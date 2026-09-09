@@ -881,6 +881,18 @@ EOF
             if [ -z "${ASSUME_YES:-}" ]; then
                 printf '\n%sAdmin panel%s\n\n' "$B" "$N"
                 if [ -z "${ADMIN_PORT:-}" ]; then
+                    # Said before the question rather than after a rejected
+                    # answer: an operator who has already typed 443 has
+                    # usually also written it into a firewall rule.
+                    warn "these ports are taken - do not pick one of them:"
+                    warn "    22    ssh"
+                    warn "    53    dns"
+                    warn "    80    the proxy, and how certificates are proved"
+                    warn "   443    the proxy"
+                    warn "  8443    the sync API the relays connect to"
+                    warn "on a relay, 3478 and 8080 are taken as well."
+                    warn "pick anything else, and open it in your firewall."
+                    printf '\n'
                     read -r -p "  port to serve it on [9443]: " ADMIN_PORT
                 fi
                 if [ -z "${ADMIN_PASS:-}" ]; then
@@ -899,7 +911,10 @@ EOF
             ADMIN_PORT="${ADMIN_PORT:-9443}"
             case "$ADMIN_PORT" in
                 *[!0-9]*|"") die "the admin port must be a number" ;;
-                53|80|443|8443|22) die "port $ADMIN_PORT is already the service's own" ;;
+                22) die "port 22 is ssh" ;;
+                8443) die "port 8443 is the sync API the relays connect to" ;;
+                53|80|443) die "port $ADMIN_PORT is the service's own - pick
+    another. 22, 53, 80, 443 and 8443 are all taken." ;;
             esac
             # The path stays generated. Nobody types it from memory, and an
             # operator asked to invent one invents a guessable one.

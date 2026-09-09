@@ -94,6 +94,31 @@ Two machines with Debian or Ubuntu and a public address each:
 No pip, no npm, no containers. Python's standard library, nginx, dnsmasq,
 nftables and coturn, all from the distribution.
 
+### Ports
+
+Everything below is taken by the service. Open them in the firewall, and do
+not give any of them to the admin panel — the installer refuses the ones it
+can see, but a firewall rule you wrote yourself it cannot.
+
+| | relay (inside Iran) | exit (abroad) |
+|---|---|---|
+| **53** udp + tcp | dnsmasq, the address customers point at | — |
+| **80** tcp | forwarded abroad; also how certificates are proved | the same |
+| **443** tcp | the SNI proxy | the same |
+| **3478** udp | STUN, so a console can work out its own NAT | — |
+| **8080** tcp | the customer panel, where there is no certificate | — |
+| **8443** tcp | the customer panel, where there is one | the sync API the relays connect to |
+| **22** tcp | ssh — never gated, so a wrong allowlist cannot lock you out | the same |
+
+The admin panel is the one port you choose. It defaults to **9443** and can be
+anything free; the installer stops you at 22, 53, 80, 443 and 8443, and
+`smartdns-access port` applies the same rule later, plus a check that nothing
+else is already listening.
+
+Inbound, the relay is the machine customers reach, so its DNS, proxy, STUN and
+panel ports have to be open to the internet. The exit only ever hears from the
+relay and from you, so 80, 443, 8443 and the panel port are enough there.
+
 ### Access control
 
 A fresh relay answers everyone. That is not a default anybody chose - it is
