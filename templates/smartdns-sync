@@ -221,15 +221,39 @@ CUSTOM_CONF = "/etc/dnsmasq.d/50-smartdns-custom.conf"
 BASE_DIR = "/etc/smartdns-base"
 
 
-def sync_base_dir():
-    """Keep BASE_DIR mirroring /etc/dnsmasq.d, except the custom domains.
+EPIC_PINS = "/etc/dnsmasq.d/epic-pins.conf"
 
-    Symlinks rather than copies, so `smartdns add` and epic-pin still reach
-    every resolver on the machine without knowing this directory exists.
+
+def epic_pin_lines():
+    """epic-pin's rules, to be written into the profiles that still want them.
+
+    Read rather than symlinked, because they are the one thing a profile may
+    need to be without: they name exact hosts, so they outrank any rule that
+    routes the parent domain, and a template that has chosen to route Epic's
+    backend has to be able to actually do it.
+    """
+    try:
+        with open(EPIC_PINS) as fh:
+            return [l.rstrip("\n") for l in fh
+                    if l.startswith("address=") or l.startswith("server=")]
+    except OSError:
+        return []
+
+
+def sync_base_dir():
+    """Keep BASE_DIR mirroring /etc/dnsmasq.d, minus two files.
+
+    Symlinks rather than copies, so `smartdns add` still reaches every
+    resolver on the machine without knowing this directory exists. The
+    operator's own domains and epic-pin's pins are left out: both are decided
+    per template, and absence is the only mechanism that works when the rules
+    would otherwise name the same host.
     """
     os.makedirs(BASE_DIR, exist_ok=True)
     want = {f for f in os.listdir("/etc/dnsmasq.d")
-            if f.endswith(".conf") and f != os.path.basename(CUSTOM_CONF)}
+            if f.endswith(".conf")
+            and f not in (os.path.basename(CUSTOM_CONF),
+                          os.path.basename(EPIC_PINS))}
     have = set(os.listdir(BASE_DIR))
     changed = False
     for f in want - have:
@@ -300,6 +324,9 @@ def apply_profiles(profiles, assignment, restart=False):
     for i, key in enumerate(sorted(profiles)):
         ports[key] = PROFILE_BASE_PORT + i
 
+    # Read once: every profile that wants them gets the same lines.
+    epic_pins = epic_pin_lines()
+
     wanted_units = set()
     for key, spec in sorted(profiles.items()):
         port = ports[key]
@@ -317,6 +344,12 @@ def apply_profiles(profiles, assignment, restart=False):
         # dnsmasq's longest match sends them to a real resolver instead of to
         # this relay.
         body += ["server=/%s/1.1.1.1" % d for d in spec.get("bypass", [])]
+        # Epic's pins, unless this template asked to route that backend. They
+        # come last and are address= rules, so where they appear they win -
+        # which is the point: a bypass sends the name to a public resolver,
+        # while a pin sends it to an address checked to answer from here.
+        if spec.get("pins", True):
+            body += epic_pins
         conf = os.path.join(PROFILE_DIR, "%s.conf" % key)
         text = "\n".join(body) + "\n"
         changed = True

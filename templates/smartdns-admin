@@ -365,6 +365,7 @@ details.svc>summary label{flex:1}
 .doms label span{direction:ltr;overflow:hidden;text-overflow:ellipsis;
  white-space:nowrap}
 .doms input{margin:0}
+.optin{display:block;font-size:11px;color:#e3b341;font-weight:400;margin-top:2px}
 .pick{margin-right:auto;display:flex;gap:6px}
 .pick button{padding:3px 10px;font-size:11px;font-weight:400;
  background:transparent;border:1px solid #30363d;color:#8b949e}
@@ -1051,7 +1052,11 @@ class Admin(http.server.BaseHTTPRequestHandler):
             return (back + "<div class='card'><h2>%s (پیش‌فرض)</h2>"
                     "<p class='muted'>قالب پیش‌فرض همیشه همهٔ سرویس‌ها را از رله "
                     "می‌برد، از جمله سرویس‌هایی که بعداً اضافه شوند. برای همین "
-                    "قابل ویرایش نیست — یک قالب تازه بسازید.</p></div>"
+                    "قابل ویرایش نیست — یک قالب تازه بسازید.</p>"
+                    "<p class='muted'>یک استثنا: گروه‌هایی که «پیش‌فرض خاموش» "
+                    "علامت خورده‌اند، حتی در این قالب هم مسیریابی نمی‌شوند. "
+                    "برای روشن کردنشان یک قالب تازه بسازید و آنجا تیکشان بزنید."
+                    "</p></div>"
                     % html.escape(t["name"]))
 
         groups = STORE.template_groups(t["id"])
@@ -1070,6 +1075,12 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 on = (svc["key"], g["key"]) in groups
                 label = (svc["label"] if len(svc["groups"]) == 1
                          else "%s — %s" % (svc["label"], g["label"]))
+                # An opt-in group is one where routing is the wrong default,
+                # not a matter of taste. Say why, next to the tick, rather
+                # than letting it look like every other box on the page.
+                if g.get("opt_in"):
+                    label += ("<span class='optin'>پیش‌فرض خاموش — روشن کردنش "
+                              "matchmaking فورتنایت را می‌شکند</span>")
                 kept = [d for d in g["domains"] if d not in off]
                 # Open the drawer when the operator has already been in here
                 # picking domains, so their exceptions are visible rather than
@@ -1083,7 +1094,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                     "<button type='button' data-all='0'>هیچ‌کدام</button></span>"
                     "</summary>"
                     % (" open" if partial else "", html.escape(key),
-                       " checked" if on else "", html.escape(label),
+                       " checked" if on else "", label,
                        len(kept) if on else 0, len(g["domains"])))
                 if not g["domains"]:
                     out.append("<p class='muted'>دامنه‌ای ندارد.</p>")
@@ -1347,12 +1358,23 @@ class Admin(http.server.BaseHTTPRequestHandler):
                                 " VALUES (?, 0, ?)", (name, now()))
             except sqlite3.IntegrityError:
                 return self.redirect("templates?m=!قالبی با این نام هست")
+            # Everything except the opt-in groups. A new template starting
+            # with those already ticked would be the panel deciding something
+            # it just told the operator was theirs to decide.
+            skipped = 0
             for svc in CATALOGUE:
                 for g in svc["groups"]:
+                    if g.get("opt_in"):
+                        skipped += 1
+                        continue
                     STORE.run("INSERT OR IGNORE INTO template_services"
                               " (template_id, service_key, group_key) VALUES (?,?,?)",
                               (cur.lastrowid, svc["key"], g["key"]))
-            return self.redirect("templates?m=قالب ساخته شد با همهٔ سرویس‌ها")
+            return self.redirect(
+                "templates?t=%d&m=قالب ساخته شد با همهٔ سرویس‌ها%s"
+                % (cur.lastrowid,
+                   "؛ %d گروهِ «پیش‌فرض خاموش» تیک نخورد" % skipped
+                   if skipped else ""))
 
         if rest == "template-save":
             tid = int(one("id") or 0)

@@ -31,6 +31,14 @@ Writes domains/services.json, stable across runs so it diffs cleanly.
 import io
 import json
 import os
+import sys
+
+# The summary it prints is half Persian, and a Windows console
+# defaults to cp1252 - which turned a finished run into a traceback.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -38,6 +46,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # real package data in a capture, and both consoles were watched downloading
 # through them. They are listed rather than pattern-matched because they must
 # out-specify the storefront rules above them.
+# Groups that exist so they can be seen and chosen, never so they can happen
+# by default.
+OPT_IN = {"epic.backend"}
+
 EXPLICIT = {
     "playstation.download": [
         "gst.prod.dl.playstation.net",
@@ -45,6 +57,12 @@ EXPLICIT = {
         "uef.np.dl.playstation.net",
         "zeus.dl.playstation.net",
     ],
+    # Epic's game backend. Routing these breaks Fortnite matchmaking: the game
+    # server ignores gameplay packets that arrive from an address other than
+    # the one matchmaking came from. They are in the catalogue so an operator
+    # can see them and decide, and marked opt-in below so that deciding
+    # nothing leaves them alone. Same list epic-pin works from.
+    "epic.backend": ['account-public-service-prod.ol.epicgames.com', 'datarouter.ol.epicgames.com', 'launcher-public-service-prod06.ol.epicgames.com', 'links-public-service-live.ol.epicgames.com', 'events-public-service-live.ol.epicgames.com', 'datastorage-public-service-live.ol.epicgames.com', 'data-asset-directory-public-service-prod.ol.epicgames.com', 'fortnitecontent-website-prod07.ol.epicgames.com', 'fortnite-public-service-prod11.ol.epicgames.com', 'mcp-gc.live.fngw.ol.epicgames.com', 'gc.svc.live.fngw.ol.epicgames.com', 'ds.svc.live.fngw.ol.epicgames.com', 'fngw-svc-ds-livefn.ol.epicgames.com', 'fn-service-habanero-live-public.ogs.live.on.epicgames.com', 'fn-service-discovery-live-public.ogs.live.on.epicgames.com', 'prm-dialogue-public-api-prod.edea.live.use1a.on.epicgames.com'],
     "xbox.download": [
         "dl.delivery.mp.microsoft.com",
         "assets1.xboxlive.com",
@@ -73,7 +91,11 @@ BRANDS = [
         ("main", "فروشگاه و انجمن", ["steampowered", "steamcommunity", "steamstatic", "valvesoftware"]),
         ("download", "دانلود بازی", ["steamcontent"]),
     ]),
-    ("epic", "Epic Games", [("main", "همه", ["epicgames", "unrealengine"])]),
+    ("epic", "Epic Games", [
+        ("main", "فروشگاه، لانچر و اکانت", ["epicgames", "unrealengine"]),
+        # Off unless an operator deliberately turns it on - see OPT_IN.
+        ("backend", "بک‌اند بازی (matchmaking فورتنایت)", []),
+    ]),
     ("ea", "EA", [("main", "همه", [
         "ea.com", "easports", "eamobile", "eaplay", "eaaccess", "eacdn",
         "eaassets", "origin.com", "bioware", "respawn", "dice.se",
@@ -220,7 +242,15 @@ def main():
         for gkey, glabel, _ in groups:
             names = sorted(set(buckets.get((skey, gkey), [])))
             if names:
-                out_groups.append({"key": gkey, "label": glabel, "domains": names})
+                group = {"key": gkey, "label": glabel, "domains": names}
+                # An opt-in group is listed but routed by nobody until an
+                # operator ticks it - including by the default template, which
+                # otherwise means "everything, now and later". Reserved for
+                # groups where routing is the wrong default rather than a
+                # matter of taste.
+                if "%s.%s" % (skey, gkey) in OPT_IN:
+                    group["opt_in"] = True
+                out_groups.append(group)
         if out_groups:
             services.append({"key": skey, "label": slabel, "groups": out_groups})
 

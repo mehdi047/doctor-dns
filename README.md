@@ -47,7 +47,7 @@ certificate naming no console host at all.
 | **Access control** | an nftables allowlist keyed on the customer's address, with per-address byte counters in the kernel |
 | **Quotas** | monthly or one-off, with warnings at 80% and 95% and automatic cutoff |
 | **Speed limits** | a per-customer download cap, shaped with htb + fq_codel rather than by dropping packets |
-| **Service templates** | which brands a customer's plan routes, down to individual domains |
+| **Service templates** | which brands a customer's plan routes, down to individual domains; a few groups ship visible but unticked, because routing them breaks the thing they belong to |
 | **Customer panel** | sign up, register an address, see usage, send a payment receipt |
 | **Operator panel** | customers, templates, domains, host monitoring, backup and restore |
 | **TLS** | certificates obtained and renewed automatically, asking for nothing but a domain name |

@@ -722,6 +722,12 @@ class Store:
         tid = cur.lastrowid
         for svc in catalogue:
             for grp in svc["groups"]:
+                # Opt-in groups are left out here too. The default template
+                # ignores these rows while it is the default, but it stops
+                # being special the moment somebody makes another one the
+                # default - and it should not carry a tick nobody made.
+                if grp.get("opt_in"):
+                    continue
                 self.run(
                     "INSERT OR IGNORE INTO template_services"
                     " (template_id, service_key, group_key) VALUES (?, ?, ?)",
@@ -741,9 +747,14 @@ class Store:
         # existed the day it was created, so a brand added in a later upgrade
         # would silently stop routing for every customer on the default plan -
         # a service quietly getting worse with no change anybody made.
+        #
+        # "Everything" stops at the opt-in groups. Those exist so an operator
+        # can see them and decide; routing one by default would be deciding
+        # for them, in the one direction that breaks something.
         row = self.one("SELECT is_default FROM templates WHERE id = ?", (template_id,))
         if row and row["is_default"]:
-            return []
+            return sorted({d for svc in catalogue for grp in svc["groups"]
+                           if grp.get("opt_in") for d in grp["domains"]})
         routed = self.template_groups(template_id)
         off = self.template_domains_off(template_id)
         out = []
@@ -798,6 +809,13 @@ class Store:
                 # into this profile's own config, and a template that does not
                 # route them simply has no rule for them anywhere.
                 "custom": custom if self.routes_custom(tid) else [],
+                # Whether this profile still wants epic-pin's work. Those pins
+                # name exact hosts, so they beat any rule that routes the
+                # parent domain - which means a template that has ticked the
+                # backend group would tick it and see nothing happen. The
+                # relay leaves the pins out of a profile that asked to route
+                # them, and keeps them everywhere else.
+                "pins": ("epic", "backend") not in self.template_groups(tid),
             }
         return by_ip, profiles
 

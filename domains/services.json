@@ -97,11 +97,34 @@
    "groups": [
     {
      "key": "main",
-     "label": "همه",
+     "label": "فروشگاه، لانچر و اکانت",
      "domains": [
       "epicgames.com",
       "unrealengine.com"
      ]
+    },
+    {
+     "key": "backend",
+     "label": "بک‌اند بازی (matchmaking فورتنایت)",
+     "domains": [
+      "account-public-service-prod.ol.epicgames.com",
+      "data-asset-directory-public-service-prod.ol.epicgames.com",
+      "datarouter.ol.epicgames.com",
+      "datastorage-public-service-live.ol.epicgames.com",
+      "ds.svc.live.fngw.ol.epicgames.com",
+      "events-public-service-live.ol.epicgames.com",
+      "fn-service-discovery-live-public.ogs.live.on.epicgames.com",
+      "fn-service-habanero-live-public.ogs.live.on.epicgames.com",
+      "fngw-svc-ds-livefn.ol.epicgames.com",
+      "fortnite-public-service-prod11.ol.epicgames.com",
+      "fortnitecontent-website-prod07.ol.epicgames.com",
+      "gc.svc.live.fngw.ol.epicgames.com",
+      "launcher-public-service-prod06.ol.epicgames.com",
+      "links-public-service-live.ol.epicgames.com",
+      "mcp-gc.live.fngw.ol.epicgames.com",
+      "prm-dialogue-public-api-prod.edea.live.use1a.on.epicgames.com"
+     ],
+     "opt_in": true
     }
    ]
   },

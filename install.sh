@@ -3121,6 +3121,12 @@ exit 0
 #        tid = cur.lastrowid
 #        for svc in catalogue:
 #            for grp in svc["groups"]:
+#                # Opt-in groups are left out here too. The default template
+#                # ignores these rows while it is the default, but it stops
+#                # being special the moment somebody makes another one the
+#                # default - and it should not carry a tick nobody made.
+#                if grp.get("opt_in"):
+#                    continue
 #                self.run(
 #                    "INSERT OR IGNORE INTO template_services"
 #                    " (template_id, service_key, group_key) VALUES (?, ?, ?)",
@@ -3140,9 +3146,14 @@ exit 0
 #        # existed the day it was created, so a brand added in a later upgrade
 #        # would silently stop routing for every customer on the default plan -
 #        # a service quietly getting worse with no change anybody made.
+#        #
+#        # "Everything" stops at the opt-in groups. Those exist so an operator
+#        # can see them and decide; routing one by default would be deciding
+#        # for them, in the one direction that breaks something.
 #        row = self.one("SELECT is_default FROM templates WHERE id = ?", (template_id,))
 #        if row and row["is_default"]:
-#            return []
+#            return sorted({d for svc in catalogue for grp in svc["groups"]
+#                           if grp.get("opt_in") for d in grp["domains"]})
 #        routed = self.template_groups(template_id)
 #        off = self.template_domains_off(template_id)
 #        out = []
@@ -3197,6 +3208,13 @@ exit 0
 #                # into this profile's own config, and a template that does not
 #                # route them simply has no rule for them anywhere.
 #                "custom": custom if self.routes_custom(tid) else [],
+#                # Whether this profile still wants epic-pin's work. Those pins
+#                # name exact hosts, so they beat any rule that routes the
+#                # parent domain - which means a template that has ticked the
+#                # backend group would tick it and see nothing happen. The
+#                # relay leaves the pins out of a profile that asked to route
+#                # them, and keeps them everywhere else.
+#                "pins": ("epic", "backend") not in self.template_groups(tid),
 #            }
 #        return by_ip, profiles
 #
@@ -4106,15 +4124,39 @@ exit 0
 #BASE_DIR = "/etc/smartdns-base"
 #
 #
-#def sync_base_dir():
-#    """Keep BASE_DIR mirroring /etc/dnsmasq.d, except the custom domains.
+#EPIC_PINS = "/etc/dnsmasq.d/epic-pins.conf"
 #
-#    Symlinks rather than copies, so `smartdns add` and epic-pin still reach
-#    every resolver on the machine without knowing this directory exists.
+#
+#def epic_pin_lines():
+#    """epic-pin's rules, to be written into the profiles that still want them.
+#
+#    Read rather than symlinked, because they are the one thing a profile may
+#    need to be without: they name exact hosts, so they outrank any rule that
+#    routes the parent domain, and a template that has chosen to route Epic's
+#    backend has to be able to actually do it.
+#    """
+#    try:
+#        with open(EPIC_PINS) as fh:
+#            return [l.rstrip("\n") for l in fh
+#                    if l.startswith("address=") or l.startswith("server=")]
+#    except OSError:
+#        return []
+#
+#
+#def sync_base_dir():
+#    """Keep BASE_DIR mirroring /etc/dnsmasq.d, minus two files.
+#
+#    Symlinks rather than copies, so `smartdns add` still reaches every
+#    resolver on the machine without knowing this directory exists. The
+#    operator's own domains and epic-pin's pins are left out: both are decided
+#    per template, and absence is the only mechanism that works when the rules
+#    would otherwise name the same host.
 #    """
 #    os.makedirs(BASE_DIR, exist_ok=True)
 #    want = {f for f in os.listdir("/etc/dnsmasq.d")
-#            if f.endswith(".conf") and f != os.path.basename(CUSTOM_CONF)}
+#            if f.endswith(".conf")
+#            and f not in (os.path.basename(CUSTOM_CONF),
+#                          os.path.basename(EPIC_PINS))}
 #    have = set(os.listdir(BASE_DIR))
 #    changed = False
 #    for f in want - have:
@@ -4185,6 +4227,9 @@ exit 0
 #    for i, key in enumerate(sorted(profiles)):
 #        ports[key] = PROFILE_BASE_PORT + i
 #
+#    # Read once: every profile that wants them gets the same lines.
+#    epic_pins = epic_pin_lines()
+#
 #    wanted_units = set()
 #    for key, spec in sorted(profiles.items()):
 #        port = ports[key]
@@ -4202,6 +4247,12 @@ exit 0
 #        # dnsmasq's longest match sends them to a real resolver instead of to
 #        # this relay.
 #        body += ["server=/%s/1.1.1.1" % d for d in spec.get("bypass", [])]
+#        # Epic's pins, unless this template asked to route that backend. They
+#        # come last and are address= rules, so where they appear they win -
+#        # which is the point: a bypass sends the name to a public resolver,
+#        # while a pin sends it to an address checked to answer from here.
+#        if spec.get("pins", True):
+#            body += epic_pins
 #        conf = os.path.join(PROFILE_DIR, "%s.conf" % key)
 #        text = "\n".join(body) + "\n"
 #        changed = True
@@ -5612,6 +5663,7 @@ exit 0
 #.doms label span{direction:ltr;overflow:hidden;text-overflow:ellipsis;
 # white-space:nowrap}
 #.doms input{margin:0}
+#.optin{display:block;font-size:11px;color:#e3b341;font-weight:400;margin-top:2px}
 #.pick{margin-right:auto;display:flex;gap:6px}
 #.pick button{padding:3px 10px;font-size:11px;font-weight:400;
 # background:transparent;border:1px solid #30363d;color:#8b949e}
@@ -6298,7 +6350,11 @@ exit 0
 #            return (back + "<div class='card'><h2>%s (پیش‌فرض)</h2>"
 #                    "<p class='muted'>قالب پیش‌فرض همیشه همهٔ سرویس‌ها را از رله "
 #                    "می‌برد، از جمله سرویس‌هایی که بعداً اضافه شوند. برای همین "
-#                    "قابل ویرایش نیست — یک قالب تازه بسازید.</p></div>"
+#                    "قابل ویرایش نیست — یک قالب تازه بسازید.</p>"
+#                    "<p class='muted'>یک استثنا: گروه‌هایی که «پیش‌فرض خاموش» "
+#                    "علامت خورده‌اند، حتی در این قالب هم مسیریابی نمی‌شوند. "
+#                    "برای روشن کردنشان یک قالب تازه بسازید و آنجا تیکشان بزنید."
+#                    "</p></div>"
 #                    % html.escape(t["name"]))
 #
 #        groups = STORE.template_groups(t["id"])
@@ -6317,6 +6373,12 @@ exit 0
 #                on = (svc["key"], g["key"]) in groups
 #                label = (svc["label"] if len(svc["groups"]) == 1
 #                         else "%s — %s" % (svc["label"], g["label"]))
+#                # An opt-in group is one where routing is the wrong default,
+#                # not a matter of taste. Say why, next to the tick, rather
+#                # than letting it look like every other box on the page.
+#                if g.get("opt_in"):
+#                    label += ("<span class='optin'>پیش‌فرض خاموش — روشن کردنش "
+#                              "matchmaking فورتنایت را می‌شکند</span>")
 #                kept = [d for d in g["domains"] if d not in off]
 #                # Open the drawer when the operator has already been in here
 #                # picking domains, so their exceptions are visible rather than
@@ -6330,7 +6392,7 @@ exit 0
 #                    "<button type='button' data-all='0'>هیچ‌کدام</button></span>"
 #                    "</summary>"
 #                    % (" open" if partial else "", html.escape(key),
-#                       " checked" if on else "", html.escape(label),
+#                       " checked" if on else "", label,
 #                       len(kept) if on else 0, len(g["domains"])))
 #                if not g["domains"]:
 #                    out.append("<p class='muted'>دامنه‌ای ندارد.</p>")
@@ -6594,12 +6656,23 @@ exit 0
 #                                " VALUES (?, 0, ?)", (name, now()))
 #            except sqlite3.IntegrityError:
 #                return self.redirect("templates?m=!قالبی با این نام هست")
+#            # Everything except the opt-in groups. A new template starting
+#            # with those already ticked would be the panel deciding something
+#            # it just told the operator was theirs to decide.
+#            skipped = 0
 #            for svc in CATALOGUE:
 #                for g in svc["groups"]:
+#                    if g.get("opt_in"):
+#                        skipped += 1
+#                        continue
 #                    STORE.run("INSERT OR IGNORE INTO template_services"
 #                              " (template_id, service_key, group_key) VALUES (?,?,?)",
 #                              (cur.lastrowid, svc["key"], g["key"]))
-#            return self.redirect("templates?m=قالب ساخته شد با همهٔ سرویس‌ها")
+#            return self.redirect(
+#                "templates?t=%d&m=قالب ساخته شد با همهٔ سرویس‌ها%s"
+#                % (cur.lastrowid,
+#                   "؛ %d گروهِ «پیش‌فرض خاموش» تیک نخورد" % skipped
+#                   if skipped else ""))
 #
 #        if rest == "template-save":
 #            tid = int(one("id") or 0)
@@ -7743,11 +7816,34 @@ exit 0
 #   "groups": [
 #    {
 #     "key": "main",
-#     "label": "همه",
+#     "label": "فروشگاه، لانچر و اکانت",
 #     "domains": [
 #      "epicgames.com",
 #      "unrealengine.com"
 #     ]
+#    },
+#    {
+#     "key": "backend",
+#     "label": "بک‌اند بازی (matchmaking فورتنایت)",
+#     "domains": [
+#      "account-public-service-prod.ol.epicgames.com",
+#      "data-asset-directory-public-service-prod.ol.epicgames.com",
+#      "datarouter.ol.epicgames.com",
+#      "datastorage-public-service-live.ol.epicgames.com",
+#      "ds.svc.live.fngw.ol.epicgames.com",
+#      "events-public-service-live.ol.epicgames.com",
+#      "fn-service-discovery-live-public.ogs.live.on.epicgames.com",
+#      "fn-service-habanero-live-public.ogs.live.on.epicgames.com",
+#      "fngw-svc-ds-livefn.ol.epicgames.com",
+#      "fortnite-public-service-prod11.ol.epicgames.com",
+#      "fortnitecontent-website-prod07.ol.epicgames.com",
+#      "gc.svc.live.fngw.ol.epicgames.com",
+#      "launcher-public-service-prod06.ol.epicgames.com",
+#      "links-public-service-live.ol.epicgames.com",
+#      "mcp-gc.live.fngw.ol.epicgames.com",
+#      "prm-dialogue-public-api-prod.edea.live.use1a.on.epicgames.com"
+#     ],
+#     "opt_in": true
 #    }
 #   ]
 #  },
