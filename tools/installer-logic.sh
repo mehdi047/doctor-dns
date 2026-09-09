@@ -937,14 +937,32 @@ if [ "$ROLE" = relay ] && [ -n "${SYNC_TOKEN:-}" ]; then
     valid_ip "$PANEL_HOST" || die "PANEL_IP '$PANEL_HOST' is not an IPv4 address"
 
     mkdir -p /etc/smart-dns; chmod 700 /etc/smart-dns
+    # Recover the domain this relay already serves its panel on, if this run
+    # was not told one. Without this, re-running the installer and pressing
+    # enter at the domain prompt blanked PANEL_DOMAIN, and the customer panel
+    # silently dropped from https to plain http - which also switches sign-up
+    # off. The same trap that once rewrote panel.env on the exit.
+    if [ -z "${PANEL_DOMAIN:-}" ] && [ -f /etc/smart-dns/sync.env ]; then
+        PANEL_DOMAIN="$(sed -n 's/^PANEL_DOMAIN=//p' /etc/smart-dns/sync.env | head -1 || true)"
+        [ -n "$PANEL_DOMAIN" ] && info "keeping the panel domain already set: $PANEL_DOMAIN"
+    fi
     umask 077
-    cat > /etc/smart-dns/sync.env <<EOF
+    if [ ! -f /etc/smart-dns/sync.env ]; then
+        cat > /etc/smart-dns/sync.env <<EOF
 PANEL_HOST=$PANEL_HOST
 SYNC_SECRET=$SECRET
 SYNC_FINGERPRINT=$FINGER
 SELF_IP=$RELAY_IP
 PANEL_DOMAIN=${PANEL_DOMAIN:-}
 EOF
+    else
+        # Merge, so anything the operator added by hand survives an upgrade.
+        set_env_key /etc/smart-dns/sync.env PANEL_HOST "$PANEL_HOST"
+        set_env_key /etc/smart-dns/sync.env SYNC_SECRET "$SECRET"
+        set_env_key /etc/smart-dns/sync.env SYNC_FINGERPRINT "$FINGER"
+        set_env_key /etc/smart-dns/sync.env SELF_IP "$RELAY_IP"
+        set_env_key /etc/smart-dns/sync.env PANEL_DOMAIN "${PANEL_DOMAIN:-}"
+    fi
     umask 022
     chmod 600 /etc/smart-dns/sync.env
 
@@ -961,8 +979,19 @@ EOF
     enable_service smartdns-sync.service
     systemctl restart smartdns-sync.service
     sleep 3
+    # Where the customer's panel ended up, for the summary at the end. The
+    # ports match smartdns-sync's own constants: 8443 when there is a
+    # certificate to serve it with, 8080 otherwise. Both sit outside the gated
+    # ports on purpose, so somebody whose address changed can still reach the
+    # page that fixes it.
+    if [ -n "${PANEL_DOMAIN:-}" ]; then
+        USER_PANEL_OUT="https://$PANEL_DOMAIN:8443/"
+    else
+        USER_PANEL_OUT="http://$SELF_IP:8080/"
+    fi
     if systemctl is-active --quiet smartdns-sync.service; then
-        info "syncing with the panel at $PANEL_HOST every 30s; claim page on port 8080"
+        info "syncing with the panel at $PANEL_HOST every 30s"
+        info "customer panel on $USER_PANEL_OUT"
     else
         warn "the sync agent did not start - journalctl -u smartdns-sync"
     fi
@@ -1040,6 +1069,28 @@ else
     Run the installer on the relay next, if you have not already.
 
 ' "$RELAY_IP"
+fi
+
+if [ -n "${USER_PANEL_OUT:-}" ]; then
+    printf '    %sCustomer panel%s - where people sign up, register the address the
+    service works on, see what is left of their allowance, and send a payment
+    receipt. It also shows them the DNS address to enter.
+
+        %s
+
+' "$B" "$N" "$USER_PANEL_OUT"
+    if [ -z "${PANEL_DOMAIN:-}" ]; then
+        printf '    %sSign-up and sign-in are switched off there%s, because without a
+    certificate that page is plain http and a password would be readable in
+    transit. Give this machine a domain and run:
+
+        smartdns-cert panel.example.com
+
+    then put PANEL_DOMAIN in /etc/smart-dns/sync.env and restart
+    smartdns-sync.
+
+' "$Y" "$N"
+    fi
 fi
 
 if [ -n "${ADMIN_URL_OUT:-}" ]; then
