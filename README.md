@@ -60,9 +60,13 @@ One script, run once on each machine. It asks which side it is on and the
 address of the other.
 
 ```sh
-curl -fsSLO https://example.invalid/install.sh   # or clone this repo
-sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/mehdi047/doctor-dns/main/get.sh | sudo sh
 ```
+
+`get.sh` only fetches `install.sh`, checks it arrived whole, saves it under
+`/usr/local/src/doctor-dns/` and hands over — so you can read what ran, and
+re-run or uninstall from that copy later. Cloning the repo and running
+`sudo bash install.sh` does the same thing.
 
 Run the **exit** first: it prints a pairing token that the relay asks for.
 

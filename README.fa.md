@@ -49,9 +49,10 @@
 یک اسکریپت، یک بار روی هر ماشین. خودش می‌پرسد کدام طرف است و آدرس طرف مقابل چیست.
 
 ```sh
-curl -fsSLO https://example.invalid/install.sh   # یا همین ریپو را clone کنید
-sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/mehdi047/doctor-dns/main/get.sh | sudo sh
 ```
+
+کار `get.sh` فقط همین است: `install.sh` را می‌گیرد، بررسی می‌کند که کامل رسیده باشد، زیر `/usr/local/src/doctor-dns/` ذخیره‌اش می‌کند و کار را به آن می‌سپارد — تا هم بتوانید چیزی را که اجرا شد بخوانید، هم بعداً از همان نسخه دوباره اجرا یا حذفش کنید. clone کردن ریپو و اجرای `sudo bash install.sh` دقیقاً همان کار را می‌کند.
 
 اول **خروجی** را نصب کنید: یک توکن جفت‌شدن چاپ می‌کند که رله از شما می‌خواهد.
 
