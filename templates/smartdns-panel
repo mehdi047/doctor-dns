@@ -285,9 +285,8 @@ MAX_RECEIPT = 4 * MB
 # rather than in this file, so changing either is an edit in the admin panel
 # rather than a redeploy to every machine.
 DEFAULT_SETTINGS = {
-    # What a new account gets before it has paid for anything.
-    "trial_bytes": str(1 * GB),
-    "trial_days": "1",
+    # No trial. A new account gets nothing until an operator gives it
+    # something - see create_web_user.
     "plan_bytes": str(2 * GB),
     "plan_days": "30",
 }
@@ -634,27 +633,20 @@ class Store:
     def user_by_telegram(self, tg_id):
         return self.one("SELECT * FROM users WHERE telegram_id = ?", (tg_id,))
 
-    def trial(self):
-        """What a brand new account gets, whichever door it came through.
-
-        A trial rather than a plan: a fixed amount, at full speed, for a fixed
-        number of days, and it does not renew. Full speed on purpose - a slow
-        trial demonstrates a slow service, and the point of it is to let
-        somebody see whether their console downloads faster through this.
-        """
-        return (int(self.setting("trial_bytes", str(GB)) or 0),
-                int(self.setting("trial_days", "1") or 1))
-
+    # A new account starts with nothing and is not connected: 'pending' keeps
+    # it out of the allowed list, which is what "no trial" has to mean, and
+    # the operator turns it on by giving it a quota.
+    #
+    # Not quota_bytes = 0 on an active account, which is the trap here: zero
+    # means unlimited everywhere in this file, so the account that was meant
+    # to get nothing would get everything. The status is what decides.
     def create_user(self, tg_id, username, first_name):
-        quota, days = self.trial()
         self.run(
             "INSERT OR IGNORE INTO users"
-            " (telegram_id, username, first_name, created_at, quota_bytes,"
-            "  quota_mode, quota_reset_at, expires_at)"
-            " VALUES (?, ?, ?, ?, ?, 'oneoff', NULL, ?)",
-            (tg_id, username, first_name, now(), quota,
-             (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(
-                 timespec="seconds")),
+            " (telegram_id, username, first_name, created_at, status,"
+            "  quota_bytes, quota_mode, quota_reset_at, expires_at)"
+            " VALUES (?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+            (tg_id, username, first_name, now()),
         )
         return self.user_by_telegram(tg_id)
 
@@ -664,20 +656,19 @@ class Store:
     def create_web_user(self, phone, first_name, password):
         """Open an account from the web panel, with no Telegram behind it.
 
-        The same trial as an account opened through the bot - the way in should
-        not decide what you get - which is why both call trial() rather than
-        each writing out its own idea of a starting allowance.
+        It starts with nothing, the same as one opened any other way - the way
+        in should not decide what you get. Signing up gets you an account, a
+        password and somewhere to send a receipt; it does not get you any
+        traffic until an operator says so.
         """
-        quota, days = self.trial()
         salt = secrets.token_hex(16)
         self.run(
             "INSERT INTO users"
             " (telegram_id, phone, password_hash, password_salt, first_name,"
-            "  created_at, quota_bytes, quota_mode, quota_reset_at, expires_at)"
-            " VALUES (NULL, ?, ?, ?, ?, ?, ?, 'oneoff', NULL, ?)",
-            (phone, hash_password(password, salt), salt, first_name, now(), quota,
-             (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(
-                 timespec="seconds")),
+            "  created_at, status, quota_bytes, quota_mode, quota_reset_at,"
+            "  expires_at)"
+            " VALUES (NULL, ?, ?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+            (phone, hash_password(password, salt), salt, first_name, now()),
         )
         return self.user_by_phone(phone)
 

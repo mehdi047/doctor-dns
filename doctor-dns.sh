@@ -2706,9 +2706,8 @@ exit 0
 ## rather than in this file, so changing either is an edit in the admin panel
 ## rather than a redeploy to every machine.
 #DEFAULT_SETTINGS = {
-#    # What a new account gets before it has paid for anything.
-#    "trial_bytes": str(1 * GB),
-#    "trial_days": "1",
+#    # No trial. A new account gets nothing until an operator gives it
+#    # something - see create_web_user.
 #    "plan_bytes": str(2 * GB),
 #    "plan_days": "30",
 #}
@@ -3055,27 +3054,20 @@ exit 0
 #    def user_by_telegram(self, tg_id):
 #        return self.one("SELECT * FROM users WHERE telegram_id = ?", (tg_id,))
 #
-#    def trial(self):
-#        """What a brand new account gets, whichever door it came through.
-#
-#        A trial rather than a plan: a fixed amount, at full speed, for a fixed
-#        number of days, and it does not renew. Full speed on purpose - a slow
-#        trial demonstrates a slow service, and the point of it is to let
-#        somebody see whether their console downloads faster through this.
-#        """
-#        return (int(self.setting("trial_bytes", str(GB)) or 0),
-#                int(self.setting("trial_days", "1") or 1))
-#
+#    # A new account starts with nothing and is not connected: 'pending' keeps
+#    # it out of the allowed list, which is what "no trial" has to mean, and
+#    # the operator turns it on by giving it a quota.
+#    #
+#    # Not quota_bytes = 0 on an active account, which is the trap here: zero
+#    # means unlimited everywhere in this file, so the account that was meant
+#    # to get nothing would get everything. The status is what decides.
 #    def create_user(self, tg_id, username, first_name):
-#        quota, days = self.trial()
 #        self.run(
 #            "INSERT OR IGNORE INTO users"
-#            " (telegram_id, username, first_name, created_at, quota_bytes,"
-#            "  quota_mode, quota_reset_at, expires_at)"
-#            " VALUES (?, ?, ?, ?, ?, 'oneoff', NULL, ?)",
-#            (tg_id, username, first_name, now(), quota,
-#             (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(
-#                 timespec="seconds")),
+#            " (telegram_id, username, first_name, created_at, status,"
+#            "  quota_bytes, quota_mode, quota_reset_at, expires_at)"
+#            " VALUES (?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+#            (tg_id, username, first_name, now()),
 #        )
 #        return self.user_by_telegram(tg_id)
 #
@@ -3085,20 +3077,19 @@ exit 0
 #    def create_web_user(self, phone, first_name, password):
 #        """Open an account from the web panel, with no Telegram behind it.
 #
-#        The same trial as an account opened through the bot - the way in should
-#        not decide what you get - which is why both call trial() rather than
-#        each writing out its own idea of a starting allowance.
+#        It starts with nothing, the same as one opened any other way - the way
+#        in should not decide what you get. Signing up gets you an account, a
+#        password and somewhere to send a receipt; it does not get you any
+#        traffic until an operator says so.
 #        """
-#        quota, days = self.trial()
 #        salt = secrets.token_hex(16)
 #        self.run(
 #            "INSERT INTO users"
 #            " (telegram_id, phone, password_hash, password_salt, first_name,"
-#            "  created_at, quota_bytes, quota_mode, quota_reset_at, expires_at)"
-#            " VALUES (NULL, ?, ?, ?, ?, ?, ?, 'oneoff', NULL, ?)",
-#            (phone, hash_password(password, salt), salt, first_name, now(), quota,
-#             (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(
-#                 timespec="seconds")),
+#            "  created_at, status, quota_bytes, quota_mode, quota_reset_at,"
+#            "  expires_at)"
+#            " VALUES (NULL, ?, ?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
+#            (phone, hash_password(password, salt), salt, first_name, now()),
 #        )
 #        return self.user_by_phone(phone)
 #
@@ -4677,8 +4668,14 @@ exit 0
 #    same allowance is noise, and the reader stops reading.
 #    """
 #    status = info.get("status")
+#    # First thing a new customer sees, so it says what to do rather than what
+#    # is wrong. Nothing is wrong: they have an account, and it is waiting.
+#    if status == "pending":
+#        return ("<div class='msg warnbox'><b>حساب شما ساخته شد.</b> "
+#                "برای فعال شدن سرویس، رسید پرداختتان را از پایین همین صفحه "
+#                "بفرستید — بعد از تأیید، پلن برایتان ثبت می‌شود.</div>")
 #    if status == "expired":
-#        return ("<div class='msg err'><b>دورهٔ آزمایشی شما تمام شد.</b> "
+#        return ("<div class='msg err'><b>دورهٔ شما تمام شد.</b> "
 #                "سرویس تا تمدید کار نمی‌کند.</div>")
 #    if status == "over_quota":
 #        return ("<div class='msg err'><b>سهمیهٔ شما تمام شد.</b> "
@@ -4701,7 +4698,7 @@ exit 0
 #
 #    ends = info.get("expires")
 #    if ends:
-#        return ("<div class='msg warnbox'>دورهٔ آزمایشی شما در <b>%s</b> "
+#        return ("<div class='msg warnbox'>دورهٔ شما در <b>%s</b> "
 #                "تمام می‌شود.</div>" % html.escape(ends))
 #    return ""
 #
@@ -5006,8 +5003,9 @@ exit 0
 #            rows.append(("تمدید", info["renews"]))
 #        rows.append(("کیف پول", "%s تومان" % format(info.get("wallet") or 0, ",")))
 #        state = {"active": "<span class='ok'>فعال</span>",
+#                 "pending": "<span class='warn'>در انتظار فعال‌سازی</span>",
 #                 "over_quota": "<span class='warn'>سهمیه تمام شده</span>",
-#                 "expired": "<span class='warn'>دورهٔ آزمایشی تمام شد</span>"}.get(
+#                 "expired": "<span class='warn'>دورهٔ شما تمام شد</span>"}.get(
 #                     info["status"], "<span class='bad'>غیرفعال</span>")
 #        rows.append(("وضعیت", state))
 #
@@ -6252,7 +6250,13 @@ exit 0
 #            sel = "".join("<option value='%d'%s>%s</option>"
 #                          % (t["id"], " selected" if t["id"] == tid else "",
 #                             html.escape(t["name"])) for t in tpls)
-#            cls = {"active": "ok", "over_quota": "warn"}.get(r["status"], "bad")
+#            # "pending" is amber, not red: nothing is wrong with the
+#            # account, it is only waiting for somebody here to give it a plan.
+#            cls = {"active": "ok", "over_quota": "warn",
+#                   "pending": "warn"}.get(r["status"], "bad")
+#            label = {"active": "فعال", "pending": "در انتظار پلن",
+#                     "over_quota": "سهمیه تمام شده", "expired": "منقضی",
+#                     "suspended": "مسدود"}.get(r["status"], r["status"])
 #            quota_gb = ("%.0f" % (r["quota_bytes"] / GB)) if r["quota_bytes"] else "0"
 #            kbps = r["speed_kbps"] or 0
 #            speed_mb = ("%g" % (kbps / 1000.0)) if kbps else "0"
@@ -6292,7 +6296,7 @@ exit 0
 #                   html.escape(r["ip"] or "-"), human(r["used_bytes"]),
 #                   r["id"], p, r["id"], r["id"], r["id"], quota_gb,
 #                   r["id"], speed_mb, r["id"], left,
-#                   p, r["id"], sel, cls, html.escape(r["status"]),
+#                   p, r["id"], sel, cls, html.escape(label),
 #                   r["id"],
 #                   p, r["id"],
 #                   "active" if r["status"] == "suspended" else "suspended",
@@ -6300,7 +6304,10 @@ exit 0
 #                   "برگرداندن" if r["status"] == "suspended" else "مسدود کردن",
 #                   "فعال" if r["status"] == "suspended" else "مسدود",
 #                   p, r["id"]))
-#        out.append("</table><p class='muted'>صفر در سهمیه یا سرعت یعنی بی‌حد. "
+#        out.append("</table><p class='muted'>ثبت‌نام تازه با وضعیت «در انتظار "
+#                   "پلن» می‌آید و تا وقتی برایش پلن ذخیره نکنید هیچ ترافیکی "
+#                   "نمی‌گیرد؛ اولین ذخیرهٔ همین سطر فعالش می‌کند. "
+#                   "صفر در سهمیه یا سرعت یعنی بی‌حد. "
 #                   "«زمان» خالی یعنی بدون تغییر؛ عددی که بنویسید تاریخ پایان را "
 #                   "از امروز همان‌قدر روز جلو می‌برد، و رنگ خاکستریِ داخلش روزهای "
 #                   "باقی‌مانده است. سرعت فقط دانلود را محدود می‌کند و تا ۳۰ ثانیه "
@@ -6591,6 +6598,12 @@ exit 0
 #                quota = int(float(gb) * GB) if gb else 0
 #            except ValueError:
 #                return self.redirect("users?m=!عدد سهمیه درست نیست")
+#            # Signing up gets an account, not traffic. Somebody has to decide
+#            # this customer may connect, and this form - opening their row and
+#            # giving them a plan - is that decision. Read the status before
+#            # the writes below, because one of them can change it.
+#            was = STORE.one("SELECT status FROM users WHERE id = ?", (uid,))
+#            joining = bool(was) and was["status"] == "pending"
 #            # Clearing the warning bits matters: a user raised above a
 #            # threshold they had already crossed would otherwise never be
 #            # warned again.
@@ -6622,20 +6635,33 @@ exit 0
 #                              " quota_reset_at = NULL, quota_mode = 'oneoff',"
 #                              " status = CASE WHEN status = 'expired' THEN 'active'"
 #                              " ELSE status END WHERE id = ?", (uid,))
-#                    return self.redirect("users?m=ذخیره شد؛ بدون محدودیت زمانی")
+#                    if joining:
+#                        STORE.run("UPDATE users SET status = 'active'"
+#                                  " WHERE id = ?", (uid,))
+#                    return self.redirect(
+#                        "users?m=ذخیره شد؛ بدون محدودیت زمانی"
+#                        + ("؛ حساب فعال شد" if joining else ""))
 #                when = datetime.now(timezone.utc) + timedelta(days=count)
 #                stamp = when.isoformat(timespec="seconds")
-#                row = STORE.one("SELECT expires_at FROM users WHERE id = ?", (uid,))
-#                if row and row["expires_at"]:
-#                    # A trial. Giving it days moves the end date, and brings it
-#                    # back if it had already run out - which is the whole
-#                    # reason an operator types in this box.
+#                row = STORE.one("SELECT quota_mode FROM users WHERE id = ?", (uid,))
+#                if row and row["quota_mode"] == "monthly":
+#                    # A renewing plan: the number moves its next reset rather
+#                    # than ending it, which is what renewing means.
+#                    STORE.run("UPDATE users SET quota_reset_at = ?"
+#                              " WHERE id = ?", (stamp, uid))
+#                else:
+#                    # Everything else gets an end date that many days out, and
+#                    # comes back if it had already run out - which is the whole
+#                    # reason an operator types in this box. This used to key
+#                    # off whether the account already had a date, which worked
+#                    # only because every account started as a dated trial.
 #                    STORE.run("UPDATE users SET expires_at = ?,"
 #                              " status = CASE WHEN status = 'expired' THEN 'active'"
 #                              " ELSE status END WHERE id = ?", (stamp, uid))
-#                else:
-#                    STORE.run("UPDATE users SET quota_reset_at = ?,"
-#                              " quota_mode = 'monthly' WHERE id = ?", (stamp, uid))
+#            if joining:
+#                STORE.run("UPDATE users SET status = 'active' WHERE id = ?",
+#                          (uid,))
+#                return self.redirect("users?m=ذخیره شد؛ حساب فعال شد")
 #            return self.redirect("users?m=ذخیره شد")
 #
 #        if rest == "receipt-decide":

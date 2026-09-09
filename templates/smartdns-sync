@@ -752,8 +752,14 @@ def account_notice(info):
     same allowance is noise, and the reader stops reading.
     """
     status = info.get("status")
+    # First thing a new customer sees, so it says what to do rather than what
+    # is wrong. Nothing is wrong: they have an account, and it is waiting.
+    if status == "pending":
+        return ("<div class='msg warnbox'><b>حساب شما ساخته شد.</b> "
+                "برای فعال شدن سرویس، رسید پرداختتان را از پایین همین صفحه "
+                "بفرستید — بعد از تأیید، پلن برایتان ثبت می‌شود.</div>")
     if status == "expired":
-        return ("<div class='msg err'><b>دورهٔ آزمایشی شما تمام شد.</b> "
+        return ("<div class='msg err'><b>دورهٔ شما تمام شد.</b> "
                 "سرویس تا تمدید کار نمی‌کند.</div>")
     if status == "over_quota":
         return ("<div class='msg err'><b>سهمیهٔ شما تمام شد.</b> "
@@ -776,7 +782,7 @@ def account_notice(info):
 
     ends = info.get("expires")
     if ends:
-        return ("<div class='msg warnbox'>دورهٔ آزمایشی شما در <b>%s</b> "
+        return ("<div class='msg warnbox'>دورهٔ شما در <b>%s</b> "
                 "تمام می‌شود.</div>" % html.escape(ends))
     return ""
 
@@ -1081,8 +1087,9 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
             rows.append(("تمدید", info["renews"]))
         rows.append(("کیف پول", "%s تومان" % format(info.get("wallet") or 0, ",")))
         state = {"active": "<span class='ok'>فعال</span>",
+                 "pending": "<span class='warn'>در انتظار فعال‌سازی</span>",
                  "over_quota": "<span class='warn'>سهمیه تمام شده</span>",
-                 "expired": "<span class='warn'>دورهٔ آزمایشی تمام شد</span>"}.get(
+                 "expired": "<span class='warn'>دورهٔ شما تمام شد</span>"}.get(
                      info["status"], "<span class='bad'>غیرفعال</span>")
         rows.append(("وضعیت", state))
 

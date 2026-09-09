@@ -205,8 +205,10 @@ reach the service from.
   whose traffic is overwhelmingly inbound.
 - **A relay without a certificate has no customer panel.** Passwords are not
   offered over plain HTTP, so such a relay serves a page saying so.
-- **Selling is not built.** Customers get a trial; turning one into a paying
-  customer is an operator editing their quota after looking at a receipt.
+- **Selling is not built, and there is no trial.** Signing up gets an account,
+  a password, and somewhere to send a receipt — no traffic. The account waits
+  until an operator opens its row and gives it a plan, which is the moment it
+  becomes able to connect at all.
 - **Xbox downloads stall** regardless of whether they are routed. Measured,
   not solved.
 - **Traffic costs double.** One customer gigabyte is about two on the relay

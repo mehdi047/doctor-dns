@@ -932,7 +932,13 @@ class Admin(http.server.BaseHTTPRequestHandler):
             sel = "".join("<option value='%d'%s>%s</option>"
                           % (t["id"], " selected" if t["id"] == tid else "",
                              html.escape(t["name"])) for t in tpls)
-            cls = {"active": "ok", "over_quota": "warn"}.get(r["status"], "bad")
+            # "pending" is amber, not red: nothing is wrong with the
+            # account, it is only waiting for somebody here to give it a plan.
+            cls = {"active": "ok", "over_quota": "warn",
+                   "pending": "warn"}.get(r["status"], "bad")
+            label = {"active": "فعال", "pending": "در انتظار پلن",
+                     "over_quota": "سهمیه تمام شده", "expired": "منقضی",
+                     "suspended": "مسدود"}.get(r["status"], r["status"])
             quota_gb = ("%.0f" % (r["quota_bytes"] / GB)) if r["quota_bytes"] else "0"
             kbps = r["speed_kbps"] or 0
             speed_mb = ("%g" % (kbps / 1000.0)) if kbps else "0"
@@ -972,7 +978,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                    html.escape(r["ip"] or "-"), human(r["used_bytes"]),
                    r["id"], p, r["id"], r["id"], r["id"], quota_gb,
                    r["id"], speed_mb, r["id"], left,
-                   p, r["id"], sel, cls, html.escape(r["status"]),
+                   p, r["id"], sel, cls, html.escape(label),
                    r["id"],
                    p, r["id"],
                    "active" if r["status"] == "suspended" else "suspended",
@@ -980,7 +986,10 @@ class Admin(http.server.BaseHTTPRequestHandler):
                    "برگرداندن" if r["status"] == "suspended" else "مسدود کردن",
                    "فعال" if r["status"] == "suspended" else "مسدود",
                    p, r["id"]))
-        out.append("</table><p class='muted'>صفر در سهمیه یا سرعت یعنی بی‌حد. "
+        out.append("</table><p class='muted'>ثبت‌نام تازه با وضعیت «در انتظار "
+                   "پلن» می‌آید و تا وقتی برایش پلن ذخیره نکنید هیچ ترافیکی "
+                   "نمی‌گیرد؛ اولین ذخیرهٔ همین سطر فعالش می‌کند. "
+                   "صفر در سهمیه یا سرعت یعنی بی‌حد. "
                    "«زمان» خالی یعنی بدون تغییر؛ عددی که بنویسید تاریخ پایان را "
                    "از امروز همان‌قدر روز جلو می‌برد، و رنگ خاکستریِ داخلش روزهای "
                    "باقی‌مانده است. سرعت فقط دانلود را محدود می‌کند و تا ۳۰ ثانیه "
@@ -1271,6 +1280,12 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 quota = int(float(gb) * GB) if gb else 0
             except ValueError:
                 return self.redirect("users?m=!عدد سهمیه درست نیست")
+            # Signing up gets an account, not traffic. Somebody has to decide
+            # this customer may connect, and this form - opening their row and
+            # giving them a plan - is that decision. Read the status before
+            # the writes below, because one of them can change it.
+            was = STORE.one("SELECT status FROM users WHERE id = ?", (uid,))
+            joining = bool(was) and was["status"] == "pending"
             # Clearing the warning bits matters: a user raised above a
             # threshold they had already crossed would otherwise never be
             # warned again.
@@ -1302,20 +1317,33 @@ class Admin(http.server.BaseHTTPRequestHandler):
                               " quota_reset_at = NULL, quota_mode = 'oneoff',"
                               " status = CASE WHEN status = 'expired' THEN 'active'"
                               " ELSE status END WHERE id = ?", (uid,))
-                    return self.redirect("users?m=ذخیره شد؛ بدون محدودیت زمانی")
+                    if joining:
+                        STORE.run("UPDATE users SET status = 'active'"
+                                  " WHERE id = ?", (uid,))
+                    return self.redirect(
+                        "users?m=ذخیره شد؛ بدون محدودیت زمانی"
+                        + ("؛ حساب فعال شد" if joining else ""))
                 when = datetime.now(timezone.utc) + timedelta(days=count)
                 stamp = when.isoformat(timespec="seconds")
-                row = STORE.one("SELECT expires_at FROM users WHERE id = ?", (uid,))
-                if row and row["expires_at"]:
-                    # A trial. Giving it days moves the end date, and brings it
-                    # back if it had already run out - which is the whole
-                    # reason an operator types in this box.
+                row = STORE.one("SELECT quota_mode FROM users WHERE id = ?", (uid,))
+                if row and row["quota_mode"] == "monthly":
+                    # A renewing plan: the number moves its next reset rather
+                    # than ending it, which is what renewing means.
+                    STORE.run("UPDATE users SET quota_reset_at = ?"
+                              " WHERE id = ?", (stamp, uid))
+                else:
+                    # Everything else gets an end date that many days out, and
+                    # comes back if it had already run out - which is the whole
+                    # reason an operator types in this box. This used to key
+                    # off whether the account already had a date, which worked
+                    # only because every account started as a dated trial.
                     STORE.run("UPDATE users SET expires_at = ?,"
                               " status = CASE WHEN status = 'expired' THEN 'active'"
                               " ELSE status END WHERE id = ?", (stamp, uid))
-                else:
-                    STORE.run("UPDATE users SET quota_reset_at = ?,"
-                              " quota_mode = 'monthly' WHERE id = ?", (stamp, uid))
+            if joining:
+                STORE.run("UPDATE users SET status = 'active' WHERE id = ?",
+                          (uid,))
+                return self.redirect("users?m=ذخیره شد؛ حساب فعال شد")
             return self.redirect("users?m=ذخیره شد")
 
         if rest == "receipt-decide":

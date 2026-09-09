@@ -196,8 +196,23 @@ check("no end date reads as unlimited",
 rec8 = Rec(); rec8.wfile = Rec._W(rec8)
 rec8.action("user-save", {"id": ["2"], "quota_gb": ["5"], "days": ["7"]})
 u = store.one("SELECT expires_at, quota_reset_at FROM users WHERE id = 2")
-check("a positive number still sets a date",
+# The number in that box means what the page beside it says: an end date this
+# many days out. It used to mean a renewal cycle for an account that had no
+# date yet, which only ever looked right because every account began as a
+# dated trial - and with trials gone, every account has no date.
+check("a positive number sets an end date",
+      bool(u["expires_at"]), str(dict(u)))
+check("and not a renewal cycle", u["quota_reset_at"] is None, str(dict(u)))
+
+# A renewing account is the one case where the number moves the reset instead.
+store.run("UPDATE users SET quota_mode = 'monthly' WHERE id = 2")
+rec9 = Rec(); rec9.wfile = Rec._W(rec9)
+rec9.action("user-save", {"id": ["2"], "quota_gb": ["5"], "days": ["14"]})
+u = store.one("SELECT expires_at, quota_reset_at, quota_mode"
+              " FROM users WHERE id = 2")
+check("a monthly plan gets its reset moved instead",
       bool(u["quota_reset_at"]), str(dict(u)))
+check("and stays monthly", u["quota_mode"] == "monthly", str(dict(u)))
 
 print("an expired cookie does not block the way back in")
 src_sync = open(os.path.join(HERE, "..", "templates", "smartdns-sync"),

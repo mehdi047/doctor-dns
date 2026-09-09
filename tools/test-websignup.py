@@ -138,15 +138,14 @@ session = res.get("session", "")
 check("signup returns a session", bool(session))
 u = store.user_by_phone("09121112233")
 check("account exists with a null telegram_id", u and u["telegram_id"] is None)
-check("account got the trial allowance",
-      u["quota_bytes"] == int(store.setting("trial_bytes")), str(u["quota_bytes"]))
-check("the trial is 1 GB", u["quota_bytes"] == 1024 ** 3, str(u["quota_bytes"]))
-check("the trial runs at full speed", (u["speed_kbps"] or 0) == 0)
-check("the trial has an end date", bool(u["expires_at"]), str(u["expires_at"]))
+# Signing up gets an account, not traffic. The trap worth a test of its own
+# is quota_bytes: zero means unlimited everywhere in the panel, so an account
+# meant to get nothing would get everything if the status did not hold it.
+check("the account is waiting for a plan", u["status"] == "pending", u["status"])
+check("it has no allowance", u["quota_bytes"] == 0, str(u["quota_bytes"]))
+check("and no end date, because it never started",
+      u["expires_at"] is None, str(u["expires_at"]))
 check("it does not renew itself", u["quota_mode"] == "oneoff", u["quota_mode"])
-expires = panel.parse_ts(u["expires_at"])
-hours = (expires - panel.datetime.now(panel.timezone.utc)).total_seconds() / 3600
-check("it ends in about a day", 23 < hours <= 24.1, "%.1f hours" % hours)
 check("no address registered yet", not store.user_ips(u["id"]))
 
 check("short password refused",
@@ -167,7 +166,24 @@ check("it is on the account",
 res = api.do_user_claim({"session": session, "ip": "203.0.113.9"})
 check("an address owned by somebody else is refused", not res.get("ok"), str(res))
 
-print("the trial ends on its date even with allowance left")
+print("a pending account reaches no relay, address registered or not")
+# The address above is registered and correct. What keeps this customer off
+# the relay is the status, and nothing they can do from their own page
+# changes it.
+check("it is not in the allowlist",
+      "203.0.113.80" not in dict(store.profiles(CATALOGUE, DEFAULT)[0]),
+      str(dict(store.profiles(CATALOGUE, DEFAULT)[0])))
+panel.enforce_quotas(store)
+check("and the sweep leaves it pending rather than expiring it",
+      store.user_by_phone("09121112233")["status"] == "pending")
+
+print("an operator giving it a plan is what turns it on")
+store.run("UPDATE users SET quota_bytes = ?, status = 'active' WHERE id = ?",
+          (2 * 1024 ** 3, u["id"]))
+check("now the address is allowed",
+      "203.0.113.80" in dict(store.profiles(CATALOGUE, DEFAULT)[0]))
+
+print("an account with a date still ends on it, allowance or not")
 store.run("UPDATE users SET expires_at = ? WHERE id = ?",
           ((panel.datetime.now(panel.timezone.utc)
             - panel.timedelta(minutes=1)).isoformat(timespec="seconds"), u["id"]))
@@ -249,7 +265,11 @@ for state, warned, expect in [
         ({"status": "over_quota", "quota": GB, "used": GB, "warned": 3},
          None, "سهمیهٔ شما تمام شد"),
         ({"status": "expired", "quota": GB, "used": 0, "warned": 0},
-         None, "دورهٔ آزمایشی شما تمام شد"),
+         None, "دورهٔ شما تمام شد"),
+        # A brand new account. Not an error, and it must not read like one -
+        # it says what to do next instead.
+        ({"status": "pending", "quota": 0, "used": 0, "warned": 0},
+         None, "حساب شما ساخته شد"),
         ({"status": "suspended", "quota": 0, "used": 0, "warned": 0},
          None, "غیرفعال")]:
     got = sync.account_notice(state)
@@ -261,6 +281,66 @@ for state, warned, expect in [
 check("only one banner at a time",
       sync.account_notice({"status": "active", "quota": GB,
                            "used": int(.97 * GB), "warned": 3}).count("<div") == 1)
+
+print("and in the panel, that is what saving a plan does")
+adm_spec = importlib.util.spec_from_loader(
+    "admin", importlib.machinery.SourceFileLoader(
+        "admin", os.path.join(HERE, "..", "templates", "smartdns-admin")))
+admin = importlib.util.module_from_spec(adm_spec)
+adm_spec.loader.exec_module(admin)
+admin.STORE = admin.Store(db_path)
+admin.CATALOGUE = CATALOGUE
+admin.CFG = {"ADMIN_PATH": "p"}
+
+
+class Rec:
+    def __init__(self):
+        self._headers_buffer = []
+        self.sent = {}
+
+    def send_response(self, code):
+        self.sent["code"] = code
+
+    def send_header(self, k, v):
+        ("%s: %s" % (k, v)).encode("latin-1")
+        self.sent[k] = v
+
+    def end_headers(self):
+        pass
+
+    class _W:
+        def write(self, b):
+            pass
+    wfile = _W()
+
+
+for n in ("action", "redirect", "send"):
+    setattr(Rec, n, getattr(admin.Admin, n))
+Rec.one = staticmethod(admin.Admin.one)
+
+res = api.do_user_signup({"phone": "09129998877", "password": "hunter2!!",
+                          "name": "زهرا", "ip": "198.51.100.20"})
+waiting = store.user_by_phone("09129998877")
+check("the second signup is pending too", waiting["status"] == "pending")
+
+Rec().action("user-save", {"id": [str(waiting["id"])], "quota_gb": ["5"],
+                           "days": ["30"]})
+now_on = store.user_by_phone("09129998877")
+check("saving a plan activates it", now_on["status"] == "active",
+      now_on["status"])
+check("with the quota that was typed",
+      now_on["quota_bytes"] == 5 * GB, str(now_on["quota_bytes"]))
+check("and an end date", bool(now_on["expires_at"]), str(now_on["expires_at"]))
+
+# Twice, because the second save must not re-activate a suspended account -
+# blocking somebody and then correcting their quota would quietly let them
+# back in.
+store.run("UPDATE users SET status = 'suspended' WHERE id = ?", (now_on["id"],))
+Rec().action("user-save", {"id": [str(now_on["id"])], "quota_gb": ["9"],
+                           "days": [""]})
+check("a suspended account stays suspended when its plan is edited",
+      store.user_by_phone("09129998877")["status"] == "suspended",
+      store.user_by_phone("09129998877")["status"])
 
 shutil.rmtree(tmp, ignore_errors=True)
 print()
