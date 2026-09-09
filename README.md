@@ -60,13 +60,14 @@ One script, run once on each machine. It asks which side it is on and the
 address of the other.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mehdi047/doctor-dns/main/get.sh | sudo sh
+curl -fsSLO https://raw.githubusercontent.com/mehdi047/doctor-dns/main/doctor-dns.sh && sudo bash doctor-dns.sh
 ```
 
-`get.sh` only fetches `doctor-dns.sh`, checks it arrived whole, saves it under
-`/usr/local/src/doctor-dns/` and hands over — so you can read what ran, and
-re-run or uninstall from that copy later. Cloning the repo and running
-`sudo bash doctor-dns.sh` does the same thing.
+It downloads rather than pipes on purpose. Every config this installs is
+stored inside the script itself, below `exit 0`, so it has to be able to read
+its own file — and it asks questions, which a pipe would answer with
+end-of-file. Downloading also leaves you a copy to read, to re-run, and to
+uninstall from. It refuses to run if that copy is not whole.
 
 Run the **exit** first: it prints a pairing token that the relay asks for.
 

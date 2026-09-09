@@ -190,6 +190,13 @@ note_file() {
 [ -r "$SELF" ] && [ -n "$(payload SYSCTL)" ] || die "cannot read my own payloads.
     Download this file and run it directly. Piping it into bash will not work,
     because the configs are stored inside the script itself."
+# A download that stopped early is still a runnable script. Everything below
+# `exit 0` is a comment, so bash parses half a file quite happily and would
+# then set the machine up with configs silently missing - which is worse than
+# not running at all. A whole one always ends on a payload terminator.
+tail -2 "$SELF" | grep -q '^#__END_' || die "this file is incomplete - the
+    download stopped early. Fetch it again:
+        curl -fsSLO https://raw.githubusercontent.com/mehdi047/doctor-dns/main/doctor-dns.sh"
 command -v apt-get >/dev/null 2>&1 || die "this installer expects Debian or Ubuntu"
 
 # ---------------------------------------------------------------- uninstall
