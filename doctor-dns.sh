@@ -35,6 +35,11 @@ set -euo pipefail
 SELF="${BASH_SOURCE[0]}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
+# What this file is. Written to the machine once an install finishes, so the
+# next run can tell whether it is an upgrade, a re-run, or somebody about to
+# put an older version over a newer one by accident.
+VERSION="0.2.0"
+
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
 # here, whether nginx.conf had a config worth putting back. Guessing wrong on a
@@ -185,6 +190,25 @@ note_file() {
     else remember files-created "$f"; fi
 }
 
+# --------------------------------------------------------------- questions?
+# Answered before the preflight, because neither one touches the machine and
+# neither has any business demanding root. Asking a script what version it is
+# and being told to use sudo is the kind of small rudeness that makes people
+# stop asking.
+case "${1:-}" in
+    --version|-V) printf '%s\n' "$VERSION"; exit 0 ;;
+    --help|-h)
+        printf 'doctor dns %s\n\n' "$VERSION"
+        printf 'usage: sudo bash %s [--uninstall]\n\n' "$0"
+        printf '  no arguments   install or update this machine\n'
+        printf '  --uninstall    put it back as it was\n'
+        printf '  --version      print the version of this file\n'
+        printf '\nenvironment (sudo does not pass these, put them after it):\n'
+        printf '  ASSUME_YES=1   take the default for every question\n'
+        printf '  ENFORCE=no     leave a relay open to everyone\n'
+        exit 0 ;;
+esac
+
 # ---------------------------------------------------------------- preflight
 [ "$(id -u)" = 0 ] || die "run as root:  sudo bash $0"
 [ -r "$SELF" ] && [ -n "$(payload SYSCTL)" ] || die "cannot read my own payloads.
@@ -320,6 +344,11 @@ uninstall() {
     esac
 
     rm -f "$STATE"
+    # The version note goes with the state it describes. Left behind, it would
+    # tell a later install that this machine already runs a version whose
+    # files are no longer here, and that install would skip its own upgrade
+    # question on the strength of it.
+    rm -f "$STATE_DIR/version"
     # Only if nothing else put anything there; never blow away a
     # directory a later stage of this project may be using.
     rmdir "$STATE_DIR" 2>/dev/null || true
@@ -331,16 +360,87 @@ uninstall() {
     exit 0
 }
 
+# --version and --help were answered above, before the preflight.
 case "${1:-}" in
     --uninstall|-u|uninstall) uninstall ;;
-    --help|-h)
-        printf 'usage: %s [--uninstall]\n' "$0"
-        printf '  no arguments   install or update this machine\n'
-        printf '  --uninstall    put it back as it was\n'
-        exit 0 ;;
     "") ;;
     *) die "unknown argument: $1  (try --help)" ;;
 esac
+
+# ---------------------------------------------------------------- version
+# Nothing below has touched the machine yet, and the answer here decides
+# whether anything will. Two cases are worth stopping for: an upgrade, which
+# the operator should know is happening rather than discover afterwards, and
+# the reverse - an older file run over a newer install, which is nearly always
+# somebody re-running a download they still had lying around.
+VERSION_FILE="$STATE_DIR/version"
+INSTALLED_VERSION=""
+[ -f "$VERSION_FILE" ] && INSTALLED_VERSION="$(head -1 "$VERSION_FILE" | tr -d "[:space:]")" || true
+
+# The customer database, the settings, the sync secret and any certificate all
+# live outside the files this script writes, and every payload it does write is
+# backed up before it is replaced. So an upgrade keeps them - but "keeps them"
+# is a promise worth a copy behind it, taken before anything starts.
+snapshot_db() {
+    local db="$STATE_DIR/panel.db" out
+    [ -f "$db" ] || return 0
+    mkdir -p "$BACKUP_DIR"
+    out="$BACKUP_DIR/panel.db.$STAMP"
+    # VACUUM INTO, not cp: the panel keeps a write-ahead log beside the file,
+    # so a plain copy of the file alone can be a database missing its newest
+    # rows. Falls back to cp where sqlite is too old to know the statement.
+    if python3 - "$db" "$out" <<'PY' 2>/dev/null
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("VACUUM INTO ?", (sys.argv[2],))
+db.close()
+PY
+    then
+        info "database copied to $out"
+    elif cp -a "$db" "$out" 2>/dev/null; then
+        warn "database copied to $out (plain copy - sqlite here is old)"
+    else
+        die "could not copy the database at $db. Fix that before upgrading."
+    fi
+}
+
+if [ -n "$INSTALLED_VERSION" ] && [ "$INSTALLED_VERSION" != "$VERSION" ]; then
+    older="$(printf '%s\n%s\n' "$INSTALLED_VERSION" "$VERSION" | sort -V | head -1)"
+    printf '\n%sVersion%s\n\n' "$B" "$N"
+    info "installed on this machine:  $INSTALLED_VERSION"
+    info "this file:                  $VERSION"
+    printf '\n'
+    if [ "$older" = "$VERSION" ]; then
+        warn "this file is OLDER than what is installed."
+        warn "installing it will put old configs over new ones, and this"
+        warn "script has no way to undo what a later version did."
+        warn "the newest is at github.com/mehdi047/doctor-dns/releases"
+        answer=n
+    else
+        warn "this will upgrade this machine from $INSTALLED_VERSION to $VERSION."
+        answer=y
+    fi
+    warn "your customers, settings, certificates and allowlist are kept."
+    printf '\n'
+    if [ -z "${ASSUME_YES:-}" ]; then
+        read -r -p "  go ahead? [$answer]: " reply
+        # An answer piped in from a file written on Windows arrives with
+        # a carriage return attached, and a "y" with one glued on
+        # matches nothing below.
+        reply="$(printf '%s' "$reply" | tr -d '\r')"
+        reply="${reply:-$answer}"
+    else
+        reply="$answer"
+        info "ASSUME_YES - taking '$answer'"
+    fi
+    case "$reply" in
+        y|Y|yes|YES) ;;
+        *) printf '\n    Nothing was changed.\n\n'; exit 0 ;;
+    esac
+    snapshot_db
+elif [ -n "$INSTALLED_VERSION" ]; then
+    info "already at $VERSION - re-running to check and repair"
+fi
 
 # ---------------------------------------------------------------- questions
 valid_ip() {
@@ -1117,7 +1217,13 @@ fi
 
 printf '\n'
 if [ "$fail" = 0 ]; then
-    printf '%s%s is installed and working.%s\n' "$G" "$ROLE" "$N"
+    # Written here and nowhere earlier: a run that died half way through has
+    # not installed this version, and recording it would tell the next run
+    # there was nothing left to do.
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$VERSION" > "$VERSION_FILE"
+    printf '%s%s is installed and working, version %s.%s\n' \
+           "$G" "$ROLE" "$VERSION" "$N"
 else
     printf '%sSomething is off - see the failures above.%s\n' "$Y" "$N"
 fi

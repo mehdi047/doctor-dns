@@ -84,6 +84,37 @@ Safe to re-run — configs are backed up, and a step that would change nothing
 does nothing. `sudo bash doctor-dns.sh --uninstall` puts the machine back,
 undoing only what this script did.
 
+### Upgrading
+
+Download the new file and run it. Before it touches anything it compares its
+own version against what the machine has, says which way it is going, and
+waits for an answer:
+
+```
+Version
+
+    installed on this machine:  0.1.0
+    this file:                  0.2.0
+
+    this will upgrade this machine from 0.1.0 to 0.2.0.
+    your customers, settings, certificates and allowlist are kept.
+
+  go ahead? [y]:
+```
+
+The case worth having it for is the other one. Run an old file over a newer
+install — a download still sitting in a home directory, months later — and it
+says so, and the default answer becomes no.
+
+Your customers, their usage, the sync secret, the panel password and any
+certificate all live outside the files the script writes, so an upgrade keeps
+them. A copy of the database is taken into `/var/backups/smart-dns/` first
+anyway, with `VACUUM INTO` rather than `cp`, because the panel keeps a
+write-ahead log beside the database and copying the file alone can miss its
+newest rows. `--version` prints what a file is without installing anything,
+and `ASSUME_YES=1` takes the default — yes for an upgrade, no for a
+downgrade — for anyone scripting it.
+
 ### Requirements
 
 Two machines with Debian or Ubuntu and a public address each:
