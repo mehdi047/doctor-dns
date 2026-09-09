@@ -63,15 +63,15 @@ address of the other.
 curl -fsSL https://raw.githubusercontent.com/mehdi047/doctor-dns/main/get.sh | sudo sh
 ```
 
-`get.sh` only fetches `install.sh`, checks it arrived whole, saves it under
+`get.sh` only fetches `doctor-dns.sh`, checks it arrived whole, saves it under
 `/usr/local/src/doctor-dns/` and hands over — so you can read what ran, and
 re-run or uninstall from that copy later. Cloning the repo and running
-`sudo bash install.sh` does the same thing.
+`sudo bash doctor-dns.sh` does the same thing.
 
 Run the **exit** first: it prints a pairing token that the relay asks for.
 
 Safe to re-run — configs are backed up, and a step that would change nothing
-does nothing. `sudo bash install.sh --uninstall` puts the machine back,
+does nothing. `sudo bash doctor-dns.sh --uninstall` puts the machine back,
 undoing only what this script did.
 
 ### Requirements
@@ -126,14 +126,14 @@ changed to something the firewall does not allow.
 
 ## How it is built
 
-`install.sh` is generated, not hand-edited. Everything lives in
+`doctor-dns.sh` is generated, not hand-edited. Everything lives in
 `templates/`, `common/` and `domains/`; `tools/installer-logic.sh` is the
 script's logic, and `tools/build-installer.py` staples them together:
 
 ```sh
-python3 tools/build-installer.py     # rewrites install.sh
-bash -n install.sh                   # it stays valid bash
-python3 tools/test-websignup.py      # …and so on for the rest
+python3 tools/build-installer.py   # rewrites doctor-dns.sh
+bash -n doctor-dns.sh              # it stays valid bash
+python3 tools/test-websignup.py    # …and so on for the rest
 ```
 
 Payloads sit below `exit 0` with every line `#`-prefixed, which is what keeps

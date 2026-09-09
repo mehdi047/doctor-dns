@@ -10,8 +10,8 @@
 # address of the other. Safe to re-run: configs are backed up, and a step that
 # would change nothing does nothing.
 #
-#   sudo bash install.sh              install or update this machine
-#   sudo bash install.sh --uninstall  put the machine back as it was
+#   sudo bash doctor-dns.sh              install or update this machine
+#   sudo bash doctor-dns.sh --uninstall  put the machine back as it was
 #
 # HTTPS for the panels is optional and asks for nothing but a domain name. A
 # certificate is obtained and renewed automatically, proved over port 80 - so

@@ -3,13 +3,13 @@
 
 Piping a downloader into a shell is only as safe as what it checks before it
 hands over, and the failure that actually happens is not an attack - it is a
-download that stopped early. install.sh carries every config it writes in its
-own tail, all of it commented out, so a file cut in half still parses as bash
-and still runs. It would set up a machine with pieces silently missing.
+download that stopped early. doctor-dns.sh carries every config it writes in
+its own tail, all of it commented out, so a file cut in half still parses as
+bash and still runs. It would set up a machine with pieces silently missing.
 
 So the checks here are about completeness, and the other thing worth testing
-is the terminal: install.sh asks which side of the service this machine is,
-and piped into sh those prompts would read the pipe and get end-of-file.
+is the terminal: the installer asks which side of the service this machine
+is, and piped into sh those prompts would read the pipe and get end-of-file.
 """
 import os
 import shutil
@@ -24,7 +24,7 @@ except Exception:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GET = os.path.join(HERE, "..", "get.sh")
-INSTALLER = os.path.join(HERE, "..", "install.sh")
+INSTALLER = os.path.join(HERE, "..", "doctor-dns.sh")
 fails = []
 
 
@@ -93,7 +93,7 @@ def run(*args, **env):
 
 
 def landed():
-    return os.path.exists(os.path.join(DEST, "install.sh"))
+    return os.path.exists(os.path.join(DEST, "doctor-dns.sh"))
 
 
 whole = open(INSTALLER, "rb").read()
@@ -107,27 +107,28 @@ print("the whole installer goes through")
 r = run()
 check("it saved the installer", landed())
 check("what it saved is byte-for-byte what it fetched",
-      landed() and open(os.path.join(DEST, "install.sh"), "rb").read() == whole)
+      landed() and
+      open(os.path.join(DEST, "doctor-dns.sh"), "rb").read() == whole)
 check("it printed a checksum to compare", "sha256" in r.stdout)
 check("it fetched from the repo, on main",
       open(asked).read().strip() ==
-      "https://raw.githubusercontent.com/mehdi047/doctor-dns/main/install.sh",
+      "https://raw.githubusercontent.com/mehdi047/doctor-dns/main/doctor-dns.sh",
       open(asked).read())
 
 print("with no terminal it stops rather than answering the prompts itself")
 # The run above: stdin is /dev/null and there is no controlling terminal.
-# install.sh asks which side of the service this machine is and what the other
-# one's address is, and there is nobody here to ask.
+# The installer asks which side of the service this machine is and what the
+# other one's address is, and there is nobody here to ask.
 check("it did not run the installer", "HANDOFF" not in r.stdout, r.stdout[-200:])
 check("it said why", "no terminal" in r.stdout, r.stdout[-200:])
 check("and gave the command to run instead",
-      "sudo bash" in r.stdout and "install.sh" in r.stdout, r.stdout[-200:])
+      "sudo bash" in r.stdout and "doctor-dns.sh" in r.stdout, r.stdout[-200:])
 check("it exited non-zero", r.returncode != 0, str(r.returncode))
 
 print("arguments are carried through")
 r = run("--uninstall")
 check("--uninstall comes back in the command it prints",
-      "install.sh --uninstall" in r.stdout, r.stdout[-200:])
+      "doctor-dns.sh --uninstall" in r.stdout, r.stdout[-200:])
 
 print("given a terminal, it hands over")
 if os.name == "nt":
@@ -151,7 +152,7 @@ else:
 
 print("REF installs from somewhere other than main")
 r = run(REF="v0.2")
-check("the tag is in the URL", "/v0.2/install.sh" in open(asked).read(),
+check("the tag is in the URL", "/v0.2/doctor-dns.sh" in open(asked).read(),
       open(asked).read())
 
 print("a download that stopped early is refused")
