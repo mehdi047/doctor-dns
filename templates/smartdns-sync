@@ -1,0 +1,1091 @@
+#!/usr/bin/env python3
+"""smartdns-sync - the relay's half of the panel.
+
+Two jobs, one process:
+
+  * every 30 seconds, hand the exit node this relay's per-address byte
+    counters and take back who is allowed, on which resolver, at what speed
+  * serve the customer's panel - signing up, signing in, registering an
+    address, and seeing what is left of an allowance
+
+The panel has to live on the relay rather than on the exit, because the whole
+point of it is to learn the customer's address, and the only address that
+matters is the one they reach the service from. A page served in Frankfurt
+would see whatever their browser came out of.
+
+It listens outside the gated ports on purpose. The access control gate covers
+53, 80 and 443, so somebody whose address changed is cut off from the service
+but can still reach the one page that fixes it. Putting the panel on a gated
+port would have locked them out of the thing that unlocks them.
+
+The relay always dials out; nothing dials in. Standard library only.
+
+PANEL_HOST is not necessarily this relay's own exit node. The panel is a
+control plane: one database serves several relay/exit pairs, and each relay
+still carries its own traffic through its own exit.
+"""
+
+import base64
+import hashlib
+import hmac
+import html
+import http.client
+import http.cookies
+import http.server
+import json
+import os
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+CONFIG = "/etc/smart-dns/sync.env"
+ACL = "/usr/local/bin/smartdns-acl"
+SHAPE = "/usr/local/bin/smartdns-shape"
+INTERVAL = 30
+CLAIM_PORT = 8080
+# The customer-facing panel. Outside the gated ports (53, 80, 443) on purpose:
+# somebody whose address changed is cut off from the service but must still be
+# able to reach the one page that fixes it.
+PANEL_TLS_PORT = 8443
+
+# A photograph of a bank slip, from a phone camera. The exit refuses anything
+# past four megabytes, so there is no point carrying more than that up to it.
+MAX_RECEIPT = 4 * 1024 * 1024
+
+
+def load_config():
+    cfg = {}
+    with open(CONFIG) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip().strip('"').strip("'")
+    for required in ("PANEL_HOST", "SYNC_SECRET", "SYNC_FINGERPRINT", "SELF_IP"):
+        if not cfg.get(required):
+            sys.exit("%s: %s is missing" % (CONFIG, required))
+    return cfg
+
+
+CFG = None
+
+# Whether this panel is served over TLS. A relay with no domain has no
+# certificate and serves plain http, and these pages are opened over an Iranian
+# ISP - so the password forms are simply not offered there. The Telegram route
+# needs no password and keeps working either way.
+SECURE = False
+
+
+def post(path, payload):
+    """POST JSON to the exit's API, pinned to its certificate.
+
+    The exit's certificate is self-signed - there is no domain on it and no CA
+    to check it against - so ordinary verification is turned off and replaced
+    with a fingerprint comparison. That is stricter than a public CA would be,
+    not weaker: exactly one certificate is accepted, and the secret is never
+    sent until it matches.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    conn = http.client.HTTPSConnection(
+        CFG["PANEL_HOST"], 8443, timeout=25, context=ctx
+    )
+    try:
+        conn.connect()
+        seen = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
+        if not hmac.compare_digest(seen, CFG["SYNC_FINGERPRINT"].lower()):
+            raise RuntimeError(
+                "certificate fingerprint mismatch - refusing to send anything.\n"
+                "  expected %s\n  got      %s" % (CFG["SYNC_FINGERPRINT"], seen)
+            )
+        body = json.dumps(payload)
+        conn.request(
+            "POST", path, body,
+            {"Content-Type": "application/json",
+             "Authorization": "Bearer " + CFG["SYNC_SECRET"]},
+        )
+        res = conn.getresponse()
+        data = json.loads(res.read() or b"{}")
+        if res.status != 200:
+            raise RuntimeError("exit returned %d: %s" % (res.status, data))
+        return data
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------ health
+class Health:
+    """Host metrics, read straight out of /proc.
+
+    CPU and network are rates, which means they only exist relative to a
+    previous reading - so the first sample after start reports no rate rather
+    than a meaningless one computed against zero. The sync loop runs every
+    thirty seconds, which is the interval these end up averaged over.
+    """
+
+    def __init__(self):
+        self.cpu = None
+        self.net = None
+
+    @staticmethod
+    def _meminfo():
+        out = {}
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                k, _, v = line.partition(":")
+                out[k] = int(v.split()[0]) * 1024      # kB -> bytes
+        return out
+
+    def _cpu_percent(self):
+        with open("/proc/stat") as fh:
+            parts = [int(x) for x in fh.readline().split()[1:]]
+        idle, total = parts[3] + parts[4], sum(parts)
+        prev, self.cpu = self.cpu, (idle, total)
+        if not prev:
+            return None
+        d_total = total - prev[1]
+        if d_total <= 0:
+            return None
+        return round(100.0 * (1 - (idle - prev[0]) / d_total), 1)
+
+    def _net_rates(self):
+        rx = tx = 0
+        with open("/proc/net/dev") as fh:
+            for line in fh.readlines()[2:]:
+                name, _, rest = line.partition(":")
+                if name.strip() == "lo":
+                    continue
+                f = rest.split()
+                rx += int(f[0]); tx += int(f[8])
+        now = time.time()
+        prev, self.net = self.net, (rx, tx, now)
+        if not prev:
+            return None, None
+        dt = now - prev[2]
+        if dt <= 0:
+            return None, None
+        return int((rx - prev[0]) / dt), int((tx - prev[1]) / dt)
+
+    def sample(self):
+        m = self._meminfo()
+        rx, tx = self._net_rates()
+        st = os.statvfs("/")
+        with open("/proc/uptime") as fh:
+            uptime = int(float(fh.readline().split()[0]))
+        with open("/proc/loadavg") as fh:
+            load = float(fh.readline().split()[0])
+        swap_total = m.get("SwapTotal", 0)
+        return {
+            "cpu": self._cpu_percent(),
+            "load": load,
+            "mem_total": m.get("MemTotal", 0),
+            # MemAvailable is what the kernel thinks is really obtainable, which
+            # is the number that matters; MemFree ignores reclaimable cache and
+            # makes a healthy box look nearly out of memory.
+            "mem_used": m.get("MemTotal", 0) - m.get("MemAvailable", 0),
+            # Reported as zero-total when the host has no swap, so the panel can
+            # leave the row out rather than drawing an empty gauge.
+            "swap_total": swap_total,
+            "swap_used": swap_total - m.get("SwapFree", 0) if swap_total else 0,
+            "disk_total": st.f_blocks * st.f_frsize,
+            "disk_used": (st.f_blocks - st.f_bfree) * st.f_frsize,
+            "rx_bps": rx,
+            "tx_bps": tx,
+            "uptime": uptime,
+        }
+
+
+# ---------------------------------------------------------------- profiles
+PROFILE_DIR = "/etc/smartdns-profiles"
+PROFILE_BASE_PORT = 5300
+NAT_TABLE = "smartdns_nat"
+
+
+def sh(*args):
+    return subprocess.run(list(args), capture_output=True, text=True, timeout=60)
+
+
+def nft(*args):
+    return sh("/usr/sbin/nft", *args)
+
+
+CUSTOM_CONF = "/etc/dnsmasq.d/50-smartdns-custom.conf"
+# What the profile resolvers read instead of /etc/dnsmasq.d. Same files, minus
+# the operator's custom domains - those are per template, and a profile that
+# does not route them must not find them at all.
+BASE_DIR = "/etc/smartdns-base"
+
+
+def sync_base_dir():
+    """Keep BASE_DIR mirroring /etc/dnsmasq.d, except the custom domains.
+
+    Symlinks rather than copies, so `smartdns add` and epic-pin still reach
+    every resolver on the machine without knowing this directory exists.
+    """
+    os.makedirs(BASE_DIR, exist_ok=True)
+    want = {f for f in os.listdir("/etc/dnsmasq.d")
+            if f.endswith(".conf") and f != os.path.basename(CUSTOM_CONF)}
+    have = set(os.listdir(BASE_DIR))
+    changed = False
+    for f in want - have:
+        os.symlink(os.path.join("/etc/dnsmasq.d", f), os.path.join(BASE_DIR, f))
+        changed = True
+    for f in have - want:
+        os.unlink(os.path.join(BASE_DIR, f))
+        changed = True
+    return changed
+
+
+def apply_custom_domains(domains):
+    """Route the domains the operator added in the panel.
+
+    Written into /etc/dnsmasq.d, which every resolver on this machine reads -
+    the main one and each profile - so one entry in the panel reaches every
+    plan. Returns whether anything changed, because dnsmasq cannot reload its
+    config: it has to be restarted, and restarting it on every sync would be a
+    DNS outage twice a minute.
+    """
+    self_ip = CFG.get("SELF_IP") or ""
+    body = ["# Domains added by the operator in the panel. Generated by",
+            "# smartdns-sync from the panel's database - edit it there, not here."]
+    body += ["address=/%s/%s" % (d, self_ip) for d in sorted(set(domains))]
+    text = "\n".join(body) + "\n"
+
+    current = None
+    if os.path.exists(CUSTOM_CONF):
+        with open(CUSTOM_CONF) as fh:
+            current = fh.read()
+    if current == text or (not domains and current is None):
+        return False
+
+    with open(CUSTOM_CONF, "w") as fh:
+        fh.write(text)
+    # Check before restarting. A bad line here takes DNS down for everyone on
+    # this relay, and dnsmasq refuses to start rather than skipping it.
+    if sh("/usr/sbin/dnsmasq", "--test", "-C", "/etc/dnsmasq.conf").returncode != 0:
+        if current is None:
+            os.unlink(CUSTOM_CONF)
+        else:
+            with open(CUSTOM_CONF, "w") as fh:
+                fh.write(current)
+        print("custom domains rejected by dnsmasq - reverted",
+              file=sys.stderr, flush=True)
+        return False
+    sh("systemctl", "restart", "dnsmasq")
+    print("custom domains: %d applied" % len(set(domains)), flush=True)
+    return True
+
+
+def apply_profiles(profiles, assignment, restart=False):
+    """Give each template its own resolver, and point each address at one.
+
+    dnsmasq cannot answer differently per client, so the split is done with one
+    instance per profile on its own port plus an nftables redirect keyed on the
+    source address. Customers all use the same DNS address; the kernel decides
+    which instance actually answers them.
+
+    A profile whose template routes everything gets no instance: that is what
+    the main resolver on port 53 already does, and every address not named in a
+    redirect falls through to it.
+    """
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    if sync_base_dir():
+        restart = True
+    ports = {}
+    for i, key in enumerate(sorted(profiles)):
+        ports[key] = PROFILE_BASE_PORT + i
+
+    wanted_units = set()
+    for key, spec in sorted(profiles.items()):
+        port = ports[key]
+        body = ["# generated by smartdns-sync - do not edit",
+                "port=%d" % port]
+        # The operator's own domains, listed only for templates that route
+        # them. They cannot be un-routed by rule the way a service can: both
+        # rules would name the same host and dnsmasq prefers the address= one.
+        # So absence is the mechanism, which is why this resolver reads
+        # BASE_DIR rather than /etc/dnsmasq.d.
+        body += ["address=/%s/%s" % (d, CFG.get("SELF_IP") or "")
+                 for d in sorted(set(spec.get("custom") or []))]
+        # These are the names this profile does NOT route. A server= rule is
+        # more specific than the address= rule that hijacks the parent, so
+        # dnsmasq's longest match sends them to a real resolver instead of to
+        # this relay.
+        body += ["server=/%s/1.1.1.1" % d for d in spec.get("bypass", [])]
+        conf = os.path.join(PROFILE_DIR, "%s.conf" % key)
+        text = "\n".join(body) + "\n"
+        changed = True
+        if os.path.exists(conf):
+            with open(conf) as fh:
+                changed = fh.read() != text
+        if changed:
+            with open(conf, "w") as fh:
+                fh.write(text)
+        unit = "smartdns-dns@%s" % key
+        wanted_units.add(unit)
+        active = sh("systemctl", "is-active", unit).stdout.strip() == "active"
+        # `restart` is set when the shared /etc/dnsmasq.d changed underneath
+        # us: these instances read it too, and dnsmasq only picks up config at
+        # startup, so without this a new domain would reach the default plan
+        # and silently miss everybody on a template.
+        if changed or not active or restart:
+            sh("systemctl", "restart", unit)
+            print("profile %s on port %d (%d bypassed)"
+                  % (key, port, len(spec.get("bypass", []))), flush=True)
+
+    # Stop resolvers for profiles nobody is on any more, and delete their
+    # config, so a template an admin removed does not linger as a process.
+    running = sh("systemctl", "list-units", "--no-legend", "--plain",
+                 "smartdns-dns@*.service").stdout
+    for line in running.splitlines():
+        unit = line.split()[0].replace(".service", "") if line.split() else ""
+        if unit and unit not in wanted_units:
+            sh("systemctl", "stop", unit)
+            key = unit.split("@", 1)[1]
+            try:
+                os.remove(os.path.join(PROFILE_DIR, "%s.conf" % key))
+            except OSError:
+                pass
+            print("profile %s retired" % key, flush=True)
+
+    apply_redirects(ports, assignment)
+
+
+def apply_redirects(ports, assignment):
+    """Point each address at its profile's resolver, with one nftables set per
+    profile and a redirect rule per set."""
+    if nft("list", "table", "ip", NAT_TABLE).returncode != 0:
+        nft("add", "table", "ip", NAT_TABLE)
+    nft("add", "chain", "ip", NAT_TABLE, "pre",
+        "{ type nat hook prerouting priority dstnat ; policy accept ; }")
+    # Rebuilt from scratch each time rather than diffed: the whole chain is a
+    # handful of rules, and a rule left behind here would send a customer to
+    # the wrong resolver silently.
+    nft("flush", "chain", "ip", NAT_TABLE, "pre")
+
+    for key, port in sorted(ports.items()):
+        setname = "prof_%s" % key
+        nft("add", "set", "ip", NAT_TABLE, setname, "{ type ipv4_addr ; }")
+        nft("flush", "set", "ip", NAT_TABLE, setname)
+        members = [ip for ip, prof in assignment.items() if prof == key]
+        if members:
+            nft("add", "element", "ip", NAT_TABLE, setname,
+                "{ %s }" % ", ".join(members))
+            nft("add", "rule", "ip", NAT_TABLE, "pre",
+                "ip saddr @%s udp dport 53 redirect to :%d" % (setname, port))
+            nft("add", "rule", "ip", NAT_TABLE, "pre",
+                "ip saddr @%s tcp dport 53 redirect to :%d" % (setname, port))
+
+
+def acl(*args):
+    return subprocess.run(
+        [ACL] + list(args), capture_output=True, text=True, timeout=30
+    )
+
+
+def current_state():
+    out = acl("list", "--json")
+    if out.returncode != 0:
+        raise RuntimeError("smartdns-acl list failed: %s" % out.stderr.strip())
+    return json.loads(out.stdout or "[]")
+
+
+HEALTH = Health()
+
+# What the shaper was last told. Speeds change about as often as somebody buys
+# a plan, and re-running tc every thirty seconds for no reason would be thirty
+# subprocesses a minute to arrive at the state already in the kernel.
+SHAPED = None
+
+
+def apply_speeds(allowed):
+    """Hand the wanted speed limits to smartdns-shape, when they have changed.
+
+    A customer with no limit is left out entirely rather than sent as zero, so
+    the shaper's job is exactly "these are the limited ones" and an account
+    going back to unlimited removes its class rather than setting it huge.
+    """
+    global SHAPED
+    wanted = sorted(
+        ({"ip": a["ip"], "mark": int(a["uid"]), "kbps": int(a.get("kbps") or 0)}
+         for a in allowed if a.get("uid") and int(a.get("kbps") or 0) > 0),
+        key=lambda w: w["mark"])
+    if wanted == SHAPED:
+        return
+    if not os.path.exists(SHAPE):
+        # An older relay that has not been upgraded yet. Say so once rather
+        # than every half minute, and carry on - unshaped is the old
+        # behaviour, not a broken one.
+        if SHAPED is None:
+            print("%s is missing - speed limits will not be applied" % SHAPE,
+                  file=sys.stderr, flush=True)
+        SHAPED = wanted
+        return
+    r = subprocess.run([SHAPE, "apply"], input=json.dumps(wanted),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        # Leave SHAPED alone so the next pass tries again.
+        print("shaping failed: %s" % r.stderr.strip(), file=sys.stderr, flush=True)
+        return
+    if r.stdout.strip():
+        print(r.stdout.strip(), flush=True)
+    SHAPED = wanted
+
+
+def sync_once():
+    rows = current_state()
+    counters = {r["ip"]: r["total"] for r in rows}
+    # Metrics ride along on a request that was happening anyway - no second
+    # connection, no second schedule, and they arrive stamped with the same
+    # moment as the usage they sit beside.
+    try:
+        host = HEALTH.sample()
+    except Exception as e:
+        host = {"error": str(e)}
+    answer = post("/sync", {"counters": counters, "host": host})
+
+    names = {a["ip"]: a.get("name", "") for a in answer.get("allowed", [])}
+    want = set(names)
+    have = {r["ip"] for r in rows}
+
+    # Which resolver each address should be answered by. Applied before the
+    # allowlist below, so an address is pointed at the right resolver no later
+    # than the moment it is let in.
+    try:
+        changed = apply_custom_domains(answer.get("extra_domains") or [])
+        assignment = {a["ip"]: a.get("profile", "")
+                      for a in answer.get("allowed", []) if a.get("profile")}
+        apply_profiles(answer.get("profiles") or {}, assignment, restart=changed)
+    except Exception as e:
+        print("profiles failed: %s" % e, file=sys.stderr, flush=True)
+
+    try:
+        apply_speeds(answer.get("allowed") or [])
+    except Exception as e:
+        print("speeds failed: %s" % e, file=sys.stderr, flush=True)
+
+    for ip in sorted(want - have):
+        r = acl("add", ip, names[ip]) if names[ip] else acl("add", ip)
+        print("added %s%s" % (ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()),
+              flush=True)
+    for ip in sorted(have - want):
+        r = acl("del", ip)
+        print("removed %s%s" % (ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()),
+              flush=True)
+    return len(want), len(want - have), len(have - want)
+
+
+def sync_loop():
+    fails = 0
+    while True:
+        try:
+            total, added, removed = sync_once()
+            if added or removed:
+                print("sync: %d allowed (+%d -%d)" % (total, added, removed), flush=True)
+            fails = 0
+        except Exception as e:
+            fails += 1
+            # Noisy for the first few, then quiet: if the exit is down for an
+            # hour the journal should not be mostly this message. The allowlist
+            # already in the kernel keeps working throughout - a sync outage
+            # must never cut off paying users.
+            if fails <= 3 or fails % 20 == 0:
+                print("sync failed (%d): %s" % (fails, e), file=sys.stderr, flush=True)
+        time.sleep(INTERVAL)
+
+
+# ------------------------------------------------------------- user panel
+USER_CSS = """
+*{box-sizing:border-box}
+body{margin:0;background:#0f1115;color:#e6e8eb;
+ font:15px/1.9 system-ui,'Segoe UI',Tahoma,sans-serif;
+ display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{background:#171a21;border:1px solid #262b36;border-radius:16px;
+ padding:26px;max-width:440px;width:100%}
+h1{font-size:18px;margin:0 0 4px;font-weight:600}
+.sub{color:#8b949e;font-size:13px;margin-bottom:20px}
+.row{display:flex;justify-content:space-between;align-items:baseline;
+ padding:11px 0;border-bottom:1px solid #1c2029}
+.row:last-of-type{border-bottom:0}
+.k{color:#8b949e;font-size:13px}
+.v{font-weight:600}
+code{background:#0f1115;padding:3px 9px;border-radius:6px;color:#7dd3a0;font-size:14px}
+.bar{height:8px;background:#0f1115;border-radius:4px;overflow:hidden;margin-top:10px}
+.bar i{display:block;height:100%;background:#7dd3a0}
+.bar i.warn{background:#e3b341}
+.bar i.hot{background:#f85149}
+button,a.btn{display:block;width:100%;margin-top:18px;padding:13px;font:inherit;
+ font-weight:600;text-align:center;text-decoration:none;
+ background:#238636;color:#fff;border:0;border-radius:10px;cursor:pointer}
+button:hover,a.btn:hover{background:#2ea043}
+button.ghost,a.btn.ghost{background:transparent;border:1px solid #30363d;
+ color:#9aa4b2;font-weight:400}
+button.ghost:hover,a.btn.ghost:hover{background:#1c2029}
+label{display:block;color:#8b949e;font-size:12px;margin:14px 0 6px}
+input{width:100%;padding:12px;font:inherit;background:#0f1115;color:#e6e8eb;
+ border:1px solid #30363d;border-radius:10px}
+input:focus{outline:0;border-color:#238636}
+.alt{text-align:center;margin-top:18px;font-size:13px;color:#8b949e}
+.alt a{color:#7dd3a0}
+.big{font-size:22px;font-weight:600;text-align:center;letter-spacing:.5px;
+ background:#0f1115;border:1px solid #262b36;border-radius:12px;padding:18px;
+ color:#7dd3a0;margin:6px 0 4px;direction:ltr}
+.note{color:#8b949e;font-size:12px;line-height:1.8;margin-top:16px}
+.msg{padding:11px 14px;border-radius:9px;margin-bottom:16px;font-size:13px}
+.msg.good{background:#12261a;border:1px solid #238636}
+.msg.err{background:#2b1416;border:1px solid #6e2c2c}
+.msg.warnbox{background:#2b2411;border:1px solid #6e5a2c}
+.icon{font-size:40px;text-align:center;line-height:1;margin-bottom:12px}
+.dns{margin-top:20px;padding:16px;background:#0f1115;border:1px solid #262b36;
+ border-radius:12px}
+.dns .k{color:#8b949e;font-size:12px;margin-bottom:8px}
+.dns .big{margin:0}
+.dns .note{margin-top:12px}
+.dns input[type=file]{width:100%;padding:10px;font-size:12px;
+ border:1px dashed #30363d;background:transparent;margin-bottom:4px}
+.ok{color:#7dd3a0}.bad{color:#f85149}.warn{color:#e3b341}
+"""
+
+
+def brand():
+    """What to call the service on the customer's pages.
+
+    The domain they typed to get here. Nothing to configure, nothing that can
+    disagree with the address in the browser bar, and no second place to
+    rename the service and forget.
+    """
+    return (CFG or {}).get("PANEL_DOMAIN") or "سرویس"
+
+
+def user_page(inner):
+    return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>%s</title><style>%s</style></head><body>
+<div class="card">%s</div></body></html>"""
+            % (html.escape(brand()), USER_CSS, inner))
+
+
+def insecure_notice():
+    """Shown instead of a password form when the panel has no certificate.
+
+    A relay with no domain serves plain http, and this page is opened over an
+    Iranian ISP. Asking for a password there would hand it to whoever is
+    watching, so the form is not offered at all rather than offered unsafely.
+
+    There is no fallback left. This page is now the only way in, so a relay
+    without a certificate has no customer panel at all - which is a thing the
+    operator has to fix rather than a thing to work around here.
+    """
+    return ("<div class='icon'>🔒</div><h1>هنوز آماده نیست</h1>"
+            "<p class='sub'>ورود و ثبت‌نام روی این سرور خاموش است، چون این صفحه "
+            "رمزگذاری‌شده نیست و رمز شما در مسیر قابل خواندن می‌بود.</p>"
+            "<p class='note'>به مدیر سرویس بگویید برای این سرور یک دامنه و "
+            "گواهی تنظیم کند؛ بعد از آن همین صفحه کار می‌کند.</p>")
+
+
+def landing(banner=""):
+    return (banner +
+            "<div class='icon'>🌐</div><h1>%s</h1>"
+            "<p class='sub'>برای دیدن حساب و ثبت آی‌پی وارد شوید.</p>"
+            "<a class='btn' href='/login'>ورود</a>"
+            "<a class='btn ghost' href='/signup'>ثبت‌نام</a>"
+            "<p class='note'>از همان اینترنتی وارد شوید که می‌خواهید سرویس "
+            "روی آن کار کند — آی‌پی همان اتصال ثبت می‌شود.</p>"
+            % html.escape(brand()))
+
+
+def signup_form(banner=""):
+    return (banner +
+            "<h1>ثبت‌نام</h1><p class='sub'>%s</p>"
+            "<form method='post' action='/signup'>"
+            "<label>نام</label>"
+            "<input name='name' maxlength='60' autocomplete='name'>"
+            "<label>شماره موبایل</label>"
+            "<input name='phone' inputmode='numeric' required "
+            "placeholder='09123456789' autocomplete='tel'>"
+            "<label>رمز عبور (دست‌کم ۸ نویسه)</label>"
+            "<input name='password' type='password' required minlength='8' "
+            "autocomplete='new-password'>"
+            "<label>تکرار رمز عبور</label>"
+            "<input name='password2' type='password' required minlength='8' "
+            "autocomplete='new-password'>"
+            "<button>ساخت حساب</button></form>"
+            "<p class='note'>شماره فقط برای شناسایی حساب و تطبیق رسید پرداخت "
+            "است؛ پیامکی فرستاده نمی‌شود.</p>"
+            "<p class='alt'>حساب دارید؟ <a href='/login'>وارد شوید</a></p>"
+            % html.escape(brand()))
+
+
+def login_form(banner=""):
+    return (banner +
+            "<h1>ورود</h1><p class='sub'>%s</p>"
+            "<form method='post' action='/login'>"
+            "<label>شماره موبایل</label>"
+            "<input name='phone' inputmode='numeric' required "
+            "placeholder='09123456789' autocomplete='tel'>"
+            "<label>رمز عبور</label>"
+            "<input name='password' type='password' required "
+            "autocomplete='current-password'>"
+            "<button>ورود</button></form>"
+            "<p class='alt'>حساب ندارید؟ <a href='/signup'>ثبت‌نام کنید</a></p>"
+            % html.escape(brand()))
+
+
+def register_ip_page(ip, banner=""):
+    """The step between signing up and having a working service.
+
+    It shows the address rather than registering it quietly, because this is
+    the one thing on the whole panel the customer has to get right: the address
+    seen here is the address that will work, and if they opened the page over
+    mobile data or a VPN it is the wrong one. Naming it gives them the chance
+    to notice.
+    """
+    return (banner +
+            "<div class='icon'>📍</div><h1>ثبت آی‌پی</h1>"
+            "<p class='sub'>سرویس روی همین آی‌پی باز می‌شود.</p>"
+            "<div class='big'>%s</div>"
+            "<form method='post' action='/register-ip'>"
+            "<button>همین آی‌پی را ثبت کن</button></form>"
+            "<p class='note'>اگر این آی‌پی اینترنت خانه یا موبایل شما "
+            "<b>نیست</b> — مثلاً وی‌پی‌ان روشن است یا از اینترنت دیگری وارد "
+            "شده‌اید — آن را ببندید، همین صفحه را تازه کنید و بعد ثبت کنید.</p>"
+            "<p class='note'>آی‌پی خانگی معمولاً ثابت نیست. اگر مودم را ریست "
+            "کردید و سرویس قطع شد، دوباره به همین صفحه بیایید و ثبت کنید.</p>"
+            "<p class='alt'><a href='/'>فعلاً نه، برو به حساب</a></p>"
+            % html.escape(ip))
+
+
+def account_notice(info):
+    """The warning the bot used to send, on the page instead.
+
+    A message reached only the accounts that had a Telegram behind them, which
+    by the end was a minority. This reaches everybody, and it is on the screen
+    they open when something has stopped working - which is when they look.
+
+    Only the worst applicable one is shown. Three stacked warnings about the
+    same allowance is noise, and the reader stops reading.
+    """
+    status = info.get("status")
+    if status == "expired":
+        return ("<div class='msg err'><b>دورهٔ آزمایشی شما تمام شد.</b> "
+                "سرویس تا تمدید کار نمی‌کند.</div>")
+    if status == "over_quota":
+        return ("<div class='msg err'><b>سهمیهٔ شما تمام شد.</b> "
+                "سرویس تا شارژ مجدد قطع است.</div>")
+    if status != "active":
+        return "<div class='msg err'>حساب شما غیرفعال است.</div>"
+
+    quota, used = info.get("quota") or 0, info.get("used") or 0
+    if quota:
+        left = max(0, quota - used)
+        # The same thresholds the panel records, read back rather than
+        # recomputed, so the page and the database never disagree about
+        # whether somebody has been warned.
+        if info.get("warned", 0) & 2:
+            return ("<div class='msg err'>بیش از ۹۵٪ سهمیه‌تان مصرف شده — "
+                    "%s مانده.</div>" % human_fa(left))
+        if info.get("warned", 0) & 1:
+            return ("<div class='msg warnbox'>بیش از ۸۰٪ سهمیه‌تان مصرف شده — "
+                    "%s مانده.</div>" % human_fa(left))
+
+    ends = info.get("expires")
+    if ends:
+        return ("<div class='msg warnbox'>دورهٔ آزمایشی شما در <b>%s</b> "
+                "تمام می‌شود.</div>" % html.escape(ends))
+    return ""
+
+
+def dns_box():
+    """The address the customer has to type into their console or router.
+
+    Served by the relay, so it is this machine's own address - not something
+    configured twice and able to disagree. A customer on a second relay is
+    looking at that relay's page and gets that relay's address, which is the
+    one that will work for them.
+
+    Only the first is given. Consoles ask for two, and the honest answer is to
+    repeat this one: a second, different resolver would answer the sanctioned
+    names truthfully and the service would fail intermittently in a way nobody
+    could diagnose.
+    """
+    ip = (CFG or {}).get("SELF_IP", "")
+    if not ip:
+        return ""
+    return ("<div class='dns'><div class='k'>آدرس DNS</div>"
+            "<div class='big'>%s</div>"
+            "<p class='note'>این را در تنظیمات شبکهٔ کنسول، گوشی یا مودم "
+            "به‌عنوان <b>DNS اول</b> بگذارید. اگر DNS دوم هم می‌خواهد، "
+            "<b>همین آدرس</b> را دوباره بنویسید — آدرس دیگری آنجا باعث می‌شود "
+            "سرویس گاهی کار کند و گاهی نه.</p></div>" % html.escape(ip))
+
+
+def human_fa(n):
+    n = float(n or 0)
+    for unit in ("بایت", "کیلوبایت", "مگابایت", "گیگابایت", "ترابایت"):
+        if n < 1024 or unit == "ترابایت":
+            return ("%d %s" if unit == "بایت" else "%.2f %s") % (n, unit)
+        n /= 1024
+
+
+class UserPanel(http.server.BaseHTTPRequestHandler):
+    """The page a customer sees.
+
+    It keeps no state of its own. The cookie is handed to the panel on the exit
+    node, which says who it belongs to - so a relay rebuilt from scratch does
+    not log anybody out, and a second relay serves the same session without the
+    two needing to share anything.
+    """
+
+    server_version = "smartdns"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def client_ip(self):
+        # The socket, never a header. Trusting X-Forwarded-For here would let
+        # anyone register any address by sending one.
+        return self.client_address[0]
+
+    def send_html(self, body, code=200, headers=None):
+        blob = user_page(body).encode("utf-8")
+        # See send(): a clean buffer, so a failed attempt cannot leave half a
+        # status line in front of this one.
+        self._headers_buffer = []
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(blob)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(blob)
+
+    def session(self):
+        cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        return cookie["sdu"].value if "sdu" in cookie else ""
+
+    def upload(self, field):
+        """Pull one file out of a multipart body: (bytes, content type).
+
+        Hand-written because cgi was removed in Python 3.13 and this installer
+        has no pip step. One field is all that is needed, so this only has to
+        find its part and hand back what sits between the blank line and the
+        next boundary.
+        """
+        ctype = self.headers.get("Content-Type") or ""
+        if "boundary=" not in ctype:
+            raise ValueError("فایلی فرستاده نشد")
+        boundary = ctype.split("boundary=", 1)[1].strip().strip('"')
+        want = ('name="%s"' % field).encode("latin-1")
+        for part in getattr(self, "raw_body", b"").split(b"--" + boundary.encode("latin-1")):
+            head, blank, data = part.partition(b"\r\n\r\n")
+            if not blank or want not in head:
+                continue
+            kind = ""
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"content-type:"):
+                    kind = line.split(b":", 1)[1].decode("latin-1").strip()
+            # The trailing CRLF belongs to the delimiter, not the file.
+            return (data[:-2] if data.endswith(b"\r\n") else data), kind
+        raise ValueError("فایلی انتخاب نشده بود")
+
+    def form(self):
+        """Read the POST body. Bounded, because this is a public port in Iran
+        and nothing stops somebody announcing a gigabyte.
+
+        A receipt arrives as multipart and is kept as raw bytes for upload()
+        to pick apart; everything else is a small urlencoded form.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return {}
+        if length <= 0:
+            return {}
+        if "multipart/form-data" in (self.headers.get("Content-Type") or ""):
+            if length > MAX_RECEIPT + 64 * 1024:      # the file plus its wrapper
+                self.raw_body = b""
+                return {"too_big": "1"}
+            self.raw_body = self.rfile.read(length)
+            return {}
+        if length > 8192:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8", "replace")
+        return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+
+    def cookie_for(self, session):
+        return ("sdu=%s; Path=/; HttpOnly; %sSameSite=Lax; Max-Age=%d"
+                % (session, "Secure; " if SECURE else "", 30 * 86400))
+
+    def redirect(self, where, message="", bad=False):
+        if message:
+            where += ("&" if "?" in where else "?") + "m=" + \
+                urllib.parse.quote(message) + ("&e=1" if bad else "")
+        return self.send("", 303, {"Location": where})
+
+    def banner(self):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        msg = (q.get("m") or [""])[0]
+        if not msg:
+            return ""
+        return "<div class='msg %s'>%s</div>" % (
+            "err" if q.get("e") else "good", html.escape(msg[:200]))
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+
+        if path in ("/signup", "/login"):
+            if not SECURE:
+                return self.send_html(insecure_notice())
+            # Whether a cookie is here decides only whether to offer a way back
+            # to the account, never whether to show the form. Bouncing on the
+            # cookie's mere existence trapped anyone holding an expired one:
+            # they were sent to a page that said their session had ended, on
+            # their way to the page that would have given them a new one.
+            back = ("<p class='alt'><a href='/'>برگشت به حساب</a></p>"
+                    if self.session() else "")
+            return self.send_html(
+                (signup_form(self.banner()) if path == "/signup"
+                 else login_form(self.banner())) + back)
+
+        if path == "/register-ip":
+            if not self.session():
+                return self.redirect("/")
+            return self.send_html(register_ip_page(self.client_ip(), self.banner()))
+
+        if path == "/logout":
+            return self.send("", 303, {"Location": "/",
+                                       "Set-Cookie": "sdu=; Path=/; Max-Age=0"})
+
+        if path != "/":
+            return self.send_html("<div class='icon'>❔</div><h1>صفحه پیدا نشد</h1>", 404)
+        return self.dashboard()
+
+    def send(self, body, code, headers):
+        blob = body.encode() if isinstance(body, str) else body
+        # Nothing reaches the socket until end_headers(), so a send() that
+        # raised part-way through leaves a half-written status line behind.
+        # Clearing the buffer keeps the next response from being appended to
+        # it and handed to the browser as one corrupt reply.
+        self._headers_buffer = []
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(blob)))
+        for k, v in headers.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(blob)
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+
+        if path in ("/signup", "/login"):
+            if not SECURE:
+                return self.send_html(insecure_notice(), 400)
+            form = self.form()
+            endpoint = "/user-signup" if path == "/signup" else "/user-password-login"
+            payload = {"phone": form.get("phone", ""),
+                       "password": form.get("password", ""),
+                       "ip": self.client_ip()}
+            if path == "/signup":
+                payload["name"] = form.get("name", "")
+                if form.get("password") != form.get("password2"):
+                    return self.redirect("/signup", "دو رمز یکی نیستند", bad=True)
+            try:
+                res = post(endpoint, payload)
+            except Exception as e:
+                print("%s failed: %s" % (endpoint, e), file=sys.stderr, flush=True)
+                return self.redirect(path, "الان نشد، چند دقیقه دیگر", bad=True)
+            if not res.get("ok"):
+                return self.redirect(path, res.get("message", "خطا"), bad=True)
+            # Straight to the address page either way. A new account has no
+            # address yet, and somebody signing in from a new connection is
+            # usually signing in precisely because the address changed.
+            return self.send("", 303, {
+                "Location": "/register-ip",
+                "Set-Cookie": self.cookie_for(res["session"])})
+
+        if path == "/receipt":
+            if not self.session():
+                return self.redirect("/")
+            form = self.form()
+            if form.get("too_big"):
+                return self.redirect("/", "فایل خیلی بزرگ است", bad=True)
+            try:
+                blob, kind = self.upload("file")
+            except ValueError as e:
+                return self.redirect("/", str(e), bad=True)
+            try:
+                res = post("/user-receipt", {
+                    "session": self.session(),
+                    "content_type": kind,
+                    "data": base64.b64encode(blob).decode("ascii"),
+                })
+            except Exception as e:
+                print("receipt failed: %s" % e, file=sys.stderr, flush=True)
+                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            return self.redirect("/", res.get("message", ""),
+                                 bad=not res.get("ok"))
+
+        if path != "/register-ip":
+            return self.send_html("<h1>404</h1>", 404)
+        try:
+            res = post("/user-claim", {"session": self.session(),
+                                       "ip": self.client_ip()})
+        except Exception:
+            res = {"ok": False, "message": "الان نشد"}
+        return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
+
+    def dashboard(self):
+        token = self.session()
+        if not token:
+            if not SECURE:
+                return self.send_html(insecure_notice())
+            return self.send_html(landing(self.banner()))
+        try:
+            info = post("/user-info", {"session": token, "ip": self.client_ip()})
+        except Exception as e:
+            print("user-info failed: %s" % e, file=sys.stderr, flush=True)
+            return self.send_html("<div class='icon'>⚠️</div><h1>الان نشد</h1>"
+                                  "<p class='sub'>چند دقیقه دیگر دوباره.</p>", 502)
+        if not info.get("ok"):
+            return self.send_html(
+                "<div class='icon'>🔑</div><h1>نشست منقضی شده</h1>"
+                "<p class='sub'>دوباره <a href='/login'>وارد شوید</a>.</p>",
+                200, {"Set-Cookie": "sdu=; Path=/; Max-Age=0"})
+
+        banner = self.banner()
+
+        used, quota = info["used"], info["quota"]
+        seen = info.get("seen_ip") or self.client_ip()
+        rows = [("پلن", html.escape(info.get("plan") or "-")),
+                ("آی‌پی ثبت‌شده", "<code>%s</code>" % html.escape(info["ip"] or "ثبت نشده")),
+                ("مصرف", human_fa(used))]
+        if quota:
+            rows.append(("سهمیه", human_fa(quota)))
+            rows.append(("باقی‌مانده", human_fa(max(0, quota - used))))
+        else:
+            rows.append(("سهمیه", "نامحدود"))
+        kbps = info.get("speed_kbps") or 0
+        rows.append(("سرعت", ("%g مگابیت بر ثانیه" % (kbps / 1000.0)) if kbps
+                     else "بدون محدودیت"))
+        if info.get("expires"):
+            rows.append(("پایان دوره", info["expires"]))
+        elif info.get("renews"):
+            rows.append(("تمدید", info["renews"]))
+        rows.append(("کیف پول", "%s تومان" % format(info.get("wallet") or 0, ",")))
+        state = {"active": "<span class='ok'>فعال</span>",
+                 "over_quota": "<span class='warn'>سهمیه تمام شده</span>",
+                 "expired": "<span class='warn'>دورهٔ آزمایشی تمام شد</span>"}.get(
+                     info["status"], "<span class='bad'>غیرفعال</span>")
+        rows.append(("وضعیت", state))
+
+        gauge = ""
+        if quota:
+            pct = min(100, int(100.0 * used / quota))
+            cls = "hot" if pct >= 90 else ("warn" if pct >= 75 else "")
+            gauge = ("<div class='bar'><i class='%s' style='width:%d%%'></i></div>"
+                     % (cls, pct))
+
+        body = ["<h1>%s</h1>" % html.escape(info.get("name") or "حساب شما"),
+                "<div class='sub'>%s</div>" % html.escape(brand()),
+                banner, account_notice(info)]
+        for k, v in rows:
+            body.append("<div class='row'><span class='k'>%s</span>"
+                        "<span class='v'>%s</span></div>" % (k, v))
+        body.append(gauge)
+        body.append(dns_box())
+
+        if not info["ip"]:
+            body.append(
+                "<a class='btn' href='/register-ip'>ثبت آی‌پی — سرویس هنوز "
+                "باز نشده</a>"
+                "<p class='note'>تا آی‌پی ثبت نشود سرویس روی اینترنت شما کار "
+                "نمی‌کند.</p>")
+        elif info["ip"] != seen:
+            body.append(
+                "<a class='btn' href='/register-ip'>ثبت آی‌پی فعلی (%s)</a>"
+                "<p class='note'>آی‌پی اینترنت شما با آنچه ثبت شده فرق دارد. "
+                "این دکمه آی‌پی فعلی را جایگزین می‌کند.</p>" % html.escape(seen))
+        else:
+            body.append(
+                "<a class='btn ghost' href='/register-ip'>"
+                "ثبت دوباره همین آی‌پی</a>"
+                "<p class='note'>آی‌پی شما درست ثبت شده. اگر مودم را ریست کردید و "
+                "سرویس قطع شد، همین صفحه را باز کنید و این دکمه را بزنید.</p>")
+        body.append(
+            "<div class='dns'><div class='k'>ارسال رسید پرداخت</div>"
+            "<p class='note' style='margin-top:0'>عکس فیش واریزی را بفرستید تا "
+            "مدیر بررسی کند و حسابتان شارژ شود. عکس یا PDF، حداکثر ۴ مگابایت. "
+            "اگر رسید تازه‌ای بفرستید، جای قبلی را می‌گیرد.</p>"
+            "<form method='post' action='/receipt' enctype='multipart/form-data'>"
+            "<input type='file' name='file' required "
+            "accept='image/jpeg,image/png,image/webp,application/pdf'>"
+            "<button class='ghost'>فرستادن رسید</button></form></div>")
+        body.append("<p class='alt'><a href='/logout'>خروج از حساب</a></p>")
+        return self.send_html("".join(body))
+
+
+def main():
+    global CFG, SECURE
+    CFG = load_config()
+    SECURE = bool(CFG.get("PANEL_DOMAIN"))
+    if not os.path.exists(ACL):
+        sys.exit("%s is missing - run the installer first" % ACL)
+    threading.Thread(target=sync_loop, daemon=True).start()
+
+    # Plain http on 8080 stays: links already sent to customers point at it,
+    # and a browser reaching it is redirected to the secure address rather
+    # than being left on a page that carries a login token in the clear.
+    if CFG.get("PANEL_DOMAIN"):
+        threading.Thread(target=serve_redirect, daemon=True).start()
+        serve_panel()
+    else:
+        print("sync up: every %ds to %s, panel on :%d (no certificate - plain http)"
+              % (INTERVAL, CFG["PANEL_HOST"], CLAIM_PORT), flush=True)
+        http.server.ThreadingHTTPServer(("0.0.0.0", CLAIM_PORT),
+                                        UserPanel).serve_forever()
+
+
+class Redirector(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        target = "https://%s:%d%s" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT, self.path)
+        self.send_response(308)
+        self.send_header("Location", target)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_POST = do_GET
+
+
+def serve_redirect():
+    http.server.ThreadingHTTPServer(("0.0.0.0", CLAIM_PORT), Redirector).serve_forever()
+
+
+def serve_panel():
+    cert = "/etc/letsencrypt/live/%s/fullchain.pem" % CFG["PANEL_DOMAIN"]
+    key = "/etc/letsencrypt/live/%s/privkey.pem" % CFG["PANEL_DOMAIN"]
+    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", PANEL_TLS_PORT), UserPanel)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    print("sync up: every %ds to %s, panel on https://%s:%d/"
+          % (INTERVAL, CFG["PANEL_HOST"], CFG["PANEL_DOMAIN"], PANEL_TLS_PORT),
+          flush=True)
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

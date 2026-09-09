@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""smartdns-shape - per-customer download speed limits on the relay.
+
+usage: smartdns-shape apply      read the wanted state as JSON on stdin
+       smartdns-shape list       show what is in force
+       smartdns-shape off        remove all shaping, leaving traffic alone
+
+The wanted state is a list of {"ip", "mark", "kbps"}. kbps is kilobits per
+second; a customer with no limit is simply absent from it.
+
+Why this shape and not another
+------------------------------
+Only the download direction is shaped - what the relay sends to the customer.
+That is the direction a customer notices, and on this box it is also the easy
+one: the relay is a proxy rather than a router, so every packet a customer
+receives is generated locally and leaves through one interface, where a
+queueing discipline can see it. Shaping the upload direction would mean
+policing on ingress through an ifb device, which drops rather than queues and
+buys very little for a service whose traffic is overwhelmingly inbound.
+
+htb, not a rate limit in nftables. nftables can drop above a rate, and drops
+are not shaping: TCP reacts to loss by collapsing its window, so a customer
+capped that way gets a connection that stalls and lurches rather than one that
+runs steadily a little slower. htb queues instead, and hands each class to
+fq_codel so a customer's own bulk download cannot drown out their own game.
+
+The address list stays in nftables, not here. nftables marks each packet with
+the customer's account number and tc matches the mark, so the tc side is a
+fixed set of rules that changes only when somebody's speed changes - and the
+question "which addresses does this box know about" keeps exactly one answer.
+"""
+import json
+import re
+import subprocess
+import sys
+
+# Root class: the ceiling every customer class hangs under. Deliberately far
+# above any real link speed, because it is not a limit - it is the parent htb
+# needs, and setting it near the true line rate would cap customers who have
+# no limit of their own.
+ROOT_RATE = "10gbit"
+
+# Where unmarked traffic goes: everything that is not a shaped customer,
+# including our own ssh session and the sync agent. Unshaped on purpose.
+DEFAULT_MINOR = 0xFFFF
+
+# Marks are account numbers, and this one is taken by the default class.
+MAX_MARK = DEFAULT_MINOR - 1
+
+TABLE = "inet smartdns"
+MAP = "speed"
+
+R = "\033[31m"; G = "\033[32m"; Y = "\033[33m"; N = "\033[0m"
+if not sys.stdout.isatty():
+    R = G = Y = N = ""
+
+
+def die(msg):
+    sys.stderr.write("%serror:%s %s\n" % (R, N, msg))
+    raise SystemExit(1)
+
+
+def run(*args, **kw):
+    return subprocess.run(list(args), capture_output=True, text=True,
+                          timeout=kw.get("timeout", 30))
+
+
+def tc(*args, check=True):
+    r = run("tc", *args)
+    if check and r.returncode != 0:
+        die("tc %s: %s" % (" ".join(args), r.stderr.strip()))
+    return r
+
+
+def nft(*args, check=True):
+    r = run("nft", *args)
+    if check and r.returncode != 0:
+        die("nft %s: %s" % (" ".join(args), r.stderr.strip()))
+    return r
+
+
+def wan():
+    """The interface customer traffic leaves by - the default route's."""
+    r = run("ip", "-o", "route", "get", "1.1.1.1")
+    if r.returncode != 0:
+        die("cannot work out which interface to shape: %s" % r.stderr.strip())
+    fields = r.stdout.split()
+    if "dev" not in fields:
+        die("no device in: %s" % r.stdout.strip())
+    return fields[fields.index("dev") + 1]
+
+
+# ------------------------------------------------------------------- state
+RATE_RE = re.compile(r"\brate\s+(\d+(?:\.\d+)?)([KMGT]?)bit", re.I)
+CLASS_RE = re.compile(r"^class\s+htb\s+1:([0-9a-f]+)\b", re.I)
+SCALE = {"": 0.001, "K": 1, "M": 1000, "G": 1000000, "T": 1000000000}
+
+
+def current_classes(dev):
+    """{minor: rate in kbit} for the customer classes that exist now.
+
+    Two output formats, because `tc -j` is not honoured everywhere: iproute2
+    6.1 emits JSON for `qdisc show` but silently prints the plain text format
+    for `class show`, which json.loads then chokes on. Rather than pin a
+    version, read whichever came back - the text format has been stable for
+    twenty years and is trivial to parse.
+    """
+    r = tc("-j", "class", "show", "dev", dev, check=False)
+    if r.returncode != 0 or not r.stdout.strip():
+        return {}
+    out = {}
+    text = r.stdout.lstrip()
+    if text.startswith("["):
+        for c in json.loads(text):
+            handle = c.get("handle", "")
+            major, _, minor = handle.partition(":")
+            if major != "1" or not minor:
+                continue
+            m = int(minor, 16)
+            if m not in (1, DEFAULT_MINOR):
+                out[m] = int(c.get("rate", 0)) // 1000     # bits -> kbit
+        return out
+    for line in text.splitlines():
+        hit = CLASS_RE.match(line.strip())
+        if not hit:
+            continue
+        m = int(hit.group(1), 16)
+        if m in (1, DEFAULT_MINOR):
+            continue
+        rate = RATE_RE.search(line)
+        out[m] = int(float(rate.group(1)) * SCALE[rate.group(2).upper()]) if rate else 0
+    return out
+
+
+def ensure_root(dev):
+    """Put the htb root in place if it is not there already.
+
+    Replacing it when it already exists would throw away every customer class
+    on a run that was meant to change one of them, so this checks first.
+    """
+    r = tc("-j", "qdisc", "show", "dev", dev, check=False)
+    have_htb = False
+    if r.returncode == 0 and r.stdout.strip():
+        have_htb = any(q.get("kind") == "htb" and q.get("handle") == "1:"
+                       for q in json.loads(r.stdout))
+    if have_htb:
+        return False
+    tc("qdisc", "replace", "dev", dev, "root", "handle", "1:",
+       "htb", "default", format(DEFAULT_MINOR, "x"))
+    tc("class", "replace", "dev", dev, "parent", "1:", "classid", "1:1",
+       "htb", "rate", ROOT_RATE, "ceil", ROOT_RATE)
+    tc("class", "replace", "dev", dev, "parent", "1:1",
+       "classid", "1:%x" % DEFAULT_MINOR,
+       "htb", "rate", ROOT_RATE, "ceil", ROOT_RATE)
+    tc("qdisc", "replace", "dev", dev, "parent", "1:%x" % DEFAULT_MINOR,
+       "handle", "%x:" % DEFAULT_MINOR, "fq_codel")
+    return True
+
+
+def add_class(dev, mark, kbps):
+    rate = "%dkbit" % kbps
+    tc("class", "replace", "dev", dev, "parent", "1:1",
+       "classid", "1:%x" % mark, "htb", "rate", rate, "ceil", rate,
+       # A burst of roughly a tenth of a second, so a limit reads as a steady
+       # speed rather than as a stutter, without letting a customer bank
+       # seconds of idle time into a spike the operator pays for.
+       "burst", "%dkbit" % max(15, kbps // 10))
+    tc("qdisc", "replace", "dev", dev, "parent", "1:%x" % mark,
+       "handle", "%x:" % mark, "fq_codel")
+    # The filter is keyed on the mark, so re-adding an identical one would
+    # stack duplicates. Delete first, ignore the failure when there is none.
+    tc("filter", "del", "dev", dev, "parent", "1:", "protocol", "ip",
+       "prio", "1", "handle", str(mark), "fw", check=False)
+    tc("filter", "add", "dev", dev, "parent", "1:", "protocol", "ip",
+       "prio", "1", "handle", str(mark), "fw", "flowid", "1:%x" % mark)
+
+
+def drop_class(dev, mark):
+    tc("filter", "del", "dev", dev, "parent", "1:", "protocol", "ip",
+       "prio", "1", "handle", str(mark), "fw", check=False)
+    tc("qdisc", "del", "dev", dev, "parent", "1:%x" % mark, check=False)
+    tc("class", "del", "dev", dev, "parent", "1:1",
+       "classid", "1:%x" % mark, check=False)
+
+
+def set_map(wanted):
+    """Replace the address-to-mark map in one step.
+
+    Flush and refill rather than working out the difference: the map is at
+    most a few hundred entries, and a customer must never be briefly missing
+    from it because their speed changed.
+    """
+    nft("flush", "map", *TABLE.split(), MAP)
+    if not wanted:
+        return
+    elements = ", ".join("%s : %d" % (w["ip"], w["mark"]) for w in wanted)
+    nft("add", "element", *TABLE.split(), MAP, "{ %s }" % elements)
+
+
+# ------------------------------------------------------------------ verbs
+def apply_wanted(wanted):
+    dev = wan()
+    seen = set()
+    clean = []
+    for w in wanted:
+        try:
+            mark, kbps = int(w["mark"]), int(w["kbps"])
+        except (KeyError, TypeError, ValueError):
+            die("bad entry: %r" % (w,))
+        if not 1 <= mark <= MAX_MARK:
+            die("mark %d is outside 1..%d" % (mark, MAX_MARK))
+        if mark in seen:
+            die("mark %d appears twice" % mark)
+        if kbps <= 0:
+            continue                     # no limit means no class
+        seen.add(mark)
+        clean.append({"ip": w["ip"], "mark": mark, "kbps": kbps})
+
+    if not clean:
+        # Nobody is limited, so leave the interface as the kernel set it up.
+        # htb replaces the multi-queue root, which costs a little throughput on
+        # a busy relay - not much, but not worth paying to shape nobody.
+        return teardown(dev, "no speed limits set")
+
+    built = ensure_root(dev)
+    have = current_classes(dev)
+    want = {w["mark"]: w["kbps"] for w in clean}
+
+    added = changed = removed = 0
+    for mark, kbps in sorted(want.items()):
+        if mark not in have:
+            added += 1
+        elif have[mark] != kbps:
+            changed += 1
+        else:
+            continue
+        add_class(dev, mark, kbps)
+    for mark in sorted(set(have) - set(want)):
+        drop_class(dev, mark)
+        removed += 1
+
+    set_map(clean)
+    if built or added or changed or removed:
+        print("shaping on %s: %d limited (+%d ~%d -%d)%s"
+              % (dev, len(clean), added, changed, removed,
+                 " [root created]" if built else ""))
+    return 0
+
+
+def show():
+    dev = wan()
+    have = current_classes(dev)
+    r = nft("-j", "list", "map", *TABLE.split(), MAP, check=False)
+    by_mark = {}
+    if r.returncode == 0 and r.stdout.strip():
+        for item in json.loads(r.stdout).get("nftables", []):
+            for e in (item.get("map", {}).get("elem") or []):
+                if isinstance(e, list) and len(e) == 2:
+                    by_mark[int(e[1])] = e[0]
+    if not have:
+        print("no speed limits in force on %s" % dev)
+        return 0
+    print("%-16s %-8s %s" % ("ADDRESS", "MARK", "LIMIT"))
+    for mark in sorted(have):
+        kbps = have[mark]
+        speed = ("%.1f Mbit/s" % (kbps / 1000.0)) if kbps >= 1000 \
+            else "%d kbit/s" % kbps
+        print("%-16s %-8d %s" % (by_mark.get(mark, "?"), mark, speed))
+    return 0
+
+
+def teardown(dev, why):
+    """Put the interface back the way the kernel had it.
+
+    Only says anything when there was something to remove, so the sync agent
+    calling this on a relay that has never shaped anybody stays quiet.
+    """
+    had = current_classes(dev)
+    for mark in had:
+        drop_class(dev, mark)
+    if had:
+        tc("qdisc", "del", "dev", dev, "root", check=False)
+    nft("flush", "map", *TABLE.split(), MAP, check=False)
+    if had:
+        print("%s on %s: %d class(es) removed" % (why, dev, len(had)))
+    return 0
+
+
+def off():
+    dev = wan()
+    teardown(dev, "shaping removed")
+    # Unconditionally here, unlike the reconciling path: `off` is a person
+    # asking for the root to go, whether or not any class is left.
+    tc("qdisc", "del", "dev", dev, "root", check=False)
+    print("shaping off on %s" % dev)
+    return 0
+
+
+def main():
+    verb = sys.argv[1] if len(sys.argv) > 1 else ""
+    if verb == "apply":
+        try:
+            wanted = json.loads(sys.stdin.read() or "[]")
+        except ValueError as e:
+            die("stdin is not valid json: %s" % e)
+        if not isinstance(wanted, list):
+            die("expected a list of {ip, mark, kbps}")
+        return apply_wanted(wanted)
+    if verb == "list":
+        return show()
+    if verb == "off":
+        return off()
+    sys.stderr.write(__doc__.split("\n\n")[1] + "\n")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

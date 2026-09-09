@@ -1,0 +1,9 @@
+[Unit]
+Description=Pin Epic backend names to reachable addresses
+After=network-online.target dnsmasq.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/epic-pin
+TimeoutStartSec=120

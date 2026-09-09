@@ -1,0 +1,4 @@
+# The installer and everything it carries must keep LF endings: it is run as a
+# shell script on Linux, and CRLF would break the shebang and every heredoc.
+* text=auto eol=lf
+*.png binary

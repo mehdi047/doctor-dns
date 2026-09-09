@@ -1,0 +1,299 @@
+#!/bin/bash
+# smartdns-acl - who may use this relay, and how much they have used
+#
+# usage: smartdns-acl add <ip> [name]     register an address
+#        smartdns-acl del <ip>            unregister it
+#        smartdns-acl list                everyone, with usage
+#        smartdns-acl usage <ip>          one address
+#        smartdns-acl reset <ip>|--all    zero the counters
+#        smartdns-acl enforce on|off|status
+#        smartdns-acl save                persist to disk now
+#
+# Add --json to list or usage for output meant for the panel rather than a
+# person. The panel will call this rather than touching nftables itself, so
+# that there is one place where the rules about what is legal live.
+set -uo pipefail
+export PATH="$PATH:/usr/sbin:/sbin"
+
+TABLE="inet smartdns"
+# Field separator for dump(). Deliberately not a tab: bash counts tabs as IFS
+# whitespace, so a row whose name is empty collapses two separators into one
+# and every column after it shifts left by one. That turned an unnamed address
+# into a name of "0" and a byte count of "", which is how it was found.
+SEP=$'\x1f'
+STATE=/etc/nftables.d/20-smartdns-state.conf
+ENFORCE=/etc/nftables.d/30-smartdns-enforce.conf
+
+R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; N=$'\e[0m'
+[ -t 1 ] || { R=; G=; Y=; N=; }
+
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+root() { [ "$(id -u)" = 0 ] || die "run as root"; }
+
+have_table() { nft list table $TABLE >/dev/null 2>&1; }
+
+valid_ip() {
+    local ip="${1:-}" o n=0
+    case "$ip" in ""|*[!0-9.]*|*..*|.*|*.) return 1 ;; esac
+    for o in ${ip//./ }; do
+        [ "$o" -ge 0 ] 2>/dev/null && [ "$o" -le 255 ] || return 1
+        n=$((n + 1))
+    done
+    [ "$n" = 4 ]
+}
+
+# Everything that reads the ruleset goes through nft's JSON output and python,
+# never through awk on the human-readable format. That format wraps long
+# element lists at whatever width it feels like - which is exactly the sort of
+# thing that works on a test box with three users and quietly mangles the
+# fiftieth.
+dump() {
+    nft -j list table $TABLE 2>/dev/null | python3 -c '
+import json, sys
+
+def elements(doc, name):
+    for item in doc.get("nftables", []):
+        s = item.get("set")
+        if s and s.get("name") == name:
+            return s.get("elem", []) or []
+    return []
+
+def walk(elems):
+    # An element is a bare value until it carries a comment or a counter, at
+    # which point nft wraps it in {"elem": {...}}. Flatten both shapes.
+    out = {}
+    for e in elems:
+        val, comment, byts = e, "", 0
+        if isinstance(e, dict) and "elem" in e:
+            inner = e["elem"]
+            val = inner.get("val", "")
+            comment = inner.get("comment") or ""
+            byts = (inner.get("counter") or {}).get("bytes", 0)
+        if isinstance(val, dict):
+            val = val.get("prefix", {}).get("addr", "")
+        out[str(val)] = (comment, byts)
+    return out
+
+doc = json.load(sys.stdin)
+allowed = walk(elements(doc, "allowed"))
+up      = walk(elements(doc, "up"))
+down    = walk(elements(doc, "down"))
+for ip in sorted(allowed, key=lambda a: [int(p) for p in a.split(".")]):
+    print("%s\x1f%s\x1f%d\x1f%d" % (ip, allowed[ip][0],
+                                    up.get(ip, ("", 0))[1], down.get(ip, ("", 0))[1]))
+'
+}
+
+human() {
+    python3 -c '
+import sys
+n = float(sys.argv[1])
+for unit in ("B", "KB", "MB", "GB", "TB"):
+    if n < 1024 or unit == "TB":
+        print(("%d %s" if unit == "B" else "%.2f %s") % (n, unit))
+        break
+    n /= 1024
+' "$1"
+}
+
+save() {
+    root; have_table || die "the smartdns table is not loaded"
+    mkdir -p /etc/nftables.d
+    local tmp ip name u d
+    tmp="$(mktemp)"
+    {
+        echo "# Written by smartdns-acl. Do not edit by hand - it is"
+        echo "# regenerated from the running ruleset every few minutes."
+        echo "# Registered addresses and their usage as of $(date -Is)."
+        echo
+        while IFS="$SEP" read -r ip name u d; do
+            [ -n "$ip" ] || continue
+            if [ -n "$name" ]; then
+                printf 'add element inet smartdns allowed { %s comment "%s" }\n' "$ip" "$name"
+            else
+                printf 'add element inet smartdns allowed { %s }\n' "$ip"
+            fi
+            # Packet counts are not restored. Only bytes are billed, and
+            # carrying a packet count across a reboot buys nothing.
+            printf 'add element inet smartdns up { %s counter packets 0 bytes %s }\n' "$ip" "$u"
+            printf 'add element inet smartdns down { %s counter packets 0 bytes %s }\n' "$ip" "$d"
+        done < <(dump)
+    } > "$tmp"
+    # The sets already exist, so -c on a file of `add element` really does
+    # validate what we are about to leave behind for the next boot.
+    if nft -c -f "$tmp" >/dev/null 2>&1; then
+        mv "$tmp" "$STATE"; chmod 644 "$STATE"
+    else
+        rm -f "$tmp"; die "the generated state file does not parse - not saving"
+    fi
+}
+
+registered() { dump | cut -d"$SEP" -f1 | grep -qxF "$1"; }
+
+case "${1:-}" in
+
+add)
+    root; shift
+    ip="${1:-}"; name="${2:-}"
+    valid_ip "$ip" || die "not an IPv4 address: ${ip:-<missing>}"
+    have_table || die "the smartdns table is not loaded; run the installer"
+    case "$name" in *'"'*|*'\'*) die "a name cannot contain a quote or a backslash" ;; esac
+    registered "$ip" && die "$ip is already registered"
+    if [ -n "$name" ]; then
+        nft add element $TABLE allowed "{ $ip comment \"$name\" }" || die "nft refused the address"
+    else
+        nft add element $TABLE allowed "{ $ip }" || die "nft refused the address"
+    fi
+    # Seed both counters so the address appears in `list` before it has sent
+    # a single packet. Without this a freshly added user looks like a failure.
+    nft add element $TABLE up   "{ $ip counter packets 0 bytes 0 }" 2>/dev/null
+    nft add element $TABLE down "{ $ip counter packets 0 bytes 0 }" 2>/dev/null
+    save
+    printf '%sadded%s %s%s\n' "$G" "$N" "$ip" "${name:+  ($name)}"
+    ;;
+
+del|rm|remove)
+    root; shift
+    ip="${1:-}"
+    valid_ip "$ip" || die "not an IPv4 address: ${ip:-<missing>}"
+    have_table || die "the smartdns table is not loaded"
+    registered "$ip" || die "$ip is not registered"
+    nft delete element $TABLE allowed "{ $ip }" || die "nft refused the removal"
+    nft delete element $TABLE up   "{ $ip }" 2>/dev/null
+    nft delete element $TABLE down "{ $ip }" 2>/dev/null
+    save
+    printf '%sremoved%s %s\n' "$G" "$N" "$ip"
+    ;;
+
+list|ls)
+    have_table || die "the smartdns table is not loaded"
+    if [ "${2:-}" = --json ]; then
+        dump | python3 -c '
+import json, sys
+rows = []
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    ip, name, u, d = line.rstrip("\n").split("\x1f")
+    rows.append({"ip": ip, "name": name, "up": int(u), "down": int(d),
+                 "total": int(u) + int(d)})
+print(json.dumps(rows))
+'
+        exit 0
+    fi
+    rows="$(dump)"
+    if [ -z "$rows" ]; then
+        echo "no addresses registered yet - add one with: smartdns-acl add <ip> [name]"
+        exit 0
+    fi
+    printf '%-16s %-16s %12s %12s %12s\n' ADDRESS NAME UP DOWN TOTAL
+    while IFS="$SEP" read -r ip name u d; do
+        printf '%-16s %-16s %12s %12s %12s\n' \
+            "$ip" "${name:--}" "$(human "$u")" "$(human "$d")" "$(human $((u + d)))"
+    done <<< "$rows"
+    ;;
+
+usage)
+    have_table || die "the smartdns table is not loaded"
+    ip="${2:-}"
+    valid_ip "$ip" || die "not an IPv4 address: ${ip:-<missing>}"
+    registered "$ip" || die "$ip is not registered"
+    # Field-exact, not a substring: grepping for "1.2.3.4" would also find
+    # the row belonging to 11.2.3.4.
+    IFS="$SEP" read -r _ name u d < <(dump | awk -F"$SEP" -v a="$ip" '$1 == a')
+    if [ "${3:-}" = --json ]; then
+        printf '{"ip":"%s","name":"%s","up":%s,"down":%s,"total":%s}\n' \
+            "$ip" "$name" "$u" "$d" "$((u + d))"
+    else
+        printf '%s%s\n' "$ip" "${name:+  ($name)}"
+        printf '    up    %s\n' "$(human "$u")"
+        printf '    down  %s\n' "$(human "$d")"
+        printf '    total %s\n' "$(human $((u + d)))"
+    fi
+    ;;
+
+reset)
+    root; shift
+    have_table || die "the smartdns table is not loaded"
+    if [ "${1:-}" = --all ]; then
+        targets="$(dump | cut -d"$SEP" -f1)"
+    else
+        valid_ip "${1:-}" || die "usage: smartdns-acl reset <ip>|--all"
+        registered "$1" || die "$1 is not registered"
+        targets="$1"
+    fi
+    for ip in $targets; do
+        for s in up down; do
+            nft delete element $TABLE "$s" "{ $ip }" 2>/dev/null
+            nft add element $TABLE "$s" "{ $ip counter packets 0 bytes 0 }" 2>/dev/null
+        done
+        printf '%sreset%s %s\n' "$G" "$N" "$ip"
+    done
+    save
+    ;;
+
+enforce)
+    have_table || die "the smartdns table is not loaded"
+    case "${2:-status}" in
+    on)
+        root
+        count="$(dump | grep -c . )"
+        # Switching this on with an empty allowlist would cut off every user of
+        # the service at once, this machine's owner included. It is the one
+        # mistake this tool can make that feels irreversible from the far end
+        # of a broken connection, so it refuses outright.
+        [ "$count" -gt 0 ] || die "the allowlist is empty - everyone would be cut off.
+    Register at least your own address first:  smartdns-acl add <your ip> me"
+        if [ "${3:-}" != --yes ] && [ -t 0 ]; then
+            printf '%s%s address(es) registered.%s Everyone else loses DNS, HTTP\n' "$Y" "$count" "$N"
+            printf 'and HTTPS through this relay immediately. SSH is not affected.\n'
+            printf 'Continue? [y/N] '
+            read -r ans
+            case "$ans" in y|Y|yes) ;; *) echo "cancelled"; exit 1 ;; esac
+        fi
+        mkdir -p /etc/nftables.d
+        cat > "$ENFORCE" <<'RULES'
+# Access control, switched on by `smartdns-acl enforce on`.
+# Delete this file, or run `smartdns-acl enforce off`, to open the relay again.
+# There is deliberately no rule for SSH: getting the allowlist wrong must never
+# cost you access to the machine.
+
+# The machine talks to its own resolver: epic-pin probes it every ten minutes,
+# and the installer's checks query it directly. Neither is a customer and
+# neither is in the allowlist, so without this line switching enforcement on
+# would quietly break both.
+add rule inet smartdns gate iif "lo" accept
+
+add rule inet smartdns gate ip saddr != @allowed udp dport 53 drop
+add rule inet smartdns gate ip saddr != @allowed tcp dport { 53, 80, 443 } drop
+RULES
+        nft flush chain $TABLE gate
+        nft -f "$ENFORCE" || { rm -f "$ENFORCE"; die "nft refused the rules; nothing changed"; }
+        printf '%senforcing%s - %s address(es) may use this relay\n' "$G" "$N" "$count"
+        ;;
+    off)
+        root
+        nft flush chain $TABLE gate
+        rm -f "$ENFORCE"
+        printf '%sopen%s - nothing is being blocked\n' "$Y" "$N"
+        ;;
+    status)
+        if nft list chain $TABLE gate 2>/dev/null | grep -q drop; then
+            printf 'enforcing - %s address(es) allowed\n' "$(dump | grep -c .)"
+        else
+            printf 'open - counting only, nothing is blocked\n'
+        fi
+        ;;
+    *) die "usage: smartdns-acl enforce on|off|status" ;;
+    esac
+    ;;
+
+save)
+    save; echo "saved to $STATE"
+    ;;
+
+*)
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

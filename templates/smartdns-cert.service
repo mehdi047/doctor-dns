@@ -1,0 +1,6 @@
+[Unit]
+Description=Renew the smart DNS panel certificates
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/smartdns-cert --renew

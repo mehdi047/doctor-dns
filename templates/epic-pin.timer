@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Epic backend address pins
+
+[Timer]
+# Epic's address sets rotate, and a pin that has gone stale is worse than none,
+# so refresh often and start shortly after boot rather than waiting a full cycle.
+OnBootSec=2min
+OnUnitActiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+# Anything carrying a real deployment's addresses or secrets.
+*.env
+panel.env
+sync.env
+sites/
+build/
+
+__pycache__/
+*.pyc

@@ -1,0 +1,1388 @@
+#!/usr/bin/env python3
+"""smartdns-admin - the operator's web panel.
+
+A separate process from smartdns-panel, sharing its database. Separate because
+the bot must not go down while this is being restarted, and because a bug in a
+web form should not take the thing that talks to customers with it. sqlite is
+in WAL mode, so two processes writing short transactions is fine.
+
+Three things stand in front of it, and none of them is sufficient alone:
+
+  a port nobody scans for   keeps it out of the way, nothing more
+  a random path prefix      an unguessable URL, not a credential
+  a password               the actual authentication
+
+Security by obscurity is not security, so the password is the real control and
+the other two only reduce how often anyone finds the door at all. Optional
+address locking is available and switched off by default: the operator's home
+address is dynamic, and locking to it would eventually shut them out.
+
+Standard library only, like everything else here, so the installer keeps
+needing no pip step. No CDN either - the pages are opened from Iran, and every
+font and stylesheet host worth using is either blocked or slow.
+"""
+
+import hashlib
+import hmac
+import html
+import http.cookies
+import http.server
+import json
+import os
+import secrets
+import sqlite3
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+
+CONFIG = "/etc/smart-dns/admin.env"
+DB = "/var/lib/smart-dns/panel.db"
+SERVICES_FILE = "/usr/local/share/smart-dns/services.json"
+
+GB = 1024 ** 3
+SESSION_HOURS = 12
+# Failed logins allowed from one address before it is made to wait. A password
+# is the real defence, so this only has to make guessing slow rather than
+# impossible.
+MAX_TRIES = 8
+LOCKOUT_SECONDS = 900
+# The database is small - a few hundred kilobytes - so this is a ceiling on
+# nonsense rather than a real limit on backups.
+MAX_UPLOAD = 64 * 1024 * 1024
+
+
+def systemctl(*args):
+    """Nudge a unit, without letting a failure here become a traceback.
+
+    Used either side of a restore. If systemd is not reachable the restore
+    itself has still happened and the operator can restart by hand, so this
+    reports and carries on rather than raising.
+    """
+    try:
+        r = subprocess.run(["systemctl"] + list(args), capture_output=True,
+                           text=True, timeout=30)
+        if r.returncode != 0:
+            print("systemctl %s: %s" % (" ".join(args), r.stderr.strip()),
+                  file=sys.stderr, flush=True)
+        return r.returncode == 0
+    except Exception as e:
+        print("systemctl %s failed: %r" % (" ".join(args), e),
+              file=sys.stderr, flush=True)
+        return False
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def human(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%d %s" if unit == "B" else "%.2f %s") % (n, unit)
+        n /= 1024
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        t = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def remaining_days(ts):
+    """Days left until `ts`, as placeholder text for the day field.
+
+    Shown greyed inside the input rather than as its value, so that saving a
+    row without touching the field does not silently reset the clock to
+    whatever it happened to say.
+    """
+    when = parse_ts(ts)
+    if not when:
+        return "بی‌نهایت"
+    left = (when - datetime.now(timezone.utc)).total_seconds() / 86400.0
+    if left <= 0:
+        return "تمام"
+    return "%d روز" % max(1, round(left))
+
+
+def load_config():
+    cfg = {}
+    with open(CONFIG) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip().strip('"').strip("'")
+    for required in ("ADMIN_PATH", "ADMIN_HASH", "ADMIN_SALT", "ADMIN_PORT"):
+        if not cfg.get(required):
+            sys.exit("%s: %s is missing" % (CONFIG, required))
+    return cfg
+
+
+def hash_password(password, salt):
+    # 200k rounds: slow enough that guessing at scale is pointless, fast enough
+    # that a login is not noticeable.
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+# ------------------------------------------------------------------ storage
+class Store:
+    def __init__(self, path):
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(path, check_same_thread=False, timeout=15)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys = ON")
+        self.db.execute("PRAGMA journal_mode = WAL")
+
+    def q(self, sql, args=()):
+        with self.lock:
+            return self.db.execute(sql, args).fetchall()
+
+    def one(self, sql, args=()):
+        rows = self.q(sql, args)
+        return rows[0] if rows else None
+
+    def run(self, sql, args=()):
+        with self.lock:
+            cur = self.db.execute(sql, args)
+            self.db.commit()
+            return cur
+
+    # The same two reads smartdns-panel does, spelled the same way. This panel
+    # keeps its own connection rather than importing that one, so they are
+    # written twice on purpose - but they must agree, because one writes what
+    # the other turns into the relays' bypass lists.
+    def template_groups(self, template_id):
+        return {(r["service_key"], r["group_key"]) for r in self.q(
+            "SELECT service_key, group_key FROM template_services"
+            " WHERE template_id = ?", (template_id,))}
+
+    def template_domains_off(self, template_id):
+        return {r["domain"] for r in self.q(
+            "SELECT domain FROM template_domains_off WHERE template_id = ?",
+            (template_id,))}
+
+    def snapshot(self, path):
+        """A consistent copy of the database at `path`, minus the metrics.
+
+        VACUUM INTO rather than copying the file: sqlite is in WAL mode, so
+        what is on disk is not the whole story and a copy taken while the bot
+        is writing can produce something that will not open.
+
+        Health samples are dropped. They are the bulk of the rows and none of
+        the value - what matters in a restore is who the customers are, what
+        they bought and what they have used.
+        """
+        with self.lock:
+            self.db.execute("VACUUM INTO ?", (path,))
+        copy = sqlite3.connect(path)
+        try:
+            copy.execute("DELETE FROM metrics")
+            copy.commit()
+            copy.execute("VACUUM")
+        finally:
+            copy.close()
+        return path
+
+    def close(self):
+        with self.lock:
+            self.db.close()
+
+
+def inspect_backup(path):
+    """Check a file really is one of our backups, and say what is in it.
+
+    Raises rather than returning a verdict, because every caller wants to stop.
+    Opening as sqlite is not enough: somebody's unrelated database would pass
+    that and then replace every customer with nothing.
+    """
+    db = sqlite3.connect(path)
+    try:
+        status = db.execute("PRAGMA integrity_check").fetchone()[0]
+        if status != "ok":
+            raise ValueError("integrity check failed: %s" % status)
+        have = {r[0] for r in db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        missing = {"users", "ips", "templates", "settings"} - have
+        if missing:
+            raise ValueError("not a panel backup - missing %s"
+                             % ", ".join(sorted(missing)))
+        return {t: db.execute("SELECT count(*) FROM " + t).fetchone()[0]
+                for t in ("users", "ips", "templates", "transactions")}
+    finally:
+        db.close()
+
+
+def parse_upload(body, content_type, field):
+    """Pull one file out of a multipart/form-data body.
+
+    Hand-written because the stdlib's cgi module was removed in Python 3.13
+    and this panel is not allowed a pip step. One field is all that is needed,
+    so the parser only has to find its part and hand back the bytes between
+    that part's blank line and the next boundary.
+    """
+    marker = "boundary="
+    if marker not in (content_type or ""):
+        raise ValueError("not a file upload")
+    boundary = content_type.split(marker, 1)[1].strip().strip('"')
+    sep = b"--" + boundary.encode("latin-1")
+    want = ('name="%s"' % field).encode("latin-1")
+    for part in body.split(sep):
+        head, blank, data = part.partition(b"\r\n\r\n")
+        if not blank or want not in head:
+            continue
+        # The bytes before the next boundary carry a trailing CRLF that
+        # belongs to the delimiter, not to the file.
+        return data[:-2] if data.endswith(b"\r\n") else data
+    raise ValueError("no file was chosen")
+
+
+# A checked backup waiting for the operator to confirm. In memory on purpose:
+# a pending restore should not survive a restart, because nobody would
+# remember agreeing to it.
+PENDING = {}
+
+
+CATALOGUE = []
+
+
+def load_catalogue():
+    try:
+        with open(SERVICES_FILE, encoding="utf-8") as fh:
+            services = json.load(fh).get("services", [])
+    except Exception:
+        services = []
+    services.append({"key": "custom", "label": "دامنه‌های دلخواه شما",
+                     "groups": [{"key": "main", "label": "همه", "domains": []}]})
+    return services
+
+
+# -------------------------------------------------------------------- pages
+CSS = """
+*{box-sizing:border-box}
+body{margin:0;background:#0f1115;color:#e6e8eb;font:14px/1.7 system-ui,'Segoe UI',Tahoma,sans-serif}
+a{color:#7dd3a0;text-decoration:none}
+.wrap{max-width:1000px;margin:0 auto;padding:24px}
+header{display:flex;align-items:center;justify-content:space-between;
+ border-bottom:1px solid #262b36;padding-bottom:14px;margin-bottom:22px;flex-wrap:wrap;gap:12px}
+h1{font-size:18px;margin:0;font-weight:600}
+nav a{margin-left:16px;color:#9aa4b2;font-size:14px}
+nav a.on{color:#7dd3a0;font-weight:600}
+.card{background:#171a21;border:1px solid #262b36;border-radius:12px;padding:18px;margin-bottom:16px}
+.card h2{font-size:15px;margin:0 0 14px;font-weight:600;color:#c9d1d9}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:right;color:#8b949e;font-weight:500;padding:8px 6px;border-bottom:1px solid #262b36}
+td{padding:9px 6px;border-bottom:1px solid #1c2029}
+tr:last-child td{border-bottom:0}
+code{background:#0f1115;padding:2px 6px;border-radius:5px;color:#7dd3a0;font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+.stat{background:#0f1115;border:1px solid #262b36;border-radius:10px;padding:14px}
+.stat .n{font-size:21px;font-weight:600}
+.stat .l{color:#8b949e;font-size:12px;margin-top:3px}
+.bar{height:6px;background:#0f1115;border-radius:3px;overflow:hidden;margin-top:7px}
+.bar i{display:block;height:100%;background:#7dd3a0}
+.bar i.warn{background:#e3b341}
+.bar i.hot{background:#f85149}
+input,select,button,textarea{font:inherit;background:#0f1115;color:#e6e8eb;
+ border:1px solid #30363d;border-radius:7px;padding:8px 10px}
+button{background:#238636;border-color:#238636;cursor:pointer;font-weight:600}
+button:hover{background:#2ea043}
+button.danger{background:#6e2c2c;border-color:#6e2c2c}
+button.ghost{background:transparent;border-color:#30363d;color:#9aa4b2;font-weight:400}
+form.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.muted{color:#8b949e;font-size:12px}
+.ok{color:#7dd3a0}.bad{color:#f85149}.warn{color:#e3b341}
+.msg{padding:11px 14px;border-radius:9px;margin-bottom:16px;font-size:13px}
+.msg.good{background:#12261a;border:1px solid #238636}
+.msg.err{background:#2b1416;border:1px solid #6e2c2c}
+label{display:block;color:#8b949e;font-size:12px;margin-bottom:5px}
+.f{margin-bottom:12px}
+.login{max-width:340px;margin:14vh auto}
+.receipt{border:1px solid #262b36;border-radius:10px;padding:14px;
+ margin-bottom:14px;background:#0f1115}
+.receipt .who{font-size:14px;font-weight:600;margin-bottom:10px}
+.receipt img{max-width:100%;max-height:420px;border-radius:8px;
+ border:1px solid #262b36;display:block}
+td.acts{white-space:nowrap}
+td.acts form{display:inline}
+td.acts button{padding:6px 10px;font-size:12px;margin-right:4px}
+a.dl{display:inline-block;background:#238636;color:#fff;font-weight:600;
+ padding:9px 16px;border-radius:7px;text-decoration:none}
+a.dl:hover{background:#2ea043}
+.svc{display:inline-block;margin:0 0 8px 14px}
+.svc label{display:inline;color:#e6e8eb;font-size:13px}
+details.svc{display:block;margin:0 0 6px;border:1px solid #262b36;border-radius:9px;
+ background:#0f1115}
+details.svc>summary{padding:9px 12px;cursor:pointer;list-style:none;
+ display:flex;align-items:center;gap:10px}
+details.svc>summary::-webkit-details-marker{display:none}
+details.svc>summary::before{content:'▸';color:#8b949e;font-size:11px;
+ transition:transform .12s}
+details.svc[open]>summary::before{transform:rotate(-90deg)}
+details.svc[open]{border-color:#30363d}
+details.svc>summary label{flex:1}
+.doms{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
+ gap:2px 14px;padding:4px 30px 12px;border-top:1px solid #1c2029;margin-top:2px}
+.doms label{display:flex;align-items:center;gap:7px;color:#9aa4b2;font-size:12px;
+ font-family:ui-monospace,Consolas,monospace;margin:0;padding:2px 0}
+.doms label span{direction:ltr;overflow:hidden;text-overflow:ellipsis;
+ white-space:nowrap}
+.doms input{margin:0}
+.pick{margin-right:auto;display:flex;gap:6px}
+.pick button{padding:3px 10px;font-size:11px;font-weight:400;
+ background:transparent;border:1px solid #30363d;color:#8b949e}
+.pick button:hover{background:#1c2029}
+"""
+
+
+def page(title, body, cfg, active="", msg=None, msg_kind="good"):
+    nav = ""
+    for path, label in (("", "خانه"), ("users", "کاربران"), ("receipts", "رسیدها"),
+                        ("templates", "قالب‌ها"), ("domains", "دامنه‌ها"),
+                        ("settings", "تنظیمات"), ("logs", "لاگ")):
+        cls = " class='on'" if active == path else ""
+        nav += "<a href='/%s/%s'%s>%s</a>" % (cfg["ADMIN_PATH"], path, cls, label)
+    banner = ""
+    if msg:
+        banner = "<div class='msg %s'>%s</div>" % (msg_kind, html.escape(msg))
+    return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>%s</title><style>%s</style></head><body><div class="wrap">
+<header><h1>%s</h1><nav>%s<a href='/%s/logout'>خروج</a></nav></header>
+%s%s</div></body></html>""" % (html.escape(title), CSS, html.escape(title), nav,
+                               cfg["ADMIN_PATH"], banner, body))
+
+
+def login_page(cfg, error=None):
+    err = "<div class='msg err'>%s</div>" % html.escape(error) if error else ""
+    return """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ورود</title><style>%s</style></head><body><div class="wrap"><div class="login">
+<div class="card"><h2>پنل مدیریت</h2>%s
+<form method="post"><div class="f"><label>رمز عبور</label>
+<input type="password" name="password" autofocus style="width:100%%"></div>
+<button type="submit" style="width:100%%">ورود</button></form></div>
+</div></div></body></html>""" % (CSS, err)
+
+
+def bar(used, total):
+    if not total:
+        return "<span class='muted'>-</span>"
+    pct = min(100, int(100.0 * used / total))
+    cls = "hot" if pct >= 90 else ("warn" if pct >= 75 else "")
+    return ("%d%% <span class='muted'>(%s از %s)</span>"
+            "<div class='bar'><i class='%s' style='width:%d%%'></i></div>"
+            % (pct, human(used), human(total), cls, pct))
+
+
+# ----------------------------------------------------------------- handler
+SESSIONS = {}          # token -> expiry
+ATTEMPTS = {}          # address -> [count, first_failure_time]
+STORE = None
+CFG = {}
+
+
+class Admin(http.server.BaseHTTPRequestHandler):
+    server_version = "smartdns"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    # -- plumbing ---------------------------------------------------------
+    def send(self, body, code=200, headers=None):
+        blob = body.encode("utf-8") if isinstance(body, str) else body
+        # Start the header buffer clean. Nothing reaches the socket until
+        # end_headers(), so a send() that raised part-way through leaves a
+        # half-written status line behind; without this, the error page that
+        # follows is appended to it and the browser is handed two responses in
+        # one - which it reports as corrupted content rather than as an error.
+        self._headers_buffer = []
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(blob)))
+        # This panel is only ever reached over TLS, and none of it should sit
+        # in a cache or be framed by anything.
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(blob)
+
+    def redirect(self, path, headers=None):
+        """Redirect, percent-encoding anything that is not plain ascii.
+
+        Every message this panel shows after an action is Persian, and it
+        travels in the query string of a Location header. A header can only
+        carry latin-1, so an unencoded message makes send_header raise in the
+        middle of the response - which the browser reports as corrupted
+        content, after the action has already been carried out.
+        """
+        base, sep, query = path.lstrip("/").partition("?")
+        if sep:
+            fields = []
+            for item in query.split("&"):
+                key, _, value = item.partition("=")
+                fields.append("%s=%s" % (key, urllib.parse.quote(value, safe="")))
+            query = "?" + "&".join(fields)
+        h = {"Location": "/%s/%s%s" % (CFG["ADMIN_PATH"], base, query)}
+        h.update(headers or {})
+        self.send("", 303, h)
+
+    def body_params(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        # A file upload is read as bytes elsewhere; decoding a database as
+        # utf-8 and running it through parse_qs would be nonsense.
+        if "multipart/form-data" in (self.headers.get("Content-Type") or ""):
+            self.raw_body = self.rfile.read(min(length, MAX_UPLOAD))
+            return {}
+        raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+        return urllib.parse.parse_qs(raw, keep_blank_values=True)
+
+    # -- backup and restore ----------------------------------------------
+    def send_backup(self):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        # Beside the database rather than in /tmp: the unit sets PrivateTmp, so
+        # /tmp is a mount point of its own, and the restore path below cannot
+        # rename across one.
+        path = os.path.join(os.path.dirname(DB), ".backup-%s.db" % stamp)
+        try:
+            STORE.snapshot(path)
+            with open(path, "rb") as fh:
+                blob = fh.read()
+        except Exception as e:
+            print("backup failed: %r" % e, file=sys.stderr, flush=True)
+            return self.redirect("settings?m=!پشتیبان‌گیری نشد: %s" % e)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return self.send(blob, 200, {
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition":
+                'attachment; filename="smartdns-backup-%s.db"' % stamp})
+
+    # -- receipts ---------------------------------------------------------
+    def send_receipt(self, ident):
+        """Hand back the stored image itself, for the <img> on the page.
+
+        Served from here rather than inlined as a data URI: the page lists
+        every pending receipt, and inlining several megabytes of base64 into
+        the HTML would make the list slow to open over an Iranian connection
+        even when the operator only wants to glance at one.
+        """
+        row = STORE.one("SELECT receipt_blob, receipt_type FROM transactions"
+                        " WHERE id = ?", (int(ident) if ident.isdigit() else 0,))
+        if not row or not row["receipt_blob"]:
+            return self.send("<h1>404</h1>", 404)
+        return self.send(bytes(row["receipt_blob"]), 200, {
+            "Content-Type": row["receipt_type"] or "application/octet-stream",
+            # Not inline for a PDF: opening one in the panel's own origin is a
+            # needless way to run somebody else's file next to the session.
+            "Content-Disposition": "inline; filename=receipt-%s" % ident})
+
+    def receipts(self):
+        p = CFG["ADMIN_PATH"]
+        rows = STORE.q(
+            "SELECT t.*, u.first_name, u.phone, u.telegram_id,"
+            " length(t.receipt_blob) AS size"
+            " FROM transactions t JOIN users u ON u.id = t.user_id"
+            " ORDER BY CASE t.status WHEN 'pending' THEN 0 ELSE 1 END,"
+            " t.created_at DESC LIMIT 100")
+        pending = [r for r in rows if r["status"] == "pending"]
+        out = ["<div class='card'><h2>رسیدهای در انتظار (%d)</h2>" % len(pending)]
+        if not pending:
+            out.append("<p class='muted'>رسیدی نرسیده.</p>")
+        for r in pending:
+            who = (r["first_name"] or "") + " · " + (
+                r["phone"] or str(r["telegram_id"] or "#%d" % r["user_id"]))
+            out.append(
+                "<div class='receipt'>"
+                "<div class='who'>%s<span class='muted'> · %s · %s</span></div>"
+                "<a href='/%s/receipt/%d' target='_blank'>"
+                "<img src='/%s/receipt/%d' alt='رسید'></a>"
+                "<div class='row' style='margin-top:10px'>"
+                "<form method='post' action='/%s/receipt-decide'>"
+                "<input type='hidden' name='id' value='%d'>"
+                "<input type='hidden' name='to' value='approved'>"
+                "<button>تأیید</button></form>"
+                "<form method='post' action='/%s/receipt-decide'>"
+                "<input type='hidden' name='id' value='%d'>"
+                "<input type='hidden' name='to' value='rejected'>"
+                "<button class='danger'>رد</button></form>"
+                "<a class='muted' href='/%s/users'>ویرایش حساب این کاربر ←</a>"
+                "</div></div>"
+                % (html.escape(who), html.escape(r["created_at"][:16]),
+                   human(r["size"] or 0),
+                   p, r["id"], p, r["id"], p, r["id"], p, r["id"], p))
+        out.append("<p class='muted'>تأیید یا رد فقط تصمیم را ثبت می‌کند و عکس "
+                   "را پاک می‌کند؛ سهمیه و زمان را خودتان در صفحهٔ کاربران "
+                   "می‌گذارید.</p></div>")
+
+        decided = [r for r in rows if r["status"] != "pending"]
+        if decided:
+            out.append("<div class='card'><h2>تصمیم‌های قبلی</h2>"
+                       "<table><tr><th>کاربر</th><th>رسید</th><th>تصمیم</th>"
+                       "<th>تاریخ</th></tr>")
+            for r in decided[:40]:
+                out.append("<tr><td>%s</td><td>%s</td><td class='%s'>%s</td>"
+                           "<td>%s</td></tr>"
+                           % (html.escape((r["first_name"] or "") + " · " +
+                                          (r["phone"] or "")),
+                              html.escape(r["created_at"][:16]),
+                              "ok" if r["status"] == "approved" else "bad",
+                              "تأیید شد" if r["status"] == "approved" else "رد شد",
+                              html.escape((r["decided_at"] or "")[:16])))
+            out.append("</table></div>")
+        return "".join(out)
+
+    def take_upload(self):
+        """Stage an uploaded file and describe it, or explain why it is no good."""
+        try:
+            blob = parse_upload(getattr(self, "raw_body", b""),
+                                self.headers.get("Content-Type"), "file")
+        except ValueError as e:
+            return self.redirect("settings?m=!%s" % e)
+        if not blob:
+            return self.redirect("settings?m=!فایل خالی بود")
+        if len(blob) >= MAX_UPLOAD:
+            return self.redirect("settings?m=!فایل خیلی بزرگ است")
+
+        path = os.path.join(os.path.dirname(DB),
+                            ".restore-%s.db" % secrets.token_hex(6))
+        with open(path, "wb") as fh:
+            fh.write(blob)
+        try:
+            counts = inspect_backup(path)
+        except Exception as e:
+            os.unlink(path)
+            return self.redirect("settings?m=!این فایل نسخهٔ پشتیبان سالمی نیست: %s" % e)
+
+        old = PENDING.pop("path", None)
+        if old and os.path.exists(old):
+            os.unlink(old)
+        PENDING.update({"path": path, "counts": counts, "size": len(blob)})
+        return self.redirect("restore")
+
+    def restore_page(self):
+        p = CFG["ADMIN_PATH"]
+        if not PENDING.get("path") or not os.path.exists(PENDING.get("path", "")):
+            return ("<div class='card'><h2>بازگردانی</h2><p class='muted'>فایلی "
+                    "برای بازگردانی منتظر نیست. از <a href='/%s/settings'>تنظیمات</a> "
+                    "یک نسخهٔ پشتیبان بفرستید.</p></div>" % p)
+        c = PENDING["counts"]
+        now_c = STORE.one(
+            "SELECT (SELECT count(*) FROM users) u, (SELECT count(*) FROM ips) i,"
+            " (SELECT count(*) FROM templates) t,"
+            " (SELECT count(*) FROM transactions) x")
+        rows = [("کاربران", c["users"], now_c["u"]),
+                ("آی‌پی‌های ثبت‌شده", c["ips"], now_c["i"]),
+                ("قالب‌ها", c["templates"], now_c["t"]),
+                ("تراکنش‌ها", c["transactions"], now_c["x"])]
+        body = ["<div class='card'><h2>این فایل جایگزین دیتابیس فعلی شود؟</h2>",
+                "<p class='muted'>حجم فایل: %s</p>" % human(PENDING["size"]),
+                "<table class='tbl'><tr><th></th><th>در فایل</th>"
+                "<th>الان در سرویس</th></tr>"]
+        for label, new, old in rows:
+            cls = "" if new == old else " class='warn'"
+            body.append("<tr><td>%s</td><td%s>%d</td><td>%d</td></tr>"
+                        % (label, cls, new, old))
+        body.append("</table>")
+        body.append(
+            "<div class='msg err' style='margin-top:18px'>بازگردانی، دیتابیس "
+            "فعلی را کامل جایگزین می‌کند. از وضعیت فعلی قبلش یک نسخه کنار "
+            "دیتابیس نگه داشته می‌شود، پس این کار برگشت‌پذیر است — ولی سرویس "
+            "چند ثانیه‌ای ری‌استارت می‌شود.</div>")
+        body.append(
+            "<form method='post' action='/%s/restore-apply' style='display:inline'>"
+            "<button class='danger'>بله، جایگزین کن</button></form> "
+            "<form method='post' action='/%s/restore-cancel' style='display:inline'>"
+            "<button class='ghost'>انصراف</button></form></div>" % (p, p))
+        return "".join(body)
+
+    def apply_restore(self):
+        path = PENDING.get("path")
+        if not path or not os.path.exists(path):
+            return self.redirect("settings?m=!چیزی برای بازگردانی نیست")
+        keep = "%s.before-restore-%s" % (
+            DB, datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
+        try:
+            STORE.snapshot(keep)
+            # Stop the bot before the swap. It holds the old file open and
+            # keeps writing to the journal beside it; deleting that journal
+            # underneath a running process is how a restore becomes corruption.
+            systemctl("stop", "smartdns-panel")
+            STORE.close()
+            os.replace(path, DB)
+            for suffix in ("-wal", "-shm"):
+                try:
+                    os.unlink(DB + suffix)
+                except OSError:
+                    pass
+            systemctl("start", "smartdns-panel")
+        except Exception as e:
+            print("restore failed: %r" % e, file=sys.stderr, flush=True)
+            systemctl("start", "smartdns-panel")
+            return self.redirect("settings?m=!بازگردانی نشد: %s" % e)
+        PENDING.clear()
+
+        p = CFG["ADMIN_PATH"]
+        self.send(page("بازگردانی شد",
+                       "<div class='card'><h2>بازگردانی شد</h2>"
+                       "<p>نسخهٔ قبلی اینجا نگه داشته شد:</p><p><code>%s</code></p>"
+                       "<p class='muted'>این پنل هم دارد ری‌استارت می‌شود تا "
+                       "دیتابیس تازه را باز کند. چند ثانیه دیگر خودش برمی‌گردد.</p>"
+                       "<p><a href='/%s/users'>رفتن به کاربران</a></p></div>"
+                       % (html.escape(keep), p),
+                       CFG, "settings"),
+                  200, {"Refresh": "16; url=/%s/users" % p})
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+        # This process still has the replaced file open, so the only honest way
+        # to pick up the new one is to let systemd start us again.
+        print("restarting after restore", flush=True)
+        threading.Timer(1.0, os._exit, (0,)).start()
+
+    @staticmethod
+    def one(params, key, default=""):
+        return (params.get(key) or [default])[0].strip()
+
+    # -- auth -------------------------------------------------------------
+    def session_ok(self):
+        cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        token = cookie["sdns"].value if "sdns" in cookie else ""
+        if not token:
+            return False
+        expiry = SESSIONS.get(token)
+        if not expiry or expiry < time.time():
+            SESSIONS.pop(token, None)
+            return False
+        return True
+
+    def locked_out(self):
+        rec = ATTEMPTS.get(self.client_address[0])
+        if not rec:
+            return False
+        count, first = rec
+        if time.time() - first > LOCKOUT_SECONDS:
+            ATTEMPTS.pop(self.client_address[0], None)
+            return False
+        return count >= MAX_TRIES
+
+    def note_failure(self):
+        addr = self.client_address[0]
+        count, first = ATTEMPTS.get(addr, (0, time.time()))
+        ATTEMPTS[addr] = (count + 1, first)
+
+    # -- routing ----------------------------------------------------------
+    def route(self):
+        prefix = "/" + CFG["ADMIN_PATH"]
+        path = urllib.parse.urlparse(self.path).path
+        if not path.startswith(prefix):
+            return None
+        rest = path[len(prefix):].strip("/")
+        return rest
+
+    def do_GET(self):
+        rest = self.route()
+        # Anything not under the secret prefix is answered as though nothing is
+        # here at all, with no hint that a panel exists on this port.
+        if rest is None:
+            return self.send("<h1>404</h1>", 404)
+        if rest == "logout":
+            cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+            if "sdns" in cookie:
+                SESSIONS.pop(cookie["sdns"].value, None)
+            return self.redirect("", {"Set-Cookie": "sdns=; Max-Age=0; Path=/"})
+        if not self.session_ok():
+            return self.send(login_page(CFG))
+        if rest == "backup.db":
+            return self.send_backup()
+        if rest.startswith("receipt/"):
+            return self.send_receipt(rest.split("/", 1)[1])
+        try:
+            return self.view(rest)
+        except Exception as e:
+            print("admin GET %s failed: %r" % (rest, e), file=sys.stderr, flush=True)
+            return self.send(page("خطا", "<div class='card'>%s</div>"
+                                  % html.escape(str(e)), CFG), 500)
+
+    def do_POST(self):
+        rest = self.route()
+        if rest is None:
+            return self.send("<h1>404</h1>", 404)
+        params = self.body_params()
+        if not self.session_ok():
+            if self.locked_out():
+                return self.send(login_page(
+                    CFG, "تلاش‌های ناموفق زیاد. چند دقیقه صبر کنید."))
+            given = self.one(params, "password")
+            want = CFG["ADMIN_HASH"]
+            if given and hmac.compare_digest(
+                    hash_password(given, CFG["ADMIN_SALT"]), want):
+                token = secrets.token_urlsafe(32)
+                SESSIONS[token] = time.time() + SESSION_HOURS * 3600
+                ATTEMPTS.pop(self.client_address[0], None)
+                return self.redirect("", {
+                    "Set-Cookie": "sdns=%s; Path=/; HttpOnly; Secure; SameSite=Strict"
+                                  % token})
+            self.note_failure()
+            return self.send(login_page(CFG, "رمز اشتباه است."))
+        try:
+            return self.action(rest, params)
+        except Exception as e:
+            print("admin POST %s failed: %r" % (rest, e), file=sys.stderr, flush=True)
+            return self.send(page("خطا", "<div class='card'>%s</div>"
+                                  % html.escape(str(e)), CFG), 500)
+
+    # -- views ------------------------------------------------------------
+    def view(self, rest):
+        msg = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("m")
+        msg = msg[0] if msg else None
+        kind = "err" if (msg or "").startswith("!") else "good"
+        msg = msg.lstrip("!") if msg else None
+        pages = {"": ("پنل مدیریت", self.home), "index": ("پنل مدیریت", self.home),
+                 "users": ("کاربران", self.users),
+                 "receipts": ("رسیدها", self.receipts),
+                 "templates": ("قالب‌ها", self.templates),
+                 "domains": ("دامنه‌ها", self.domains),
+                 "settings": ("تنظیمات", self.settings),
+                 "restore": ("بازگردانی", self.restore_page),
+                 "logs": ("لاگ", self.logs)}
+        if rest not in pages:
+            return self.send("<h1>404</h1>", 404)
+        title, fn = pages[rest]
+        active = "" if rest == "index" else rest
+        return self.send(page(title, fn(), CFG, active, msg, kind))
+
+    def home(self):
+        u = STORE.one("SELECT count(*) c, COALESCE(sum(used_bytes),0) b FROM users")
+        act = STORE.one("SELECT count(*) c FROM users WHERE status = 'active'")
+        ips = STORE.one("SELECT count(*) c FROM ips")
+        out = ["<div class='card'><h2>خلاصه</h2><div class='grid'>"]
+        for n, l in ((u["c"], "کاربر"), (act["c"], "فعال"),
+                     (ips["c"], "آی‌پی ثبت‌شده"), (human(u["b"]), "مجموع مصرف")):
+            out.append("<div class='stat'><div class='n'>%s</div>"
+                       "<div class='l'>%s</div></div>" % (html.escape(str(n)), l))
+        out.append("</div></div>")
+
+        rows = STORE.q("SELECT m.* FROM metrics m JOIN (SELECT host, MAX(at) at"
+                       " FROM metrics GROUP BY host) l"
+                       " ON l.host = m.host AND l.at = m.at ORDER BY m.host")
+        out.append("<div class='card'><h2>سرورها</h2>")
+        if not rows:
+            out.append("<p class='muted'>هنوز آماری نرسیده.</p>")
+        else:
+            out.append("<table><tr><th>سرور</th><th>CPU</th><th>RAM</th>"
+                       "<th>SWAP</th><th>دیسک</th><th>شبکه</th><th>روشن</th></tr>")
+            for r in rows:
+                seen = parse_ts(r["at"])
+                stale = ""
+                if seen and (datetime.now(timezone.utc) - seen).total_seconds() > 120:
+                    stale = " <span class='bad'>قطع</span>"
+                swap = (bar(r["swap_used"], r["swap_total"]) if r["swap_total"]
+                        else "<span class='muted'>ندارد</span>")
+                out.append(
+                    "<tr><td><code>%s</code>%s</td><td>%s%%</td><td>%s</td>"
+                    "<td>%s</td><td>%s</td>"
+                    "<td class='muted'>↓%s/s ↑%s/s</td>"
+                    "<td class='muted'>%d روز</td></tr>"
+                    % (html.escape(r["host"]), stale, r["cpu"],
+                       bar(r["mem_used"], r["mem_total"]), swap,
+                       bar(r["disk_used"], r["disk_total"]),
+                       human(r["rx_bps"]), human(r["tx_bps"]),
+                       (r["uptime"] or 0) // 86400))
+            out.append("</table>")
+        out.append("</div>")
+        return "".join(out)
+
+    def users(self):
+        tpls = STORE.q("SELECT * FROM templates ORDER BY id")
+        default = STORE.one("SELECT id FROM templates WHERE is_default = 1")
+        did = default["id"] if default else 0
+        rows = STORE.q("SELECT u.*, (SELECT ip FROM ips WHERE user_id = u.id LIMIT 1)"
+                       " ip FROM users u ORDER BY u.created_at DESC")
+        out = ["<div class='card'><h2>کاربران (%d)</h2>" % len(rows)]
+        if not rows:
+            return "".join(out) + "<p class='muted'>هنوز کسی ثبت‌نام نکرده.</p></div>"
+        out.append("<table><tr><th>شناسه</th><th>آی‌پی</th><th>مصرف</th>"
+                   "<th>سهمیه (گیگ)</th><th>سرعت Mb/s</th><th>زمان (روز)</th>"
+                   "<th>قالب</th><th>وضعیت</th><th></th></tr>")
+        p = CFG["ADMIN_PATH"]
+        for r in rows:
+            tid = r["template_id"] or did
+            sel = "".join("<option value='%d'%s>%s</option>"
+                          % (t["id"], " selected" if t["id"] == tid else "",
+                             html.escape(t["name"])) for t in tpls)
+            cls = {"active": "ok", "over_quota": "warn"}.get(r["status"], "bad")
+            quota_gb = ("%.0f" % (r["quota_bytes"] / GB)) if r["quota_bytes"] else "0"
+            kbps = r["speed_kbps"] or 0
+            speed_mb = ("%g" % (kbps / 1000.0)) if kbps else "0"
+            left = remaining_days(r["expires_at"] or r["quota_reset_at"])
+            out.append(
+                "<tr><td><code>%s</code><br><span class='muted'>%s</span></td>"
+                "<td><code>%s</code></td><td>%s</td>"
+                "<td><form id='u%d' method='post' action='/%s/user-save'></form>"
+                "<input form='u%d' type='hidden' name='id' value='%d'>"
+                "<input form='u%d' name='quota_gb' value='%s' size='4'"
+                " title='گیگابایت، ۰=نامحدود'></td>"
+                "<td><input form='u%d' name='speed_mb' value='%s' size='4'"
+                " title='مگابیت بر ثانیه، ۰=بی‌حد'></td>"
+                "<td><input form='u%d' name='days' size='4' placeholder='%s'"
+                " title='از امروز چند روز دیگر'></td>"
+                "<td><form method='post' action='/%s/user-template'>"
+                "<input type='hidden' name='id' value='%d'>"
+                "<select name='template_id' onchange='this.form.submit()'>%s</select>"
+                "</form></td>"
+                "<td class='%s'>%s</td>"
+                "<td class='acts'><button form='u%d' title='ذخیره'>ثبت</button>"
+                "<form method='post' action='/%s/user-status'>"
+                "<input type='hidden' name='id' value='%d'>"
+                "<input type='hidden' name='to' value='%s'>"
+                "<button class='%s' title='%s'>%s</button></form>"
+                "<form method='post' action='/%s/user-reset'"
+                " onsubmit='return confirm(\"مصرف این کاربر صفر شود؟\")'>"
+                "<input type='hidden' name='id' value='%d'>"
+                "<button class='ghost' title='صفر کردن مصرف'>صفر</button></form>"
+                "</td></tr>"
+                # A web account has no Telegram id and a bot account has no
+                # phone, so the column shows whichever this account has - and
+                # the row number when it somehow has neither.
+                % (html.escape(str(r["telegram_id"] or r["phone"]
+                                   or "#%d" % r["id"])),
+                   html.escape(r["first_name"] or r["username"] or ""),
+                   html.escape(r["ip"] or "-"), human(r["used_bytes"]),
+                   r["id"], p, r["id"], r["id"], r["id"], quota_gb,
+                   r["id"], speed_mb, r["id"], left,
+                   p, r["id"], sel, cls, html.escape(r["status"]),
+                   r["id"],
+                   p, r["id"],
+                   "active" if r["status"] == "suspended" else "suspended",
+                   "ghost" if r["status"] == "suspended" else "danger",
+                   "برگرداندن" if r["status"] == "suspended" else "مسدود کردن",
+                   "فعال" if r["status"] == "suspended" else "مسدود",
+                   p, r["id"]))
+        out.append("</table><p class='muted'>صفر در سهمیه یا سرعت یعنی بی‌حد. "
+                   "«زمان» خالی یعنی بدون تغییر؛ عددی که بنویسید تاریخ پایان را "
+                   "از امروز همان‌قدر روز جلو می‌برد، و رنگ خاکستریِ داخلش روزهای "
+                   "باقی‌مانده است. سرعت فقط دانلود را محدود می‌کند و تا ۳۰ ثانیه "
+                   "دیگر روی رله‌ها اعمال می‌شود.</p></div>")
+        return "".join(out)
+
+    def templates(self):
+        """Two pages behind one path: the list, and one template's editor.
+
+        Editing is its own page because the editor carries a checkbox for every
+        domain in the catalogue - some five hundred of them. Rendering that
+        for every template at once would make a page several times the size,
+        opened over a connection from Iran, to show one template's detail.
+        """
+        wanted = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query).get("t")
+        if wanted:
+            row = STORE.one("SELECT * FROM templates WHERE id = ?",
+                            (int(wanted[0]) if wanted[0].isdigit() else 0,))
+            if row:
+                return self.template_editor(row)
+        return self.template_list()
+
+    def template_list(self):
+        tpls = STORE.q("SELECT * FROM templates ORDER BY id")
+        default = STORE.one("SELECT id FROM templates WHERE is_default = 1")
+        did = default["id"] if default else 0
+        p = CFG["ADMIN_PATH"]
+        out = ["<div class='card'><h2>قالب‌ها</h2>"
+               "<table><tr><th>نام</th><th>کاربر</th><th>سرویس‌ها</th>"
+               "<th>دامنه‌ها</th><th></th></tr>"]
+        for t in tpls:
+            users = STORE.one("SELECT count(*) c FROM users"
+                              " WHERE COALESCE(template_id, ?) = ?",
+                              (did, t["id"]))["c"]
+            name = html.escape(t["name"])
+            if t["is_default"]:
+                out.append("<tr><td>%s <span class='muted'>(پیش‌فرض)</span></td>"
+                           "<td>%d</td><td colspan='2' class='muted'>همه، از جمله "
+                           "سرویس‌هایی که بعداً اضافه شوند</td><td></td></tr>"
+                           % (name, users))
+                continue
+            groups = STORE.template_groups(t["id"])
+            off = STORE.template_domains_off(t["id"])
+            n_groups = n_dom = total_dom = 0
+            for svc in CATALOGUE:
+                for g in svc["groups"]:
+                    total_dom += len(g["domains"])
+                    if (svc["key"], g["key"]) in groups:
+                        n_groups += 1
+                        n_dom += sum(1 for d in g["domains"] if d not in off)
+            out.append("<tr><td>%s</td><td>%d</td><td>%d</td>"
+                       "<td>%d <span class='muted'>از %d</span></td>"
+                       "<td><a href='/%s/templates?t=%d'>ویرایش</a></td></tr>"
+                       % (name, users, n_groups, n_dom, total_dom, p, t["id"]))
+        out.append("</table></div>")
+        out.append("<div class='card'><h2>قالب تازه</h2>"
+                   "<form method='post' action='/%s/template-new' class='row'>"
+                   "<input name='name' placeholder='نام قالب'><button>ساختن</button>"
+                   "</form><p class='muted'>قالب تازه با همهٔ سرویس‌ها ساخته می‌شود؛ "
+                   "بعد تیک‌ها را بردارید. هر قالبِ در حال استفاده یک resolver روی هر "
+                   "رله است، پس حداکثر ۸ تا.</p></div>" % p)
+        return "".join(out)
+
+    def template_editor(self, t):
+        p = CFG["ADMIN_PATH"]
+        back = "<p><a href='/%s/templates'>‹ برگشت به فهرست قالب‌ها</a></p>" % p
+        if t["is_default"]:
+            return (back + "<div class='card'><h2>%s (پیش‌فرض)</h2>"
+                    "<p class='muted'>قالب پیش‌فرض همیشه همهٔ سرویس‌ها را از رله "
+                    "می‌برد، از جمله سرویس‌هایی که بعداً اضافه شوند. برای همین "
+                    "قابل ویرایش نیست — یک قالب تازه بسازید.</p></div>"
+                    % html.escape(t["name"]))
+
+        groups = STORE.template_groups(t["id"])
+        off = STORE.template_domains_off(t["id"])
+        out = [back,
+               "<div class='card'><h2>%s</h2>" % html.escape(t["name"]),
+               "<p class='muted'>تیک سرویس یعنی همهٔ دامنه‌هایش از رله می‌رود — "
+               "از جمله دامنه‌هایی که بعداً به آن اضافه شوند. کشو را باز کنید تا "
+               "بین دامنه‌ها یکی‌یکی انتخاب کنید.</p>",
+               "<form method='post' action='/%s/template-save'>"
+               "<input type='hidden' name='id' value='%d'>" % (p, t["id"])]
+
+        for svc in CATALOGUE:
+            for g in svc["groups"]:
+                key = "%s.%s" % (svc["key"], g["key"])
+                on = (svc["key"], g["key"]) in groups
+                label = (svc["label"] if len(svc["groups"]) == 1
+                         else "%s — %s" % (svc["label"], g["label"]))
+                kept = [d for d in g["domains"] if d not in off]
+                # Open the drawer when the operator has already been in here
+                # picking domains, so their exceptions are visible rather than
+                # hidden behind a summary that looks like every other one.
+                partial = on and len(kept) != len(g["domains"])
+                out.append(
+                    "<details class='svc'%s><summary>"
+                    "<label><input type='checkbox' name='g' value='%s'%s> %s</label>"
+                    "<span class='muted count'>%d از %d دامنه</span>"
+                    "<span class='pick'><button type='button' data-all='1'>همه</button>"
+                    "<button type='button' data-all='0'>هیچ‌کدام</button></span>"
+                    "</summary>"
+                    % (" open" if partial else "", html.escape(key),
+                       " checked" if on else "", html.escape(label),
+                       len(kept) if on else 0, len(g["domains"])))
+                if not g["domains"]:
+                    out.append("<p class='muted'>دامنه‌ای ندارد.</p>")
+                out.append("<div class='doms'>")
+                for d in sorted(g["domains"]):
+                    out.append("<label><input type='checkbox' name='d' value='%s'%s>"
+                               "<span>%s</span></label>"
+                               % (html.escape(d), "" if d in off else " checked",
+                                  html.escape(d)))
+                out.append("</div></details>")
+
+        out.append("<div style='margin-top:16px'><button>ذخیره</button> "
+                   "<button class='danger' formaction='/%s/template-delete' "
+                   "formnovalidate>حذف قالب</button></div></form></div>" % p)
+        # Convenience only. Every checkbox above is a plain form control, so
+        # the page works with this script blocked or broken - it just means
+        # ticking five hundred boxes by hand.
+        out.append("""<script>
+(function () {
+  function count(d) {
+    var boxes = d.querySelectorAll('.doms input');
+    var on = d.querySelectorAll('.doms input:checked').length;
+    var g = d.querySelector('summary input[name=g]');
+    var label = d.querySelector('.count');
+    if (label) label.textContent = (g.checked ? on : 0) + ' از ' + boxes.length + ' دامنه';
+  }
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest('.pick button');
+    if (b) {
+      // Inside a <summary>, so the drawer would otherwise open and close
+      // under the operator every time they pressed one of these.
+      e.preventDefault();
+      e.stopPropagation();
+      var d = b.closest('details'), all = b.dataset.all === '1';
+      d.querySelectorAll('.doms input').forEach(function (i) { i.checked = all; });
+      if (all) d.querySelector('summary input[name=g]').checked = true;
+      return count(d);
+    }
+    if (e.target.matches('summary input[name=g]')) {
+      e.stopPropagation();
+      return count(e.target.closest('details'));
+    }
+    if (e.target.matches('.doms input')) {
+      var d2 = e.target.closest('details');
+      // Ticking a domain in a service that is switched off is a request for
+      // that service, so switch it on rather than silently ignoring it.
+      if (e.target.checked) d2.querySelector('summary input[name=g]').checked = true;
+      count(d2);
+    }
+  });
+})();
+</script>""")
+        return "".join(out)
+
+    def domains(self):
+        rows = STORE.q("SELECT * FROM custom_domains ORDER BY added_at DESC")
+        shipped = sum(len(g["domains"]) for s in CATALOGUE for g in s["groups"])
+        p = CFG["ADMIN_PATH"]
+        out = ["<div class='card'><h2>دامنه‌های شما (%d)</h2>" % len(rows),
+               "<form method='post' action='/%s/domain-add' class='row' "
+               "style='margin-bottom:14px'>"
+               "<input name='domain' placeholder='example.com' style='min-width:220px'>"
+               "<input name='note' placeholder='یادداشت (اختیاری)'>"
+               "<button>افزودن</button></form>" % p]
+        if rows:
+            out.append("<table><tr><th>دامنه</th><th>یادداشت</th><th>افزوده</th>"
+                       "<th></th></tr>")
+            for r in rows:
+                out.append("<tr><td><code>%s</code></td><td class='muted'>%s</td>"
+                           "<td class='muted'>%s</td>"
+                           "<td><form method='post' action='/%s/domain-del'>"
+                           "<input type='hidden' name='domain' value='%s'>"
+                           "<button class='danger'>حذف</button></form></td></tr>"
+                           % (html.escape(r["domain"]), html.escape(r["note"] or ""),
+                              (r["added_at"] or "")[:10], p, html.escape(r["domain"])))
+            out.append("</table>")
+        out.append("<p class='muted'>زیردامنه‌ها خودکار شامل می‌شوند. این‌ها در سرویس "
+                   "«دامنه‌های دلخواه» جمع می‌شوند، پس در هر قالب می‌شود تیکشان را "
+                   "برداشت. به‌علاوهٔ %d دامنه‌ای که با نصاب می‌آید.</p></div>" % shipped)
+        return "".join(out)
+
+    def settings(self):
+        p = CFG["ADMIN_PATH"]
+        out = []
+        out.append(
+            "<div class='card'><h2>نسخهٔ پشتیبان</h2>"
+            "<p class='muted'>یک فایل sqlite با همهٔ کاربران، آی‌پی‌ها، قالب‌ها، "
+            "تراکنش‌ها و تنظیمات. آمار سلامت سرورها داخلش نیست — حجم زیادی است "
+            "و ارزشی در بازگردانی ندارد.</p>"
+            "<p><a class='dl' href='/%s/backup.db'>دانلود نسخهٔ پشتیبان</a></p>"
+            "<h2 style='margin-top:22px'>بازگردانی</h2>"
+            "<form method='post' action='/%s/restore' enctype='multipart/form-data' "
+            "class='row'><input type='file' name='file' accept='.db' required>"
+            "<button class='ghost'>بررسی فایل</button></form>"
+            "<p class='muted'>فایل اول فقط بررسی و توصیف می‌شود؛ جایگزینی جدا "
+            "تأیید می‌خواهد.</p></div>" % (p, p))
+
+        out.append("<div class='card'><h2>رمز این پنل</h2>"
+                   "<form method='post' action='/%s/password' class='row'>"
+                   "<input type='password' name='password' placeholder='رمز تازه'>"
+                   "<button>تغییر</button></form></div>" % p)
+        return "".join(out)
+
+    def logs(self):
+        out = []
+        for unit in ("smartdns-panel", "smartdns-admin"):
+            try:
+                txt = subprocess.run(
+                    ["journalctl", "-u", unit, "-n", "60", "--no-pager",
+                     "--output=cat"], capture_output=True, text=True,
+                    timeout=20).stdout
+            except Exception as e:
+                txt = str(e)
+            out.append("<div class='card'><h2>%s</h2><pre style='overflow-x:auto;"
+                       "font-size:12px;color:#9aa4b2;white-space:pre-wrap'>%s</pre>"
+                       "</div>" % (unit, html.escape(txt or "(چیزی نیست)")))
+        return "".join(out)
+
+    # -- actions ----------------------------------------------------------
+    def action(self, rest, params):
+        one = lambda k, d="": self.one(params, k, d)
+
+        if rest == "user-save":
+            uid = int(one("id") or 0)
+            gb = one("quota_gb", "0")
+            days = one("days")
+            try:
+                quota = int(float(gb) * GB) if gb else 0
+            except ValueError:
+                return self.redirect("users?m=!عدد سهمیه درست نیست")
+            # Clearing the warning bits matters: a user raised above a
+            # threshold they had already crossed would otherwise never be
+            # warned again.
+            STORE.run("UPDATE users SET quota_bytes = ?, warned = 0,"
+                      " status = CASE WHEN status = 'over_quota' THEN 'active'"
+                      " ELSE status END WHERE id = ?", (quota, uid))
+            if "speed_mb" in params:
+                try:
+                    mb = float(one("speed_mb", "0") or 0)
+                except ValueError:
+                    return self.redirect("users?m=!عدد سرعت درست نیست")
+                if mb < 0:
+                    return self.redirect("users?m=!سرعت منفی نمی‌شود")
+                STORE.run("UPDATE users SET speed_kbps = ? WHERE id = ?",
+                          (int(mb * 1000), uid))
+            if days:
+                try:
+                    count = float(days)
+                except ValueError:
+                    return self.redirect("users?m=!تعداد روز درست نیست")
+                if count < 0:
+                    return self.redirect("users?m=!تعداد روز منفی نمی‌شود")
+                if count == 0:
+                    # No end date at all. The account then ends only when its
+                    # allowance does, which is what an operator means by
+                    # putting zero in a box that everywhere else on this page
+                    # means "no limit".
+                    STORE.run("UPDATE users SET expires_at = NULL,"
+                              " quota_reset_at = NULL, quota_mode = 'oneoff',"
+                              " status = CASE WHEN status = 'expired' THEN 'active'"
+                              " ELSE status END WHERE id = ?", (uid,))
+                    return self.redirect("users?m=ذخیره شد؛ بدون محدودیت زمانی")
+                when = datetime.now(timezone.utc) + timedelta(days=count)
+                stamp = when.isoformat(timespec="seconds")
+                row = STORE.one("SELECT expires_at FROM users WHERE id = ?", (uid,))
+                if row and row["expires_at"]:
+                    # A trial. Giving it days moves the end date, and brings it
+                    # back if it had already run out - which is the whole
+                    # reason an operator types in this box.
+                    STORE.run("UPDATE users SET expires_at = ?,"
+                              " status = CASE WHEN status = 'expired' THEN 'active'"
+                              " ELSE status END WHERE id = ?", (stamp, uid))
+                else:
+                    STORE.run("UPDATE users SET quota_reset_at = ?,"
+                              " quota_mode = 'monthly' WHERE id = ?", (stamp, uid))
+            return self.redirect("users?m=ذخیره شد")
+
+        if rest == "receipt-decide":
+            tid = int(one("id") or 0)
+            to = one("to")
+            if to not in ("approved", "rejected"):
+                return self.redirect("receipts?m=!تصمیم نامعتبر")
+            # The image goes with the decision. It was evidence for a judgement
+            # that has now been made, and keeping every customer's bank slip
+            # for ever is a liability rather than a record.
+            STORE.run("UPDATE transactions SET status = ?, decided_at = ?,"
+                      " receipt_blob = NULL WHERE id = ?", (to, now(), tid))
+            return self.redirect(
+                "receipts?m=%s" % ("رسید تأیید شد؛ حالا سهمیه و زمانش را بگذارید"
+                                   if to == "approved" else "رسید رد شد"))
+
+        if rest == "user-status":
+            uid = int(one("id") or 0)
+            to = one("to")
+            if to not in ("active", "suspended"):
+                return self.redirect("users?m=!وضعیت نامعتبر")
+            # Clearing the warning bits on the way back in: an account that
+            # crossed a threshold while blocked would otherwise never warn
+            # again once it is working.
+            STORE.run("UPDATE users SET status = ?, warned = CASE WHEN ? = 'active'"
+                      " THEN 0 ELSE warned END WHERE id = ?", (to, to, uid))
+            return self.redirect(
+                "users?m=%s" % ("کاربر مسدود شد؛ تا ۳۰ ثانیه دیگر قطع می‌شود"
+                                if to == "suspended" else "کاربر برگشت"))
+
+        if rest == "user-reset":
+            uid = int(one("id") or 0)
+            # The kernel counters on the relays are not touched. Usage here is
+            # the growth of those counters since the last sync, so zeroing the
+            # total is enough - the next sync adds only what has happened
+            # since, not the whole counter again.
+            STORE.run("UPDATE users SET used_bytes = 0, warned = 0,"
+                      " status = CASE WHEN status = 'over_quota' THEN 'active'"
+                      " ELSE status END WHERE id = ?", (uid,))
+            return self.redirect("users?m=مصرف صفر شد")
+
+        if rest == "user-template":
+            STORE.run("UPDATE users SET template_id = ? WHERE id = ?",
+                      (int(one("template_id") or 0), int(one("id") or 0)))
+            return self.redirect("users?m=قالب عوض شد؛ تا ۳۰ ثانیه دیگر روی رله‌ها اعمال می‌شود")
+
+        if rest == "template-new":
+            name = one("name")
+            if not name:
+                return self.redirect("templates?m=!نام لازم است")
+            count = STORE.one("SELECT count(*) c FROM templates")["c"]
+            if count >= 8:
+                return self.redirect("templates?m=!سقف ۸ قالب پر است؛ هر قالب یک "
+                                     "resolver روی هر رله است")
+            try:
+                cur = STORE.run("INSERT INTO templates (name, is_default, created_at)"
+                                " VALUES (?, 0, ?)", (name, now()))
+            except sqlite3.IntegrityError:
+                return self.redirect("templates?m=!قالبی با این نام هست")
+            for svc in CATALOGUE:
+                for g in svc["groups"]:
+                    STORE.run("INSERT OR IGNORE INTO template_services"
+                              " (template_id, service_key, group_key) VALUES (?,?,?)",
+                              (cur.lastrowid, svc["key"], g["key"]))
+            return self.redirect("templates?m=قالب ساخته شد با همهٔ سرویس‌ها")
+
+        if rest == "template-save":
+            tid = int(one("id") or 0)
+            if STORE.one("SELECT is_default FROM templates WHERE id = ?",
+                         (tid,))["is_default"]:
+                return self.redirect("templates?m=!قالب پیش‌فرض قابل تغییر نیست")
+            wanted = set(params.get("g") or [])
+            # Checkboxes only report what is ticked, so the off-list is worked
+            # out by subtraction: every domain in a routed group that did not
+            # come back. That also means a group whose drawer was never opened
+            # still submits all of its domains, and nothing is lost by not
+            # having looked at it.
+            keep = set(params.get("d") or [])
+            STORE.run("DELETE FROM template_services WHERE template_id = ?", (tid,))
+            STORE.run("DELETE FROM template_domains_off WHERE template_id = ?", (tid,))
+            for svc in CATALOGUE:
+                for g in svc["groups"]:
+                    if "%s.%s" % (svc["key"], g["key"]) not in wanted:
+                        continue
+                    STORE.run("INSERT OR IGNORE INTO template_services"
+                              " (template_id, service_key, group_key) VALUES (?,?,?)",
+                              (tid, svc["key"], g["key"]))
+                    for d in g["domains"]:
+                        if d not in keep:
+                            STORE.run("INSERT OR IGNORE INTO template_domains_off"
+                                      " (template_id, domain) VALUES (?, ?)", (tid, d))
+            return self.redirect("templates?t=%d&m=ذخیره شد؛ تا ۳۰ ثانیه دیگر روی "
+                                 "رله‌ها اعمال می‌شود" % tid)
+
+        if rest == "template-delete":
+            tid = int(one("id") or 0)
+            row = STORE.one("SELECT is_default FROM templates WHERE id = ?", (tid,))
+            if not row or row["is_default"]:
+                return self.redirect("templates?m=!قالب پیش‌فرض حذف نمی‌شود")
+            # Move anyone on it back to the default first, so nobody is left
+            # pointing at a template that no longer exists.
+            default = STORE.one("SELECT id FROM templates WHERE is_default = 1")
+            STORE.run("UPDATE users SET template_id = ? WHERE template_id = ?",
+                      (default["id"] if default else None, tid))
+            STORE.run("DELETE FROM template_services WHERE template_id = ?", (tid,))
+            STORE.run("DELETE FROM templates WHERE id = ?", (tid,))
+            return self.redirect("templates?m=قالب حذف شد و کاربرانش به پیش‌فرض برگشتند")
+
+        if rest == "domain-add":
+            raw = one("domain")
+            try:
+                domain = clean_domain(raw)
+            except ValueError as e:
+                return self.redirect("domains?m=!%s" % e)
+            for svc in CATALOGUE:
+                for grp in svc["groups"]:
+                    if domain in grp["domains"]:
+                        return self.redirect(
+                            "domains?m=!%s از قبل در سرویس %s هست"
+                            % (domain, svc["label"]))
+            if STORE.one("SELECT 1 FROM custom_domains WHERE domain = ?", (domain,)):
+                return self.redirect("domains?m=!%s از قبل اضافه شده" % domain)
+            STORE.run("INSERT INTO custom_domains (domain, note, added_at)"
+                      " VALUES (?, ?, ?)", (domain, one("note") or None, now()))
+            return self.redirect("domains?m=%s اضافه شد" % domain)
+
+        if rest == "domain-del":
+            STORE.run("DELETE FROM custom_domains WHERE domain = ?", (one("domain"),))
+            return self.redirect("domains?m=حذف شد")
+
+        if rest == "restore":
+            return self.take_upload()
+
+        if rest == "restore-apply":
+            return self.apply_restore()
+
+        if rest == "restore-cancel":
+            path = PENDING.pop("path", None)
+            PENDING.clear()
+            if path and os.path.exists(path):
+                os.unlink(path)
+            return self.redirect("settings?m=بازگردانی لغو شد")
+
+        if rest == "password":
+            new = one("password")
+            if len(new) < 8:
+                return self.redirect("settings?m=!رمز باید حداقل ۸ نویسه باشد")
+            salt = secrets.token_hex(16)
+            digest = hash_password(new, salt)
+            set_config_key("ADMIN_SALT", salt)
+            set_config_key("ADMIN_HASH", digest)
+            CFG["ADMIN_SALT"], CFG["ADMIN_HASH"] = salt, digest
+            # Everyone else holding a session was authenticated with the old
+            # password; a password change should end those.
+            token_keep = http.cookies.SimpleCookie(
+                self.headers.get("Cookie", ""))["sdns"].value
+            for t in list(SESSIONS):
+                if t != token_keep:
+                    SESSIONS.pop(t, None)
+            return self.redirect("settings?m=رمز عوض شد")
+
+        return self.send("<h1>404</h1>", 404)
+
+
+DOMAIN_RE = __import__("re").compile(
+    r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+FORBIDDEN = ("localhost", "local", "internal", "arpa", "telegram.org",
+             "t.me", "telegram.me")
+
+
+def clean_domain(raw):
+    """Same normalisation the bot does, so a domain added here and one added
+    there end up identical rather than as two rows differing by a www."""
+    import re
+    d = (raw or "").strip().lower()
+    d = re.sub(r"^[a-z]+://", "", d)
+    d = d.split("/")[0].split("?")[0].split("@")[-1].split(":")[0].strip(".")
+    if not d:
+        raise ValueError("خالی است")
+    if not DOMAIN_RE.match(d):
+        raise ValueError("قالب دامنه درست نیست")
+    if any(d == f or d.endswith("." + f) for f in FORBIDDEN):
+        raise ValueError("این دامنه را نمی‌شود مسیر داد")
+    return d
+
+
+def set_config_key(key, value):
+    """Rewrite one key in admin.env, leaving the rest of the file alone."""
+    lines = []
+    if os.path.exists(CONFIG):
+        with open(CONFIG) as fh:
+            lines = [l for l in fh.read().split("\n") if not l.startswith(key + "=")]
+    lines = [l for l in lines if l.strip()]
+    lines.append("%s=%s" % (key, value))
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG)
+
+
+def main():
+    global STORE, CFG, CATALOGUE
+    CFG = load_config()
+    CATALOGUE = load_catalogue()
+    STORE = Store(DB)
+
+    port = int(CFG["ADMIN_PORT"])
+    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), Admin)
+    cert = CFG.get("ADMIN_CERT")
+    key = CFG.get("ADMIN_KEY")
+    if cert and key and os.path.exists(cert):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+    else:
+        # Refuse rather than silently serve a login form in the clear: the
+        # password would cross the network readable by anyone on the path.
+        sys.exit("no certificate at %s - refusing to serve the panel over plain "
+                 "http" % cert)
+    print("admin panel up on %s://0.0.0.0:%d/%s/"
+          % (scheme, port, CFG["ADMIN_PATH"]), flush=True)
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

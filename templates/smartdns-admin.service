@@ -1,0 +1,17 @@
+[Unit]
+Description=Smart DNS admin web panel
+After=network-online.target smartdns-panel.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/smartdns-admin
+Restart=always
+RestartSec=10
+# Reads the certificate and writes admin.env when the password changes, so it
+# needs root - but nothing else on the box.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

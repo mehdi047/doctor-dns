@@ -1,0 +1,17 @@
+[Unit]
+Description=Smart DNS relay sync - usage out, allowlist in, claim page
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/smartdns-sync
+Restart=always
+RestartSec=10
+# Needs root: it drives smartdns-acl, which talks to nftables.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

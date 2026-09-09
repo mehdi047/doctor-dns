@@ -1,0 +1,1405 @@
+#!/usr/bin/env python3
+"""smartdns-panel - the database behind the relays, and the API they sync to.
+
+This runs on the exit node, not on the relay. The relay connects out to this
+API every half minute to hand over per-address usage and collect the list of
+addresses it should allow, which resolver each is on, and what speed each is
+capped at. The relay always initiates: it is the machine in the harder network
+position, and this way it needs no new inbound port.
+
+One database serves every relay. That is what makes a customer's allowance
+mean one thing across the whole service rather than one thing per machine.
+
+There was a Telegram bot in this process. It is gone: almost every account was
+opened on the web panel and had no Telegram behind it, so the bot's commands
+had all grown web equivalents and its messages were reaching a shrinking
+minority. What it did for customers - registering an address, seeing an
+account, being warned before the allowance runs out - the panel on each relay
+now does for everybody.
+
+Only the standard library is used, so the installer stays a single file with
+no pip step.
+"""
+
+import base64
+import hashlib
+import hmac
+import html
+import http.server
+import json
+import os
+import re
+import secrets
+import signal
+import shutil
+import sqlite3
+import ssl
+import sys
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+CONFIG = "/etc/smart-dns/panel.env"
+DB = "/var/lib/smart-dns/panel.db"
+CERT = "/etc/smart-dns/sync.crt"
+KEY = "/etc/smart-dns/sync.key"
+API_PORT = 8443
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id             INTEGER PRIMARY KEY,
+    -- Null for an account opened on the web panel. Telegram is one way in, not
+    -- the only one. UNIQUE still holds where it matters: sqlite allows many
+    -- nulls in a unique column, which is the behaviour wanted here.
+    telegram_id    INTEGER UNIQUE,
+    -- How a web account signs in. Nothing verifies it - there is no SMS
+    -- gateway - so it names an account and lets a card receipt be matched to
+    -- one. It is not evidence about who holds the line.
+    phone          TEXT UNIQUE,
+    password_hash  TEXT,
+    password_salt  TEXT,
+    username       TEXT,
+    first_name     TEXT,
+    created_at     TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'active',
+    -- 0 means unlimited. Quota is counted in bytes, on the wire, both
+    -- directions, which is what the kernel counters actually measure.
+    quota_bytes    INTEGER NOT NULL DEFAULT 0,
+    quota_mode     TEXT NOT NULL DEFAULT 'monthly',
+    quota_reset_at TEXT,
+    used_bytes     INTEGER NOT NULL DEFAULT 0,
+    max_ips        INTEGER NOT NULL DEFAULT 1,
+    wallet         INTEGER NOT NULL DEFAULT 0,
+    -- Download limit in kilobits per second, 0 for no limit. The relay turns
+    -- this into one htb class per customer; the number lives here because the
+    -- relay must be able to be rebuilt from nothing but a sync.
+    speed_kbps     INTEGER NOT NULL DEFAULT 0,
+    -- When this account stops working regardless of how much is left. Set for
+    -- the trial; null for a paid account, which ends when its quota does.
+    expires_at     TEXT
+);
+
+-- One row per registered address. UNIQUE(ip) is deliberate: without it a
+-- second account could register an address someone else is already paying
+-- for and ride along free.
+CREATE TABLE IF NOT EXISTS ips (
+    id           INTEGER PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    ip           TEXT NOT NULL UNIQUE,
+    added_at     TEXT NOT NULL,
+    -- The last raw counter this address reported. Usage is the growth of that
+    -- number, so a user who changes address keeps the total they had built up.
+    last_counter INTEGER NOT NULL DEFAULT 0
+);
+
+-- A customer's claim that they paid, and the photograph of the slip.
+--
+-- The image is a blob rather than a file beside the database, so that one
+-- backup is the whole story and a restore brings the pending ones back with
+-- everything else. It does not grow without bound: the image is dropped the
+-- moment the operator decides, leaving the row as the record.
+CREATE TABLE IF NOT EXISTS transactions (
+    id           INTEGER PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount       INTEGER NOT NULL,
+    kind         TEXT NOT NULL,
+    receipt      TEXT,
+    receipt_blob BLOB,
+    receipt_type TEXT,
+    note         TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    created_at   TEXT NOT NULL,
+    decided_at   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE INDEX IF NOT EXISTS ips_user ON ips(user_id);
+
+-- A template is a named set of service groups that route through the relay.
+-- Customers are assigned one; they do not get an arbitrary per-customer
+-- combination, because each distinct combination costs a dnsmasq instance on
+-- every relay and the count has to stay small enough to run. Templates make
+-- that limit a product decision - how many plans do you sell - rather than an
+-- accident waiting to happen.
+CREATE TABLE IF NOT EXISTS templates (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT UNIQUE NOT NULL,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+-- One row per group the template routes. A group absent from here is bypassed
+-- for that template: resolved to its real address so the client reaches it
+-- directly, costing the operator nothing and the customer some speed.
+CREATE TABLE IF NOT EXISTS template_services (
+    template_id INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+    service_key TEXT NOT NULL,
+    group_key   TEXT NOT NULL,
+    PRIMARY KEY (template_id, service_key, group_key)
+);
+
+-- Single domains switched off inside a group the template otherwise routes.
+--
+-- Recorded as exceptions rather than as the full list of what is routed, so
+-- that a group means "everything in this group" and keeps meaning it when the
+-- catalogue grows. A domain added to Spotify next month starts routing for
+-- every template that routes Spotify - which is what an operator who ticked
+-- Spotify asked for - while the handful they deliberately switched off stay
+-- off. No domain is in two groups, so the domain alone identifies the row.
+CREATE TABLE IF NOT EXISTS template_domains_off (
+    template_id INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+    domain      TEXT NOT NULL,
+    PRIMARY KEY (template_id, domain)
+);
+
+-- Browser sessions for the user panel. The relay serves the pages but keeps
+-- no state: it holds the cookie and asks here who it belongs to, so a relay
+-- being rebuilt does not log everybody out, and a second relay serves the same
+-- session without anything being shared between them.
+CREATE TABLE IF NOT EXISTS panel_sessions (
+    token      TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+-- Where each address's counter stood at the last sync, per relay.
+--
+-- Per relay, not per address. Every relay reports its own counter for the same
+-- customer, and one shared figure makes them overwrite each other: the relay
+-- reporting the smaller number looks like a counter reset, the next relay's
+-- larger number then looks like fresh traffic, and the same bytes are charged
+-- again every cycle. Two relays turned 52 GB of real usage into 12.6 TB in a
+-- day. Invisible with a single relay, which is why it survived until there
+-- were two.
+CREATE TABLE IF NOT EXISTS ip_counters (
+    ip           TEXT NOT NULL,
+    relay        TEXT NOT NULL,
+    last_counter INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (ip, relay)
+);
+
+-- Domains the operator added themselves, on top of the list that ships with
+-- the installer. Kept here rather than edited on each relay so that one entry
+-- reaches every relay, and survives a relay being rebuilt from scratch.
+CREATE TABLE IF NOT EXISTS custom_domains (
+    domain   TEXT PRIMARY KEY,
+    note     TEXT,
+    added_at TEXT NOT NULL
+);
+
+-- Host health, one row per sample per machine. Written every thirty seconds
+-- by whatever reports it, and pruned to a day, which at that rate is a few
+-- thousand rows per host - small enough to keep in the same database rather
+-- than standing up something separate to hold it.
+CREATE TABLE IF NOT EXISTS metrics (
+    id         INTEGER PRIMARY KEY,
+    host       TEXT NOT NULL,
+    at         TEXT NOT NULL,
+    cpu        REAL,
+    load       REAL,
+    mem_used   INTEGER,
+    mem_total  INTEGER,
+    swap_used  INTEGER,
+    swap_total INTEGER,
+    disk_used  INTEGER,
+    disk_total INTEGER,
+    rx_bps     INTEGER,
+    tx_bps     INTEGER,
+    uptime     INTEGER
+);
+CREATE INDEX IF NOT EXISTS metrics_host_at ON metrics(host, at);
+"""
+
+METRIC_FIELDS = ("cpu", "load", "mem_used", "mem_total", "swap_used",
+                 "swap_total", "disk_used", "disk_total", "rx_bps", "tx_bps",
+                 "uptime")
+
+# How long health samples are kept. A day is enough to answer "was it the
+# server?" about something that happened this morning, and short enough that
+# the table never becomes the largest thing in the database.
+METRICS_KEEP_HOURS = 24
+
+# Columns added after the first release. sqlite has no ADD COLUMN IF NOT
+# EXISTS, so these are applied only when the column is genuinely missing.
+MIGRATIONS = [
+    # Which warning thresholds this user has already been told about, so a
+    # sync every thirty seconds does not send the same warning a hundred times.
+    ("users", "warned", "INTEGER NOT NULL DEFAULT 0"),
+    # Null means the default template, so existing accounts keep working
+    # unchanged when this arrives.
+    ("users", "template_id", "INTEGER REFERENCES templates(id)"),
+    # Web signup. Added by ALTER on databases that predate it; the UNIQUE on
+    # phone lives in the index below, because ADD COLUMN cannot carry one.
+    ("users", "phone", "TEXT"),
+    ("users", "password_hash", "TEXT"),
+    ("users", "password_salt", "TEXT"),
+    # Download limit in kilobits per second; 0 means no limit, which is what
+    # every account that predates this gets.
+    ("users", "speed_kbps", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "expires_at", "TEXT"),
+    ("transactions", "receipt_blob", "BLOB"),
+    ("transactions", "receipt_type", "TEXT"),
+    ("transactions", "note", "TEXT"),
+]
+
+# Indexes that have to exist whether the table was created by SCHEMA or grown
+# by MIGRATIONS. A unique index and a UNIQUE column constraint are the same
+# thing to sqlite, so this makes both paths end up identical.
+INDEXES = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS users_phone ON users(phone)",
+]
+
+# Where the installer puts the service catalogue - which brands exist, which
+# groups each has, and which domains are in each group.
+SERVICES_FILE = "/usr/local/share/smart-dns/services.json"
+
+# Ceiling on distinct templates actually in use. Each one is a dnsmasq
+# instance on every relay, with its own cache and its own port, so this is a
+# real resource limit rather than a preference. Eight plans is more than any
+# of this is likely to need; the panel refuses to exceed it rather than
+# quietly starting a ninth resolver on every machine.
+MAX_TEMPLATES = 8
+
+MB = 1024 ** 2
+GB = 1024 ** 3
+
+# A photograph of a bank slip. Generous for a phone camera, small enough that
+# a few pending ones cannot bloat the database or a backup.
+MAX_RECEIPT = 4 * MB
+
+# What the service is called and what a new account gets. Kept in the database
+# rather than in this file, so changing either is an edit in the admin panel
+# rather than a redeploy to every machine.
+DEFAULT_SETTINGS = {
+    # What a new account gets before it has paid for anything.
+    "trial_bytes": str(500 * MB),
+    "trial_days": "1",
+    "plan_bytes": str(2 * GB),
+    "plan_days": "30",
+}
+
+# Fractions of the quota at which the user is warned, and the bit each one
+# sets in users.warned.
+THRESHOLDS = [(0.80, 1), (0.95, 2)]
+
+IPV4 = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+
+
+class Throttle:
+    """Counts recent attempts per key, in memory.
+
+    The panel is one process, so a dict is the whole implementation. Losing the
+    counts on restart is acceptable: this exists to make guessing slow, and a
+    restart is not something an attacker can cause.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.hits = {}
+
+    def _prune(self, key, window):
+        cutoff = time.time() - window
+        kept = [t for t in self.hits.get(key, []) if t > cutoff]
+        if kept:
+            self.hits[key] = kept
+        else:
+            self.hits.pop(key, None)
+        return kept
+
+    def check(self, key, limit, window):
+        """(allowed, seconds until the oldest attempt falls out of the window)"""
+        with self.lock:
+            kept = self._prune(key, window)
+            if len(kept) < limit:
+                return True, 0
+            return False, int(window - (time.time() - kept[0])) + 1
+
+    def hit(self, key):
+        with self.lock:
+            self.hits.setdefault(key, []).append(time.time())
+
+    def clear(self, key):
+        with self.lock:
+            self.hits.pop(key, None)
+
+
+THROTTLE = Throttle()
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_ts(s):
+    """Parse a stored timestamp as an aware UTC datetime, or None.
+
+    Everything this program writes carries an offset, but the database is also
+    edited by hand and by admin scripts, and sqlite's own datetime() produces a
+    naive string. Comparing one of those against an aware value raises, which
+    is how the whole quota pass once died on every sync. Assume UTC when no
+    offset is given, since that is what every writer here means.
+    """
+    if not s:
+        return None
+    try:
+        t = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def valid_ip(s):
+    m = IPV4.match(s or "")
+    return bool(m) and all(0 <= int(p) <= 255 for p in m.groups())
+
+
+def normal_phone(s):
+    """Reduce an Iranian mobile number to one canonical form, or return "".
+
+    People type the same number four ways - 0912…, 912…, +98912…, ۰۹۱۲… - and
+    all four have to collide, or one person ends up with four accounts and the
+    operator cannot match a card receipt to any of them.
+    """
+    digits = ""
+    for ch in (s or "").strip():
+        if ch.isdigit():
+            # Persian and Arabic-Indic digits: unicodedata.digit maps both.
+            digits += str(unicodedata.digit(ch))
+    if digits.startswith("0098"):
+        digits = digits[4:]
+    elif digits.startswith("98") and len(digits) == 12:
+        digits = digits[2:]
+    elif digits.startswith("0"):
+        digits = digits[1:]
+    # 9xxxxxxxxx - a mobile number without the leading zero.
+    if len(digits) == 10 and digits.startswith("9"):
+        return "0" + digits
+    return ""
+
+
+def hash_password(password, salt):
+    # Same cost as the admin panel: slow enough that a stolen database is not
+    # a list of passwords, fast enough that signing in is not noticeable.
+    return hashlib.pbkdf2_hmac(
+        "sha256", (password or "").encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+def check_password(user, password):
+    if not user["password_hash"] or not user["password_salt"]:
+        return False
+    return hmac.compare_digest(
+        hash_password(password, user["password_salt"]), user["password_hash"])
+
+
+def human(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%d %s" if unit == "B" else "%.2f %s") % (n, unit)
+        n /= 1024
+
+
+DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+"
+                       r"[a-z]{2,63}$")
+
+# Names that must never be routed to the relay. localhost and the internal
+# suffixes would break name resolution on the machine itself. Telegram stays on
+# the list because customers reach support through it and a relay answering for
+# t.me would break that for everyone behind it.
+FORBIDDEN = ("localhost", "local", "internal", "arpa", "telegram.org",
+             "t.me", "telegram.me")
+
+
+def clean_domain(raw):
+    """Normalise what someone typed into a domain, or explain why it is not.
+
+    Accepts what people actually paste - a full URL, a trailing slash, capital
+    letters, a leading dot or www - because rejecting those teaches nothing and
+    just costs a round trip.
+    """
+    d = (raw or "").strip().lower()
+    d = re.sub(r"^[a-z]+://", "", d)      # scheme
+    d = d.split("/")[0].split("?")[0]     # path, query
+    d = d.split("@")[-1]                  # someone pasting an email
+    d = d.split(":")[0]                   # port
+    d = d.strip(".")
+    if not d:
+        raise ValueError("خالی است")
+    if not DOMAIN_RE.match(d):
+        raise ValueError("قالب دامنه درست نیست")
+    if any(d == f or d.endswith("." + f) for f in FORBIDDEN):
+        raise ValueError("این دامنه را نمی‌شود مسیر داد")
+    if d.count(".") == 1 and len(d.split(".")[0]) <= 2:
+        raise ValueError("خیلی کلی است - دامنهٔ کامل بدهید")
+    return d
+
+
+def inspect_backup(path):
+    """Check a file really is one of our backups, and say what is in it.
+
+    Raises rather than returning a verdict, because every caller wants to stop.
+    A file that opens as sqlite is not enough: someone's unrelated database
+    would pass that and then replace every customer with nothing.
+    """
+    db = sqlite3.connect(path)
+    try:
+        status = db.execute("PRAGMA integrity_check").fetchone()[0]
+        if status != "ok":
+            raise ValueError("integrity check failed: %s" % status)
+        have = {r[0] for r in db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        missing = {"users", "ips", "templates", "settings"} - have
+        if missing:
+            raise ValueError("not a panel backup - missing %s"
+                             % ", ".join(sorted(missing)))
+        return {t: db.execute("SELECT count(*) FROM " + t).fetchone()[0]
+                for t in ("users", "ips", "templates", "transactions")}
+    finally:
+        db.close()
+
+
+# The operator's own domains, presented as a service so a template can include
+# or exclude them like any brand. Its domain list lives in the database rather
+# than the catalogue file, so it is filled in at use rather than shipped.
+CUSTOM_SERVICE = {"key": "custom", "label": "دامنه‌های دلخواه شما",
+                  "groups": [{"key": "main", "label": "همه", "domains": []}]}
+
+
+def load_catalogue():
+    """The service catalogue the installer dropped alongside this script.
+
+    Shipped as a file rather than kept in the database so that it is versioned
+    with the code: adding a brand is an upgrade, not a migration, and every
+    relay and panel agrees on what "playstation.download" means.
+    """
+    try:
+        with io_open(SERVICES_FILE) as fh:
+            return json.load(fh).get("services", [])
+    except Exception as e:
+        print("no service catalogue at %s: %s" % (SERVICES_FILE, e),
+              file=sys.stderr, flush=True)
+        return []
+
+
+def io_open(path):
+    return open(path, encoding="utf-8")
+
+
+def load_config():
+    cfg = {}
+    with open(CONFIG) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip().strip('"').strip("'")
+    for required in ("SYNC_SECRET", "RELAY_IP"):
+        if not cfg.get(required):
+            sys.exit("%s: %s is missing" % (CONFIG, required))
+    return cfg
+
+
+# --------------------------------------------------------------- database
+def relax_telegram_id(db, path):
+    """Drop the NOT NULL from users.telegram_id on databases that predate web
+    signup.
+
+    sqlite cannot alter a column constraint, so the table has to be rebuilt.
+    The new definition is not written out here - it is the existing one with
+    that one phrase removed - so any column added by a later MIGRATIONS entry
+    survives without this function knowing it exists.
+
+    A copy of the database is taken first. This runs at startup, before the bot
+    is polling and before any relay can reach the API, and if it goes wrong the
+    operator has the file it went wrong on.
+    """
+    row = db.execute("SELECT sql FROM sqlite_master"
+                     " WHERE type = 'table' AND name = 'users'").fetchone()
+    if not row:
+        return
+    old = row[0]
+    new = re.sub(r"(telegram_id\s+INTEGER\s+UNIQUE)\s+NOT\s+NULL", r"\1",
+                 old, flags=re.I)
+    if new == old:
+        return                      # already nullable, nothing to do
+
+    backup = "%s.pre-websignup" % path
+    db.commit()                     # VACUUM cannot run inside a transaction
+    if not os.path.exists(backup):
+        db.execute("VACUUM INTO ?", (backup,))
+    print("migrating users: telegram_id may now be null (backup: %s)" % backup,
+          flush=True)
+
+    new = re.sub(r"^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?[\"'`\[]?users[\"'`\]]?",
+                 "CREATE TABLE users_new", new, count=1, flags=re.I)
+    cols = [r[1] for r in db.execute("PRAGMA table_info(users)")]
+    names = ", ".join('"%s"' % c for c in cols)
+
+    # Foreign keys off for the swap: ips, claims, transactions and
+    # panel_sessions all point at users(id), and dropping the table underneath
+    # them with enforcement on would either fail or take their rows with it.
+    # It cannot be toggled inside a transaction, hence the order here.
+    db.execute("PRAGMA foreign_keys = OFF")
+    try:
+        db.execute("BEGIN")
+        db.execute(new)
+        db.execute("INSERT INTO users_new (%s) SELECT %s FROM users" % (names, names))
+        db.execute("DROP TABLE users")
+        db.execute("ALTER TABLE users_new RENAME TO users")
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        db.execute("PRAGMA foreign_keys = ON")
+        raise
+    broken = db.execute("PRAGMA foreign_key_check").fetchall()
+    db.execute("PRAGMA foreign_keys = ON")
+    if broken:
+        raise RuntimeError("migration left %d dangling references - the "
+                           "database before it is at %s" % (len(broken), backup))
+
+
+class Store:
+    """All database access, with one lock around it.
+
+    Two threads touch the database - the Telegram loop and the sync API - and
+    sqlite3 connections are not safe to share across threads. One connection
+    guarded by a lock is simpler to reason about than a pool, and at this size
+    there is nothing to gain from the pool.
+    """
+
+    def __init__(self, path):
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys = ON")
+        self.db.execute("PRAGMA journal_mode = WAL")
+        with self.lock:
+            self.db.executescript(SCHEMA)
+            relax_telegram_id(self.db, path)
+            for table, column, spec in MIGRATIONS:
+                have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
+                if column not in have:
+                    self.db.execute(
+                        "ALTER TABLE %s ADD COLUMN %s %s" % (table, column, spec)
+                    )
+            for statement in INDEXES:
+                self.db.execute(statement)
+            for key, value in DEFAULT_SETTINGS.items():
+                self.db.execute(
+                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+            self.db.commit()
+
+    def setting(self, key, default=""):
+        row = self.one("SELECT value FROM settings WHERE key = ?", (key,))
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        self.run(
+            "INSERT INTO settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+
+    def q(self, sql, args=()):
+        with self.lock:
+            return self.db.execute(sql, args).fetchall()
+
+    def one(self, sql, args=()):
+        rows = self.q(sql, args)
+        return rows[0] if rows else None
+
+    def run(self, sql, args=()):
+        with self.lock:
+            cur = self.db.execute(sql, args)
+            self.db.commit()
+            return cur
+
+    def user_by_telegram(self, tg_id):
+        return self.one("SELECT * FROM users WHERE telegram_id = ?", (tg_id,))
+
+    def trial(self):
+        """What a brand new account gets, whichever door it came through.
+
+        A trial rather than a plan: a fixed amount, at full speed, for a fixed
+        number of days, and it does not renew. Full speed on purpose - a slow
+        trial demonstrates a slow service, and the point of it is to let
+        somebody see whether their console downloads faster through this.
+        """
+        return (int(self.setting("trial_bytes", str(500 * MB)) or 0),
+                int(self.setting("trial_days", "1") or 1))
+
+    def create_user(self, tg_id, username, first_name):
+        quota, days = self.trial()
+        self.run(
+            "INSERT OR IGNORE INTO users"
+            " (telegram_id, username, first_name, created_at, quota_bytes,"
+            "  quota_mode, quota_reset_at, expires_at)"
+            " VALUES (?, ?, ?, ?, ?, 'oneoff', NULL, ?)",
+            (tg_id, username, first_name, now(), quota,
+             (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(
+                 timespec="seconds")),
+        )
+        return self.user_by_telegram(tg_id)
+
+    def user_by_phone(self, phone):
+        return self.one("SELECT * FROM users WHERE phone = ?", (phone,))
+
+    def create_web_user(self, phone, first_name, password):
+        """Open an account from the web panel, with no Telegram behind it.
+
+        The same trial as an account opened through the bot - the way in should
+        not decide what you get - which is why both call trial() rather than
+        each writing out its own idea of a starting allowance.
+        """
+        quota, days = self.trial()
+        salt = secrets.token_hex(16)
+        self.run(
+            "INSERT INTO users"
+            " (telegram_id, phone, password_hash, password_salt, first_name,"
+            "  created_at, quota_bytes, quota_mode, quota_reset_at, expires_at)"
+            " VALUES (NULL, ?, ?, ?, ?, ?, ?, 'oneoff', NULL, ?)",
+            (phone, hash_password(password, salt), salt, first_name, now(), quota,
+             (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(
+                 timespec="seconds")),
+        )
+        return self.user_by_phone(phone)
+
+    def set_password(self, user_id, password):
+        salt = secrets.token_hex(16)
+        self.run("UPDATE users SET password_hash = ?, password_salt = ?"
+                 " WHERE id = ?", (hash_password(password, salt), salt, user_id))
+
+    def open_session(self, user_id, days=30):
+        token = secrets.token_urlsafe(32)
+        self.run(
+            "INSERT INTO panel_sessions (token, user_id, created_at, expires_at)"
+            " VALUES (?, ?, ?, ?)",
+            (token, user_id, now(),
+             (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(
+                 timespec="seconds")))
+        return token
+
+    def user_ips(self, user_id):
+        return self.q("SELECT * FROM ips WHERE user_id = ? ORDER BY added_at", (user_id,))
+
+    def allowed(self):
+        return self.q(
+            "SELECT i.ip AS ip, u.id AS uid FROM ips i JOIN users u ON u.id = i.user_id"
+            " WHERE u.status = 'active'"
+        )
+
+    # ----------------------------------------------------------- templates
+    def ensure_default_template(self, catalogue):
+        """Create the all-services template if there is none.
+
+        Everything routes in it, which is exactly how the service behaved
+        before templates existed - so an upgrade changes nothing until an
+        admin decides otherwise.
+        """
+        row = self.one("SELECT * FROM templates WHERE is_default = 1")
+        if row:
+            return row
+        cur = self.run(
+            "INSERT INTO templates (name, is_default, created_at) VALUES (?, 1, ?)",
+            ("کامل", now()))
+        tid = cur.lastrowid
+        for svc in catalogue:
+            for grp in svc["groups"]:
+                self.run(
+                    "INSERT OR IGNORE INTO template_services"
+                    " (template_id, service_key, group_key) VALUES (?, ?, ?)",
+                    (tid, svc["key"], grp["key"]))
+        return self.one("SELECT * FROM templates WHERE id = ?", (tid,))
+
+    def template_groups(self, template_id):
+        return {(r["service_key"], r["group_key"]) for r in self.q(
+            "SELECT service_key, group_key FROM template_services WHERE template_id = ?",
+            (template_id,))}
+
+    def bypass_for(self, template_id, catalogue):
+        """Domains this template does NOT route, so the relay resolves them
+        normally and the client goes straight to them."""
+        # The default template means "everything", and has to keep meaning it
+        # as the catalogue grows. Reading its rows would freeze it at whatever
+        # existed the day it was created, so a brand added in a later upgrade
+        # would silently stop routing for every customer on the default plan -
+        # a service quietly getting worse with no change anybody made.
+        row = self.one("SELECT is_default FROM templates WHERE id = ?", (template_id,))
+        if row and row["is_default"]:
+            return []
+        routed = self.template_groups(template_id)
+        off = self.template_domains_off(template_id)
+        out = []
+        for svc in catalogue:
+            # Custom domains are never bypassed by rule - see routes_custom.
+            if svc["key"] == "custom":
+                continue
+            for grp in svc["groups"]:
+                if (svc["key"], grp["key"]) not in routed:
+                    out.extend(grp["domains"])
+                else:
+                    # The group is routed, minus whatever was switched off
+                    # inside it one domain at a time.
+                    out.extend(d for d in grp["domains"] if d in off)
+        return sorted(set(out))
+
+    def template_domains_off(self, template_id):
+        return {r["domain"] for r in self.q(
+            "SELECT domain FROM template_domains_off WHERE template_id = ?",
+            (template_id,))}
+
+    def profiles(self, catalogue, default_id):
+        """The templates actually in use, and who is on each.
+
+        Only templates with at least one active registered address become
+        profiles: an unused template costs a resolver on every relay for
+        nobody's benefit.
+        """
+        rows = self.q(
+            "SELECT i.ip AS ip, u.id AS uid, u.speed_kbps AS kbps,"
+            " COALESCE(u.template_id, ?) AS tid"
+            " FROM ips i JOIN users u ON u.id = i.user_id"
+            " WHERE u.status = 'active'", (default_id,))
+        by_ip = {}
+        used = set()
+        for r in rows:
+            tid = r["tid"] if self.one(
+                "SELECT 1 FROM templates WHERE id = ?", (r["tid"],)) else default_id
+            by_ip[r["ip"]] = {"uid": r["uid"], "tid": tid,
+                              "kbps": r["kbps"] or 0}
+            used.add(tid)
+        custom = self.custom_domains()
+        profiles = {}
+        for tid in used:
+            # The default routes everything, which is what the relay's main
+            # resolver already does - it needs no instance of its own.
+            if tid == default_id:
+                continue
+            profiles[str(tid)] = {
+                "bypass": self.bypass_for(tid, catalogue),
+                # Listed positively, not by omission: the relay writes these
+                # into this profile's own config, and a template that does not
+                # route them simply has no rule for them anywhere.
+                "custom": custom if self.routes_custom(tid) else [],
+            }
+        return by_ip, profiles
+
+    def custom_domains(self):
+        return [r["domain"] for r in self.q(
+            "SELECT domain FROM custom_domains ORDER BY domain")]
+
+    def routes_custom(self, template_id):
+        """Whether this template routes the operator's own domains.
+
+        These cannot be handled the way catalogue services are. A service is
+        un-routed by adding a more specific `server=` rule that out-matches the
+        broad `address=` hijacking its parent - but a custom domain's two rules
+        name exactly the same host, and dnsmasq picks the address= one. Tested,
+        not assumed. So rather than un-routing them per template, they are
+        written only into the resolvers of templates that do route them.
+        """
+        row = self.one("SELECT is_default FROM templates WHERE id = ?", (template_id,))
+        if row and row["is_default"]:
+            return True
+        return ("custom", "main") in self.template_groups(template_id)
+
+    def backup(self):
+        """A consistent copy of the database, minus the metrics.
+
+        VACUUM INTO rather than copying the file: sqlite is in WAL mode, so the
+        file on disk is not the whole story and copying it while the bot is
+        writing can produce something that will not open. VACUUM INTO takes a
+        proper snapshot with the database still running.
+
+        Health samples are dropped from the copy. They are the bulk of the rows
+        and none of the value - what matters in a restore is who the customers
+        are, what they bought and what they have used.
+        """
+        path = "/tmp/smartdns-backup-%s.db" % datetime.now(timezone.utc).strftime(
+            "%Y%m%d-%H%M%S")
+        with self.lock:
+            self.db.execute("VACUUM INTO ?", (path,))
+        copy = sqlite3.connect(path)
+        copy.execute("DELETE FROM metrics")
+        copy.commit()
+        copy.execute("VACUUM")
+        copy.close()
+        return path
+
+    def restore(self, path):
+        """Put a checked backup in place of the live database.
+
+        The current database is kept, not deleted: a restore is exactly the
+        moment somebody discovers they restored the wrong file, and having the
+        previous state one move away is the difference between an inconvenience
+        and losing every customer.
+
+        The candidate has to be staged beside the database, not in /tmp.
+        rename() cannot cross a mount point, and the unit sets PrivateTmp, so
+        /tmp is one - a restore from there fails with EXDEV at the last step,
+        after the safety copy has been taken and the connection closed.
+        """
+        if os.path.dirname(os.path.abspath(path)) != os.path.dirname(DB):
+            staged = os.path.join(os.path.dirname(DB),
+                                  ".restore-%s.db" % secrets.token_hex(6))
+            shutil.copyfile(path, staged)
+            os.unlink(path)
+            path = staged
+        keep = "%s.before-restore-%s" % (
+            DB, datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
+        with self.lock:
+            self.db.execute("VACUUM INTO ?", (keep,))
+            self.db.close()
+        os.replace(path, DB)
+        # A stale write-ahead log next to a different database is how a restore
+        # turns into corruption. The backup is a complete snapshot, so there is
+        # nothing in these worth keeping.
+        for suffix in ("-wal", "-shm"):
+            try:
+                os.unlink(DB + suffix)
+            except OSError:
+                pass
+        return keep
+
+    def record_metrics(self, host, sample):
+        if not isinstance(sample, dict) or "error" in sample:
+            return
+        cols = [f for f in METRIC_FIELDS if sample.get(f) is not None]
+        # An empty sample builds "INSERT INTO metrics (host, at, ) VALUES ..",
+        # which sqlite rejects and which took the whole sync request down with
+        # it - a relay running an older agent sends no metrics at all, and that
+        # must not stop its usage being counted.
+        if not cols:
+            return
+        self.run(
+            "INSERT INTO metrics (host, at, %s) VALUES (?, ?, %s)"
+            % (", ".join(cols), ", ".join("?" * len(cols))),
+            [host, now()] + [sample[c] for c in cols],
+        )
+
+    def prune_metrics(self):
+        self.run(
+            "DELETE FROM metrics WHERE at < ?",
+            ((datetime.now(timezone.utc)
+              - timedelta(hours=METRICS_KEEP_HOURS)).isoformat(timespec="seconds"),))
+
+    def latest_metrics(self):
+        """Newest sample per host."""
+        return self.q(
+            "SELECT m.* FROM metrics m JOIN ("
+            "  SELECT host, MAX(at) AS at FROM metrics GROUP BY host"
+            ") last ON last.host = m.host AND last.at = m.at"
+        )
+
+    def fold_counters(self, relay, counters):
+        """Turn raw per-address counters into per-user usage.
+
+        The kernel counts bytes per address since the element was created. What
+        a bill needs is bytes per user, across whatever addresses they have had.
+        So take the growth since last time rather than the absolute number, and
+        add it to the user's running total.
+
+        The previous reading is kept per relay - see ip_counters. Sharing one
+        figure between relays bills the same bytes over and over.
+        """
+        touched = {}
+        with self.lock:
+            for ip, total in counters.items():
+                row = self.db.execute(
+                    "SELECT id, user_id FROM ips WHERE ip = ?", (ip,)).fetchone()
+                if row is None:
+                    continue
+                prev = self.db.execute(
+                    "SELECT last_counter FROM ip_counters WHERE ip = ? AND relay = ?",
+                    (ip, relay)).fetchone()
+                # A counter that went backwards means it was reset - a reboot
+                # restoring an older saved value, or the address being
+                # re-added. Whatever is there now is the growth.
+                delta = total - (prev["last_counter"] if prev else 0)
+                if delta < 0:
+                    delta = total
+                if delta:
+                    self.db.execute(
+                        "UPDATE users SET used_bytes = used_bytes + ? WHERE id = ?",
+                        (delta, row["user_id"]),
+                    )
+                    touched[row["user_id"]] = touched.get(row["user_id"], 0) + delta
+                self.db.execute(
+                    "INSERT INTO ip_counters (ip, relay, last_counter)"
+                    " VALUES (?, ?, ?) ON CONFLICT(ip, relay)"
+                    " DO UPDATE SET last_counter = excluded.last_counter",
+                    (ip, relay, total))
+            self.db.commit()
+        return touched
+
+
+# ----------------------------------------------------------------- health
+class Health:
+    """This machine's own metrics, read straight out of /proc.
+
+    A near-copy of the same class in smartdns-sync. They are duplicated on
+    purpose: each program is extracted from the installer as a single
+    self-contained file, so a shared module would mean a third payload and a
+    third thing to keep in step.
+    """
+
+    def __init__(self):
+        self.cpu = None
+        self.net = None
+
+    @staticmethod
+    def _meminfo():
+        out = {}
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                k, _, v = line.partition(":")
+                out[k] = int(v.split()[0]) * 1024
+        return out
+
+    def _cpu_percent(self):
+        with open("/proc/stat") as fh:
+            parts = [int(x) for x in fh.readline().split()[1:]]
+        idle, total = parts[3] + parts[4], sum(parts)
+        prev, self.cpu = self.cpu, (idle, total)
+        if not prev:
+            return None
+        d_total = total - prev[1]
+        if d_total <= 0:
+            return None
+        return round(100.0 * (1 - (idle - prev[0]) / d_total), 1)
+
+    def _net_rates(self):
+        rx = tx = 0
+        with open("/proc/net/dev") as fh:
+            for line in fh.readlines()[2:]:
+                name, _, rest = line.partition(":")
+                if name.strip() == "lo":
+                    continue
+                f = rest.split()
+                rx += int(f[0]); tx += int(f[8])
+        stamp = time.time()
+        prev, self.net = self.net, (rx, tx, stamp)
+        if not prev:
+            return None, None
+        dt = stamp - prev[2]
+        if dt <= 0:
+            return None, None
+        return int((rx - prev[0]) / dt), int((tx - prev[1]) / dt)
+
+    def sample(self):
+        m = self._meminfo()
+        rx, tx = self._net_rates()
+        st = os.statvfs("/")
+        with open("/proc/uptime") as fh:
+            uptime = int(float(fh.readline().split()[0]))
+        with open("/proc/loadavg") as fh:
+            load = float(fh.readline().split()[0])
+        swap_total = m.get("SwapTotal", 0)
+        return {
+            "cpu": self._cpu_percent(),
+            "load": load,
+            "mem_total": m.get("MemTotal", 0),
+            "mem_used": m.get("MemTotal", 0) - m.get("MemAvailable", 0),
+            "swap_total": swap_total,
+            "swap_used": swap_total - m.get("SwapFree", 0) if swap_total else 0,
+            "disk_total": st.f_blocks * st.f_frsize,
+            "disk_used": (st.f_blocks - st.f_bfree) * st.f_frsize,
+            "rx_bps": rx,
+            "tx_bps": tx,
+            "uptime": uptime,
+        }
+
+
+# ------------------------------------------------------------------ quota
+def enforce_quotas(store):
+    """Reset, warn and cut off. Called after every sync.
+
+    Cutting off is a status change and nothing more. The relay learns about it
+    on its next sync, when the address stops appearing in the allowed list and
+    smartdns-acl removes it from the kernel. Nothing here touches a firewall
+    directly - one place decides who may connect, and it is the database.
+
+    Nothing is sent anywhere either. The warning thresholds are recorded in
+    users.warned and the customer is told on their own panel page, which
+    reaches everybody - most accounts have no Telegram behind them and never
+    did, so a message was only ever going to some of them.
+    """
+    stamp = datetime.now(timezone.utc)
+    for u in store.q("SELECT * FROM users"):
+        quota, used = u["quota_bytes"], u["used_bytes"]
+
+        # A trial ends on its date whether or not the allowance ran out, so
+        # this comes before anything to do with bytes. Checked for every
+        # account, but only the trial sets a date - a paid account ends when
+        # its quota does.
+        due = parse_ts(u["expires_at"])
+        if due and stamp >= due:
+            if u["status"] == "active":
+                store.run("UPDATE users SET status = 'expired' WHERE id = ?",
+                          (u["id"],))
+                print("expired: user %d after %s" % (u["id"], human(used)),
+                      flush=True)
+            continue
+
+        # Monthly plans roll over on their own date rather than on the 1st, so
+        # a user who joins on the 20th gets a full month.
+        if u["quota_mode"] == "monthly" and u["quota_reset_at"]:
+            due = parse_ts(u["quota_reset_at"])
+            if due and stamp >= due:
+                days = int(store.setting("plan_days", "30") or 30)
+                store.run(
+                    "UPDATE users SET used_bytes = 0, warned = 0,"
+                    " status = CASE WHEN status = 'over_quota' THEN 'active' ELSE status END,"
+                    " quota_reset_at = ? WHERE id = ?",
+                    ((stamp + timedelta(days=days)).isoformat(timespec="seconds"), u["id"]),
+                )
+                continue
+
+        if not quota:            # unlimited
+            continue
+
+        if used >= quota and u["status"] == "active":
+            store.run("UPDATE users SET status = 'over_quota' WHERE id = ?", (u["id"],))
+            print("over quota: user %d at %s of %s"
+                  % (u["id"], human(used), human(quota)), flush=True)
+            continue
+
+        # Record each threshold as it is crossed, once. The bit is what makes
+        # it once - a sync runs every thirty seconds - and it is what the
+        # customer's own page reads to decide whether to warn them.
+        for fraction, bit in THRESHOLDS:
+            if used >= quota * fraction and not (u["warned"] & bit):
+                store.run("UPDATE users SET warned = warned | ? WHERE id = ?",
+                          (bit, u["id"]))
+
+
+# --------------------------------------------------------------- sync API
+class API(http.server.BaseHTTPRequestHandler):
+    server_version = "smartdns"
+    store = None
+    secret = None
+    relays = ()
+    tg = None
+
+    def log_message(self, *a):
+        pass
+
+    def reply(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def authorised(self):
+        # This port is reachable from the whole internet, so the bearer token
+        # is not the only thing standing in front of the database. Only the
+        # relays this exit is paired with may talk to it at all - a scanner
+        # that finds the port gets nothing to guess against.
+        if self.client_address[0] not in self.relays:
+            return False
+        given = self.headers.get("Authorization", "")
+        want = "Bearer " + self.secret
+        # Constant time, so the comparison cannot be used to guess the secret
+        # one character at a time.
+        return hmac.compare_digest(given, want)
+
+    def do_POST(self):
+        if not self.authorised():
+            return self.reply(401, {"error": "unauthorised"})
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            # Base64 inflates by a third, and the largest thing a relay sends
+            # is a receipt. Anything past that is refused unread rather than
+            # buffered.
+            if length > 8 * MB:
+                return self.reply(413, {"error": "too large"})
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            return self.reply(400, {"error": "bad json"})
+
+        if self.path == "/sync":
+            counters = body.get("counters") or {}
+            clean = {
+                ip: int(v) for ip, v in counters.items() if valid_ip(ip) and int(v) >= 0
+            }
+            self.store.fold_counters(self.client_address[0], clean)
+            # The relay names itself by the address it connected from, so a
+            # second relay appears on its own without any configuration.
+            self.store.record_metrics(self.client_address[0], body.get("host") or {})
+            # Quotas are evaluated here, on fresh numbers, so a user who runs
+            # out is off the list this relay is about to be handed.
+            try:
+                enforce_quotas(self.store)
+            except Exception as e:
+                print("quota pass failed: %r" % e, file=sys.stderr, flush=True)
+            by_ip, profiles = self.store.profiles(CATALOGUE, DEFAULT_TEMPLATE[0])
+            # The label goes into the nftables element as a comment, so that
+            # `smartdns-acl list` on the relay is readable without the
+            # database in front of you. The profile tells the relay which
+            # resolver this address should be pointed at.
+            # uid travels as well as the label built from it: the relay uses
+            # it as the shaping mark, and parsing it back out of "u12" would
+            # be a second place that has to agree about the format.
+            allowed = [{"ip": ip, "name": "u%d" % v["uid"], "uid": v["uid"],
+                        "kbps": v["kbps"],
+                        "profile": str(v["tid"]) if str(v["tid"]) in profiles else ""}
+                       for ip, v in sorted(by_ip.items())]
+            extra = [r["domain"] for r in self.store.q(
+                "SELECT domain FROM custom_domains ORDER BY domain")]
+            return self.reply(200, {"allowed": allowed, "profiles": profiles,
+                                    "extra_domains": extra,
+                                    })
+
+        # ---- user panel, served by the relay on the customer's behalf ----
+        if self.path == "/user-info":
+            return self.reply(200, self.do_user_info(body))
+        if self.path == "/user-claim":
+            return self.reply(200, self.do_user_claim(body))
+        if self.path == "/user-signup":
+            return self.reply(200, self.do_user_signup(body))
+        if self.path == "/user-password-login":
+            return self.reply(200, self.do_user_password_login(body))
+        if self.path == "/user-receipt":
+            return self.reply(200, self.do_user_receipt(body))
+
+        return self.reply(404, {"error": "no such endpoint"})
+
+    # ---- user panel ------------------------------------------------------
+    def _session_user(self, token):
+        row = self.store.one(
+            "SELECT u.* FROM panel_sessions s JOIN users u ON u.id = s.user_id"
+            " WHERE s.token = ? AND s.expires_at > ?", (token or "", now()))
+        return row
+
+    def do_user_signup(self, body):
+        """Open an account from the panel, with no Telegram in the way.
+
+        The address is not registered here. Signing up and pointing the service
+        at a connection are two different decisions - somebody may well sign up
+        on their phone's mobile data and only afterwards go and register the
+        home line - so the next page asks, showing the address it can see.
+        """
+        ip = body.get("ip", "")
+        ok, wait = THROTTLE.check("signup:%s" % ip, limit=4, window=3600)
+        if not ok:
+            return {"ok": False, "message":
+                    "تعداد ثبت‌نام از این اینترنت زیاد بوده. %d دقیقه دیگر."
+                    % max(1, wait // 60)}
+
+        phone = normal_phone(body.get("phone"))
+        if not phone:
+            return {"ok": False,
+                    "message": "شماره موبایل درست نیست. مثل ۰۹۱۲۳۴۵۶۷۸۹ بنویسید"}
+        password = body.get("password") or ""
+        if len(password) < 8:
+            return {"ok": False, "message": "رمز باید دست‌کم ۸ نویسه باشد"}
+        name = (body.get("name") or "").strip()[:60]
+
+        if self.store.user_by_phone(phone):
+            return {"ok": False,
+                    "message": "این شماره قبلاً ثبت شده. وارد شوید"}
+        try:
+            user = self.store.create_web_user(phone, name, password)
+        except sqlite3.IntegrityError:
+            # Two signups with the same number at the same moment. The unique
+            # index is what actually decides; this only turns it into a
+            # sentence.
+            return {"ok": False, "message": "این شماره قبلاً ثبت شده. وارد شوید"}
+        THROTTLE.hit("signup:%s" % ip)
+        print("web signup: %s (#%d) from %s" % (phone, user["id"], ip), flush=True)
+        return {"ok": True, "session": self.store.open_session(user["id"]),
+                "message": "حساب ساخته شد"}
+
+    def do_user_password_login(self, body):
+        ip = body.get("ip", "")
+        ok, wait = THROTTLE.check("login:%s" % ip, limit=8, window=900)
+        if not ok:
+            return {"ok": False, "message":
+                    "تلاش زیاد بوده. %d دقیقه دیگر امتحان کنید."
+                    % max(1, wait // 60)}
+
+        phone = normal_phone(body.get("phone"))
+        user = self.store.user_by_phone(phone) if phone else None
+        # One message for a wrong number and a wrong password. Two different
+        # messages tell anybody who asks which numbers have accounts.
+        if not user or not check_password(user, body.get("password") or ""):
+            THROTTLE.hit("login:%s" % ip)
+            return {"ok": False, "message": "شماره یا رمز درست نیست"}
+        THROTTLE.clear("login:%s" % ip)
+        return {"ok": True, "session": self.store.open_session(user["id"])}
+
+    def do_user_receipt(self, body):
+        """Store a photograph of a payment slip against the customer.
+
+        The relay reads the upload and passes the bytes here base64-encoded,
+        so the image lands in the same database as everything else and one
+        backup covers it. Nothing about the account changes: this records a
+        claim, and the operator decides what it is worth.
+        """
+        user = self._session_user(body.get("session"))
+        if not user:
+            return {"ok": False, "message": "نشست معتبر نیست"}
+
+        kind = (body.get("content_type") or "").split(";")[0].strip().lower()
+        if kind not in ("image/jpeg", "image/png", "image/webp", "application/pdf"):
+            return {"ok": False,
+                    "message": "فقط عکس (JPG، PNG، WEBP) یا PDF قبول می‌شود"}
+        try:
+            blob = base64.b64decode(body.get("data") or "", validate=True)
+        except Exception:
+            return {"ok": False, "message": "فایل خراب بود، دوباره بفرستید"}
+        if not blob:
+            return {"ok": False, "message": "فایل خالی بود"}
+        if len(blob) > MAX_RECEIPT:
+            return {"ok": False, "message": "فایل بزرگ‌تر از %s است"
+                    % human(MAX_RECEIPT)}
+
+        # One pending receipt per customer. A second one replaces the first
+        # rather than queueing: somebody who sends three photographs of the
+        # same slip means the last one, and the operator should not have to
+        # work out which.
+        self.store.run(
+            "DELETE FROM transactions WHERE user_id = ? AND status = 'pending'",
+            (user["id"],))
+        try:
+            amount = max(0, int(body.get("amount") or 0))
+        except (TypeError, ValueError):
+            amount = 0
+        self.store.run(
+            "INSERT INTO transactions"
+            " (user_id, amount, kind, receipt_blob, receipt_type, note,"
+            "  status, created_at)"
+            " VALUES (?, ?, 'card', ?, ?, ?, 'pending', ?)",
+            (user["id"], amount, blob, kind,
+             (body.get("note") or "").strip()[:200], now()))
+        print("receipt from user %d: %s, %s"
+              % (user["id"], kind, human(len(blob))), flush=True)
+        return {"ok": True,
+                "message": "رسید فرستاده شد. پس از بررسی حسابتان شارژ می‌شود"}
+
+    def do_user_claim(self, body):
+        """Register the address the browser is coming from, for a user who is
+        already signed in - the 'my address changed' button."""
+        user = self._session_user(body.get("session"))
+        if not user:
+            return {"ok": False, "message": "نشست معتبر نیست"}
+        ip = body.get("ip", "")
+        if not valid_ip(ip):
+            return {"ok": False, "message": "آی‌پی نامعتبر"}
+        return self.do_claim_register(user["id"], ip)
+
+    def do_claim_register(self, user_id, ip):
+        owner = self.store.one("SELECT user_id FROM ips WHERE ip = ?", (ip,))
+        if owner and owner["user_id"] != user_id:
+            return {"ok": False, "message": "این آی‌پی به حساب دیگری ثبت شده است"}
+        user = self.store.one("SELECT * FROM users WHERE id = ?", (user_id,))
+        existing = self.store.user_ips(user_id)
+        # One active address per account, with as many changes as they like.
+        # Replacing rather than adding is what makes that true.
+        if existing and len(existing) >= user["max_ips"]:
+            for old in existing[: len(existing) - user["max_ips"] + 1]:
+                self.store.run("DELETE FROM ips WHERE id = ?", (old["id"],))
+        self.store.run(
+            "INSERT OR REPLACE INTO ips (user_id, ip, added_at) VALUES (?, ?, ?)",
+            (user_id, ip, now()))
+        return {"ok": True, "message": "آی‌پی %s ثبت شد" % ip}
+
+    def do_user_info(self, body):
+        user = self._session_user(body.get("session"))
+        if not user:
+            return {"ok": False, "message": "نشست معتبر نیست"}
+        ips = self.store.user_ips(user["id"])
+        tpl = self.store.one("SELECT name FROM templates WHERE id = ?",
+                             (user["template_id"],)) if user["template_id"] else None
+        if not tpl:
+            tpl = self.store.one("SELECT name FROM templates WHERE is_default = 1")
+        return {
+            "ok": True,
+            "name": user["first_name"] or user["username"] or "",
+            "telegram_id": user["telegram_id"],
+            "ip": ips[0]["ip"] if ips else None,
+            "used": user["used_bytes"],
+            "quota": user["quota_bytes"],
+            "status": user["status"],
+            "wallet": user["wallet"],
+            "plan": tpl["name"] if tpl else "",
+            "renews": (user["quota_reset_at"] or "")[:10],
+            "expires": (user["expires_at"] or "")[:10],
+            "speed_kbps": user["speed_kbps"] or 0,
+            # Which warning thresholds this account has crossed. The relay's
+            # page turns this into the banner the bot used to send.
+            "warned": user["warned"] or 0,
+            "seen_ip": body.get("ip", ""),
+        }
+
+
+def serve_api(cfg, store):
+    API.store = store
+    API.secret = cfg["SYNC_SECRET"]
+    # Comma separated, so one exit can serve several relays.
+    API.relays = tuple(x.strip() for x in cfg["RELAY_IP"].split(",") if x.strip())
+    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", API_PORT), API)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(CERT, KEY)
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    httpd.serve_forever()
+
+
+def watch_self(store):
+    """Sample this machine's own health.
+
+    The relays report theirs on the sync request, but nothing syncs *to* the
+    exit, so without this the machine running the panel would be the one host
+    missing from the panel.
+    """
+    health = Health()
+    while True:
+        try:
+            store.record_metrics("exit", health.sample())
+            store.prune_metrics()
+        except Exception as e:
+            print("self health failed: %r" % e, file=sys.stderr, flush=True)
+        time.sleep(30)
+
+
+CATALOGUE = []
+# A one-element list so the API thread sees updates without a global statement.
+DEFAULT_TEMPLATE = [0]
+
+
+def main():
+    global CATALOGUE
+    cfg = load_config()
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    store = Store(DB)
+    CATALOGUE = load_catalogue() + [CUSTOM_SERVICE]
+    DEFAULT_TEMPLATE[0] = store.ensure_default_template(CATALOGUE)["id"]
+    print("catalogue: %d services, default template #%d"
+          % (len(CATALOGUE), DEFAULT_TEMPLATE[0]), flush=True)
+
+    threading.Thread(target=watch_self, args=(store,), daemon=True).start()
+
+    def bye(*_):
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+    print("panel up: api on :%d" % API_PORT, flush=True)
+    # In the foreground now. The Telegram loop used to be what kept this
+    # process alive and the API rode along on a daemon thread behind it; with
+    # the bot gone the API is the whole job, so it holds the process itself.
+    serve_api(cfg, store)
+
+
+if __name__ == "__main__":
+    main()

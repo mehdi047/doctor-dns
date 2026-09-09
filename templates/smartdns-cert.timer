@@ -1,0 +1,13 @@
+[Unit]
+Description=Twice-daily certificate renewal check
+
+[Timer]
+# Twice a day is what Let's Encrypt asks for. certbot itself decides what is
+# actually due, so almost every run does nothing; the point is that a
+# certificate never gets close to expiring unnoticed.
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=3h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,98 @@
+#!/bin/bash
+# smartdns - manage the sanction-bypass domain list
+# usage: smartdns add|del|list|find|test|status [domain ...]
+set -euo pipefail
+
+CONF=/etc/dnsmasq.d/smart-dns.conf
+BYPASS=/etc/dnsmasq.d/bypass.conf
+IP=__RELAY_IP__
+
+need_root() { [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }; }
+
+case "${1:-}" in
+  add)
+    need_root; shift
+    [ $# -gt 0 ] || { echo "usage: smartdns add <domain> [domain ...]"; exit 1; }
+    for d in "$@"; do
+      d=$(echo "$d" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##; s/^\.//')
+      if grep -qxF "address=/$d/$IP" "$CONF"; then
+        echo "already present: $d"
+      else
+        echo "address=/$d/$IP" >> "$CONF"
+        echo "added: $d"
+      fi
+    done
+    dnsmasq --test -C /etc/dnsmasq.conf && systemctl restart dnsmasq && echo "dnsmasq reloaded"
+    ;;
+  del|rm)
+    need_root; shift
+    [ $# -gt 0 ] || { echo "usage: smartdns del <domain> [domain ...]"; exit 1; }
+    for d in "$@"; do
+      d=$(echo "$d" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##; s/^\.//')
+      if grep -qxF "address=/$d/$IP" "$CONF"; then
+        sed -i "\#^address=/$d/$IP\$#d" "$CONF"
+        echo "removed: $d"
+      else
+        echo "not found: $d"
+      fi
+    done
+    systemctl restart dnsmasq && echo "dnsmasq reloaded"
+    ;;
+  bypass)
+    # exclude a subdomain from the hijack - for services that do NOT run on 443
+    # (e.g. EA's gosredirector uses TCP 42130/42230, hijacking it kills FC 25)
+    need_root; shift
+    [ $# -gt 0 ] || { echo "usage: smartdns bypass <domain> [domain ...]"; exit 1; }
+    for d in "$@"; do
+      d=$(echo "$d" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##; s/^\.//')
+      if grep -qxF "server=/$d/1.1.1.1" "$BYPASS"; then
+        echo "already bypassed: $d"
+      else
+        printf 'server=/%s/1.1.1.1
+server=/%s/8.8.8.8
+' "$d" "$d" >> "$BYPASS"
+        echo "bypassed (resolves to its real IP now): $d"
+      fi
+    done
+    dnsmasq --test -C /etc/dnsmasq.conf && systemctl restart dnsmasq && echo "dnsmasq reloaded"
+    ;;
+  unbypass)
+    need_root; shift
+    for d in "$@"; do
+      d=$(echo "$d" | tr 'A-Z' 'a-z' | sed 's#^https\?://##; s#/.*##; s/^\.//')
+      sed -i "\#^server=/$d/#d" "$BYPASS" && echo "un-bypassed: $d"
+    done
+    systemctl restart dnsmasq && echo "dnsmasq reloaded"
+    ;;
+  list)
+    grep '^address=' "$CONF" | sed -E 's#^address=/([^/]+)/.*#\1#' | sort
+    ;;
+  find)
+    shift; grep -i "${1:-}" "$CONF" || echo "no match"
+    ;;
+  test)
+    shift
+    for d in "$@"; do
+      got=$(dig +short +time=5 @127.0.0.1 "$d" A | tr '\n' ' ')
+      if [ "$(echo "$got" | awk '{print $1}')" = "$IP" ]; then
+        printf "%-30s ROUTED   (%s)\n" "$d" "$got"
+      else
+        printf "%-30s direct   (%s)\n" "$d" "$got"
+      fi
+    done
+    ;;
+  status|"")
+    echo "domains routed : $(grep -c '^address=' "$CONF")"
+    echo "bypassed       : $(grep -c '^server=' "$BYPASS" 2>/dev/null || echo 0) rules"
+    echo "dnsmasq        : $(systemctl is-active dnsmasq) / $(systemctl is-enabled dnsmasq)"
+    echo "nginx          : $(systemctl is-active nginx) / $(systemctl is-enabled nginx)"
+    echo "relay target   : $(grep -oE 'proxy_pass [0-9.]+:443' /etc/nginx/nginx.conf | awk '{print $2}')"
+    echo
+    echo "listeners:"
+    ss -tulnp | grep -E ':53 |:80 |:443 ' | awk '{print "  " $1, $5, $NF}'
+    ;;
+  *)
+    echo "usage: smartdns {add|del|bypass|unbypass|list|find|test|status} [domain ...]"
+    exit 1
+    ;;
+esac

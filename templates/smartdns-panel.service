@@ -1,0 +1,21 @@
+[Unit]
+Description=Smart DNS panel - database and sync API for the relays
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/smartdns-panel
+Restart=always
+RestartSec=10
+# The bot token lives in panel.env, not in the unit and not in the script,
+# because this repository is going to be public.
+EnvironmentFile=-/etc/smart-dns/panel.env
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/smart-dns
+
+[Install]
+WantedBy=multi-user.target

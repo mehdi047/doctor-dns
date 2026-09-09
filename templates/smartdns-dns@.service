@@ -1,0 +1,18 @@
+[Unit]
+Description=Smart DNS resolver for service template %i
+After=network-online.target
+PartOf=smartdns-sync.service
+
+[Service]
+Type=simple
+# /etc/smartdns-base mirrors /etc/dnsmasq.d by symlink, minus the operator's
+# custom domains. Sharing by symlink means `smartdns add` and epic-pin still
+# reach every resolver; leaving the custom file out is what lets a template
+# not route those domains, since they cannot be un-routed by rule.
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/dev/null \
+    --conf-dir=/etc/smartdns-base --conf-file=/etc/smartdns-profiles/%i.conf
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

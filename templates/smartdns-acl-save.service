@@ -1,0 +1,10 @@
+[Unit]
+Description=Persist smart DNS allowlist and traffic counters
+After=nftables.service
+
+[Service]
+# A plain oneshot on purpose. With RemainAfterExit=yes the unit would stay
+# active after its first run and every later trigger from the timer would be
+# silently skipped - the counters would then be written exactly once, at boot.
+Type=oneshot
+ExecStart=/usr/local/bin/smartdns-acl save

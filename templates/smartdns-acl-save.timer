@@ -1,0 +1,12 @@
+[Unit]
+Description=Persist smart DNS counters every few minutes
+
+[Timer]
+# Counters live in the kernel. An unclean shutdown loses whatever has not
+# been written out, so the window is kept short enough that nobody can burn
+# a meaningful amount of quota inside it.
+OnBootSec=3min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
