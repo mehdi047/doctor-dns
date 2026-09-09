@@ -45,10 +45,10 @@ CONFIG = "/etc/smart-dns/sync.env"
 ACL = "/usr/local/bin/smartdns-acl"
 SHAPE = "/usr/local/bin/smartdns-shape"
 INTERVAL = 30
-CLAIM_PORT = 8080
-# The customer-facing panel. Outside the gated ports (53, 80, 443) on purpose:
-# somebody whose address changed is cut off from the service but must still be
-# able to reach the one page that fixes it.
+# The customer-facing panel, and the only port it is ever served on. Outside
+# the gated ports (53, 80, 443) on purpose: somebody whose address changed is
+# cut off from the service but must still be able to reach the one page that
+# fixes it.
 PANEL_TLS_PORT = 8443
 
 # A photograph of a bank slip, from a phone camera. The exit refuses anything
@@ -72,12 +72,6 @@ def load_config():
 
 
 CFG = None
-
-# Whether this panel is served over TLS. A relay with no domain has no
-# certificate and serves plain http, and these pages are opened over an Iranian
-# ISP - so the password forms are simply not offered there. The Telegram route
-# needs no password and keeps working either way.
-SECURE = False
 
 
 def post(path, payload):
@@ -651,24 +645,6 @@ def user_page(inner):
             % (html.escape(brand()), USER_CSS, inner))
 
 
-def insecure_notice():
-    """Shown instead of a password form when the panel has no certificate.
-
-    A relay with no domain serves plain http, and this page is opened over an
-    Iranian ISP. Asking for a password there would hand it to whoever is
-    watching, so the form is not offered at all rather than offered unsafely.
-
-    There is no fallback left. This page is now the only way in, so a relay
-    without a certificate has no customer panel at all - which is a thing the
-    operator has to fix rather than a thing to work around here.
-    """
-    return ("<div class='icon'>🔒</div><h1>هنوز آماده نیست</h1>"
-            "<p class='sub'>ورود و ثبت‌نام روی این سرور خاموش است، چون این صفحه "
-            "رمزگذاری‌شده نیست و رمز شما در مسیر قابل خواندن می‌بود.</p>"
-            "<p class='note'>به مدیر سرویس بگویید برای این سرور یک دامنه و "
-            "گواهی تنظیم کند؛ بعد از آن همین صفحه کار می‌کند.</p>")
-
-
 def landing(banner=""):
     return (banner +
             "<div class='icon'>🌐</div><h1>%s</h1>"
@@ -909,8 +885,8 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
 
     def cookie_for(self, session):
-        return ("sdu=%s; Path=/; HttpOnly; %sSameSite=Lax; Max-Age=%d"
-                % (session, "Secure; " if SECURE else "", 30 * 86400))
+        return ("sdu=%s; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=%d"
+                % (session, 30 * 86400))
 
     def redirect(self, where, message="", bad=False):
         if message:
@@ -930,8 +906,6 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
 
         if path in ("/signup", "/login"):
-            if not SECURE:
-                return self.send_html(insecure_notice())
             # Whether a cookie is here decides only whether to offer a way back
             # to the account, never whether to show the form. Bouncing on the
             # cookie's mere existence trapped anyone holding an expired one:
@@ -974,8 +948,6 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
 
         if path in ("/signup", "/login"):
-            if not SECURE:
-                return self.send_html(insecure_notice(), 400)
             form = self.form()
             endpoint = "/user-signup" if path == "/signup" else "/user-password-login"
             payload = {"phone": form.get("phone", ""),
@@ -1051,8 +1023,6 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
     def dashboard(self):
         token = self.session()
         if not token:
-            if not SECURE:
-                return self.send_html(insecure_notice())
             return self.send_html(landing(self.banner()))
         try:
             info = post("/user-info", {"session": token, "ip": self.client_ip()})
@@ -1155,44 +1125,25 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    global CFG, SECURE
+    global CFG
     CFG = load_config()
-    SECURE = bool(CFG.get("PANEL_DOMAIN"))
     if not os.path.exists(ACL):
         sys.exit("%s is missing - run the installer first" % ACL)
     threading.Thread(target=sync_loop, daemon=True).start()
 
-    # Plain http on 8080 stays: links already sent to customers point at it,
-    # and a browser reaching it is redirected to the secure address rather
-    # than being left on a page that carries a login token in the clear.
+    # Over TLS or not at all. This panel asks for a password and hands back a
+    # session cookie, and there is no version of that which is safe over plain
+    # http on an Iranian ISP. There used to be a second, plain listener that
+    # served a page explaining why the forms were switched off; a port that
+    # serves anything is a port that can be pointed at, so it is gone rather
+    # than harmless.
     if CFG.get("PANEL_DOMAIN"):
-        threading.Thread(target=serve_redirect, daemon=True).start()
         serve_panel()
     else:
-        print("sync up: every %ds to %s, panel on :%d (no certificate - plain http)"
-              % (INTERVAL, CFG["PANEL_HOST"], CLAIM_PORT), flush=True)
-        http.server.ThreadingHTTPServer(("0.0.0.0", CLAIM_PORT),
-                                        UserPanel).serve_forever()
-
-
-class Redirector(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *a):
-        pass
-
-    def do_GET(self):
-        target = "https://%s:%d%s" % (CFG["PANEL_DOMAIN"], PANEL_TLS_PORT, self.path)
-        self.send_response(308)
-        self.send_header("Location", target)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    do_POST = do_GET
-
-
-def serve_redirect():
-    http.server.ThreadingHTTPServer(("0.0.0.0", CLAIM_PORT), Redirector).serve_forever()
+        print("sync up: every %ds to %s - no certificate, so no customer panel"
+              % (INTERVAL, CFG["PANEL_HOST"]), flush=True)
+        while True:
+            time.sleep(3600)
 
 
 def serve_panel():

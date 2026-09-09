@@ -224,6 +224,16 @@ check("it removes the version file", 'rm -f "$STATE_DIR/version"' in un)
 check("and still leaves the database alone",
       "database left where it is" in un)
 
+print("every optional summary variable is read defensively")
+# The script runs under `set -u`, and the variables that carry the end-of-run
+# summary are set only on the paths that have something to say. One of them
+# was read bare after the panel stopped being served without a certificate,
+# and the whole install died on its last line with "unbound variable" - after
+# doing every bit of its work, so the version was never recorded either.
+for var in sorted(set(re.findall(r"^\s*([A-Z_]+_OUT)=", src, re.M))):
+    check("%s is set before any path can skip it" % var,
+          re.search(r'^%s=""$' % var, src, re.M) is not None)
+
 print("--version and --help answer without root")
 # The first version of this compared against apt-get, which both flags come
 # before anyway - so it passed while the script still told an ordinary user

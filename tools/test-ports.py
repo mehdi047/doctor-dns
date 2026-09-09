@@ -70,8 +70,9 @@ block = src[warn_at:ask_at]
 for p in TAKEN:
     check("it names %s" % p, re.search(r"\b%s\b" % p, block) is not None,
           block[:200])
-check("and says the relay takes 3478 and 8080 too",
-      "3478" in block and "8080" in block)
+check("and says the relay takes 3478 too", "3478" in block)
+check("and does not name a port that no longer exists",
+      "8080" not in block, block)
 check("and says to open the chosen one in the firewall",
       "firewall" in block)
 
@@ -118,9 +119,12 @@ else:
     for p in pair:
         txt = open(p, encoding="utf-8").read()
         name = os.path.basename(p)
-        missing = [x for x in TAKEN + ["3478", "8080"]
+        missing = [x for x in TAKEN + ["3478"]
                    if not re.search(r"\b%s\b" % x, txt)]
         check("%s lists every port in use" % name, not missing, str(missing))
+        # The plain-http panel is gone. A README that still lists its port
+        # tells an operator to open a hole in the firewall for nothing.
+        check("%s does not still list 8080" % name, "8080" not in txt)
         check("%s says the panel port must not be one of them" % name,
               "9443" in txt)
 

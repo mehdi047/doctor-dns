@@ -161,8 +161,7 @@ can see, but a firewall rule you wrote yourself it cannot.
 | **80** tcp | forwarded abroad; also how certificates are proved | the same |
 | **443** tcp | the SNI proxy | the same |
 | **3478** udp | STUN, so a console can work out its own NAT | — |
-| **8080** tcp | the customer panel, where there is no certificate | — |
-| **8443** tcp | the customer panel, where there is one | the sync API the relays connect to |
+| **8443** tcp | the customer panel — TLS only, so a relay without a certificate serves no panel at all | the sync API the relays connect to |
 | **22** tcp | ssh — never gated, so a wrong allowlist cannot lock you out | the same |
 
 The admin panel is the one port you choose. It defaults to **9443** and can be
@@ -258,8 +257,10 @@ reach the service from.
 - **Upload is not shaped.** Only the download direction is capped. Policing
   ingress needs an ifb device and drops rather than queues, for a service
   whose traffic is overwhelmingly inbound.
-- **A relay without a certificate has no customer panel.** Passwords are not
-  offered over plain HTTP, so such a relay serves a page saying so.
+- **A relay without a certificate has no customer panel.** That page asks for
+  a password, and nothing here asks for a password over plain HTTP — so it is
+  not served at all rather than served unsafely. Nobody can sign up or
+  register an address on such a relay until it is given a domain.
 - **Selling is not built, and there is no trial.** Signing up gets an account,
   a password, and somewhere to send a receipt — no traffic. The account waits
   until an operator opens its row and gives it a plan, which is the moment it

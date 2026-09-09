@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -541,6 +541,17 @@ export DEBIAN_FRONTEND=noninteractive
 NGINX_CHANGED=0
 DNSMASQ_CHANGED=0
 
+# What the run has to tell the operator at the end. Empty here so that the
+# summary can read them plainly under `set -u`, whichever paths ran. One of
+# these was left unset when the customer panel stopped being served without a
+# certificate, and the install died on its very last line - after doing all of
+# its work, and before recording that it had.
+ADMIN_URL_OUT=""
+ADMIN_PASS_OUT=""
+SYNC_TOKEN_OUT=""
+USER_PANEL_OUT=""
+AUTO_ENFORCE_OUT=""
+
 # Start the record over, but keep what an earlier install already knew: which
 # packages were new and which files existed before we ever touched them. Those
 # facts are only true the first time, and losing them would make a later
@@ -888,7 +899,6 @@ if [ -n "${PANEL_DOMAIN:-}" ]; then
 fi
 
 # ----------------------------------------------------------------- panel
-SYNC_TOKEN_OUT=""
 if [ "$ROLE" = exit ]; then
     step "Panel: database and sync API"
     mkdir -p /etc/smart-dns; chmod 700 /etc/smart-dns
@@ -919,7 +929,6 @@ if [ "$ROLE" = exit ]; then
 # written at install time and is readable only by root.
 SYNC_SECRET=$SYNC_SECRET
 RELAY_IP=$RELAY_IP
-CLAIM_PORT=8080
 EOF
     else
         # Merge rather than rewrite. An earlier version of this rewrote the
@@ -990,7 +999,7 @@ EOF
                     warn "    80    the proxy, and how certificates are proved"
                     warn "   443    the proxy"
                     warn "  8443    the sync API the relays connect to"
-                    warn "on a relay, 3478 and 8080 are taken as well."
+                    warn "on a relay, 3478 is taken as well."
                     warn "pick anything else, and open it in your firewall."
                     printf '\n'
                     read -r -p "  port to serve it on [9443]: " ADMIN_PORT
@@ -1136,15 +1145,13 @@ EOF
     enable_service smartdns-sync.service
     systemctl restart smartdns-sync.service
     sleep 3
-    # Where the customer's panel ended up, for the summary at the end. The
-    # ports match smartdns-sync's own constants: 8443 when there is a
-    # certificate to serve it with, 8080 otherwise. Both sit outside the gated
-    # ports on purpose, so somebody whose address changed can still reach the
-    # page that fixes it.
+    # Where the customer's panel ended up, for the summary at the end. It is
+    # served over TLS or not at all - it asks for a password, and there is no
+    # safe way to do that in the clear - so a relay with no certificate has no
+    # panel and nothing to print. 8443 sits outside the gated ports on purpose,
+    # so somebody whose address changed can still reach the page that fixes it.
     if [ -n "${PANEL_DOMAIN:-}" ]; then
         USER_PANEL_OUT="https://$PANEL_DOMAIN:8443/"
-    else
-        USER_PANEL_OUT="http://$SELF_IP:8080/"
     fi
     # Ask for the relay to be closed as soon as there is somebody to allow.
     # It cannot be closed here: a relay is paired before anyone has registered,
@@ -1162,7 +1169,11 @@ EOF
     fi
     if systemctl is-active --quiet smartdns-sync.service; then
         info "syncing with the panel at $PANEL_HOST every 30s"
-        info "customer panel on $USER_PANEL_OUT"
+        if [ -n "$USER_PANEL_OUT" ]; then
+            info "customer panel on $USER_PANEL_OUT"
+        else
+            warn "no certificate, so no customer panel - see the end of this run"
+        fi
     else
         warn "the sync agent did not start - journalctl -u smartdns-sync"
     fi
@@ -1248,7 +1259,7 @@ else
 ' "$RELAY_IP"
 fi
 
-if [ -n "${AUTO_ENFORCE_OUT:-}" ]; then
+if [ -n "$AUTO_ENFORCE_OUT" ]; then
     printf '    %sAccess control%s - this relay is open right now, because nobody has
     registered an address yet and closing it on an empty list would cut off
     everyone. It closes itself the moment the first address is registered,
@@ -1261,7 +1272,7 @@ if [ -n "${AUTO_ENFORCE_OUT:-}" ]; then
 ' "$B" "$N"
 fi
 
-if [ -n "${USER_PANEL_OUT:-}" ]; then
+if [ -n "$USER_PANEL_OUT" ]; then
     printf '    %sCustomer panel%s - where people sign up, register the address the
     service works on, see what is left of their allowance, and send a payment
     receipt. It also shows them the DNS address to enter.
@@ -1269,10 +1280,14 @@ if [ -n "${USER_PANEL_OUT:-}" ]; then
         %s
 
 ' "$B" "$N" "$USER_PANEL_OUT"
-    if [ -z "${PANEL_DOMAIN:-}" ]; then
-        printf '    %sSign-up and sign-in are switched off there%s, because without a
-    certificate that page is plain http and a password would be readable in
-    transit. Give this machine a domain and run:
+fi
+
+if [ "$ROLE" = relay ] && [ -z "${PANEL_DOMAIN:-}" ]; then
+    printf '    %sThere is no customer panel on this relay%s, because it has no
+    certificate. That page asks for a password, and nothing asks for a
+    password over plain http here - so it is not served at all rather than
+    served unsafely. Nobody can sign up or register an address until you
+    give this machine a domain:
 
         smartdns-cert panel.example.com
 
@@ -1280,10 +1295,9 @@ if [ -n "${USER_PANEL_OUT:-}" ]; then
     smartdns-sync.
 
 ' "$Y" "$N"
-    fi
 fi
 
-if [ -n "${ADMIN_URL_OUT:-}" ]; then
+if [ -n "$ADMIN_URL_OUT" ]; then
     printf '    %sAdmin panel%s - shown once. Only a hash of the password is stored,
     so it can be replaced but never read back. Write it down now.
 
