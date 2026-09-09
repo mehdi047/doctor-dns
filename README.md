@@ -62,6 +62,31 @@ certificate naming no console host at all.
 | **Operator panel** | customers, templates, domains, host monitoring, backup and restore |
 | **TLS** | certificates obtained and renewed automatically, asking for nothing but a domain name |
 
+## What it looks like
+
+The operator's panel, on the exit. Customers, what each has used, their
+quota, their speed cap and how long they have left — all editable in the row:
+
+![The operator's user list](docs/screenshots/admin-users.png)
+
+A template decides which brands a customer's plan carries. Open a service and
+the domains inside it can be picked one at a time; the amber note is a group
+that ships switched off because routing it breaks the thing it belongs to:
+
+![The template editor](docs/screenshots/admin-template.png)
+
+And the machines themselves, reporting in every thirty seconds:
+
+![Host monitoring](docs/screenshots/admin-home.png)
+
+The customer's own page, served by the relay. It shows what is left, the DNS
+address to type into a console, and the button that re-registers their
+address after the ISP has changed it:
+
+<img src="docs/screenshots/user-panel.png" alt="The customer's page" width="360">
+
+*(Made-up customers. Nobody in these pictures is real.)*
+
 ## Install
 
 One script, run once on each machine. It asks which side it is on and the
