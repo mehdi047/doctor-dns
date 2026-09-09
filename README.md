@@ -1,4 +1,6 @@
-# smart-dns
+# chapar — smart-dns
+
+*[فارسی](README.fa.md)*
 
 A smart DNS service for Iran, in two halves: a relay inside the country and an
 exit node outside it. Sanctioned domains resolve to the relay, which carries
@@ -170,6 +172,10 @@ reach the service from.
   not solved.
 - **Traffic costs double.** One customer gigabyte is about two on the relay
   and two on the exit — measured, and worth knowing before pricing anything.
+
+## Contributors
+
+- [Armin Toranj](https://github.com/arminandtoo) — `@arminandtoo`
 
 ## Licence
 

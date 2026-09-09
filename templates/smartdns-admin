@@ -1100,9 +1100,14 @@ class Admin(http.server.BaseHTTPRequestHandler):
                     out.append("<p class='muted'>دامنه‌ای ندارد.</p>")
                 out.append("<div class='doms'>")
                 for d in sorted(g["domains"]):
+                    # A tick on this page means "routed". Inside a group that
+                    # is switched off nothing is routed, so nothing there is
+                    # ticked - otherwise the drawer contradicts the summary
+                    # beside it, which already says 0 of however many.
                     out.append("<label><input type='checkbox' name='d' value='%s'%s>"
                                "<span>%s</span></label>"
-                               % (html.escape(d), "" if d in off else " checked",
+                               % (html.escape(d),
+                                  " checked" if on and d not in off else "",
                                   html.escape(d)))
                 out.append("</div></details>")
 
@@ -1130,12 +1135,24 @@ class Admin(http.server.BaseHTTPRequestHandler):
       e.stopPropagation();
       var d = b.closest('details'), all = b.dataset.all === '1';
       d.querySelectorAll('.doms input').forEach(function (i) { i.checked = all; });
-      if (all) d.querySelector('summary input[name=g]').checked = true;
+      // No domains and the service still ticked would be a tick that routes
+      // nothing, so the two move together.
+      d.querySelector('summary input[name=g]').checked = all;
       return count(d);
     }
     if (e.target.matches('summary input[name=g]')) {
       e.stopPropagation();
-      return count(e.target.closest('details'));
+      var d3 = e.target.closest('details');
+      var boxes = d3.querySelectorAll('.doms input');
+      // Ticking a service means all of it. The drawer is for taking things
+      // out afterwards, not for putting five hundred domains in by hand.
+      if (e.target.checked) {
+        var any = d3.querySelectorAll('.doms input:checked').length;
+        if (!any) boxes.forEach(function (i) { i.checked = true; });
+      } else {
+        boxes.forEach(function (i) { i.checked = false; });
+      }
+      return count(d3);
     }
     if (e.target.matches('.doms input')) {
       var d2 = e.target.closest('details');
@@ -1384,9 +1401,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
             wanted = set(params.get("g") or [])
             # Checkboxes only report what is ticked, so the off-list is worked
             # out by subtraction: every domain in a routed group that did not
-            # come back. That also means a group whose drawer was never opened
-            # still submits all of its domains, and nothing is lost by not
-            # having looked at it.
+            # come back.
             keep = set(params.get("d") or [])
             STORE.run("DELETE FROM template_services WHERE template_id = ?", (tid,))
             STORE.run("DELETE FROM template_domains_off WHERE template_id = ?", (tid,))
@@ -1397,8 +1412,13 @@ class Admin(http.server.BaseHTTPRequestHandler):
                     STORE.run("INSERT OR IGNORE INTO template_services"
                               " (template_id, service_key, group_key) VALUES (?,?,?)",
                               (tid, svc["key"], g["key"]))
+                    # A ticked service with none of its domains ticked is a
+                    # tick that routes nothing, which nobody means. It is what
+                    # the form sends when the helper script is blocked, so
+                    # read it the only way it makes sense: all of them.
+                    picked = keep.intersection(g["domains"]) or set(g["domains"])
                     for d in g["domains"]:
-                        if d not in keep:
+                        if d not in picked:
                             STORE.run("INSERT OR IGNORE INTO template_domains_off"
                                       " (template_id, domain) VALUES (?, ?)", (tid, d))
             return self.redirect("templates?t=%d&m=ذخیره شد؛ تا ۳۰ ثانیه دیگر روی "

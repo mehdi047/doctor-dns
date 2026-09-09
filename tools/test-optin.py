@@ -151,9 +151,11 @@ class Rec:
     wfile = _W()
 
 
-for n in ("action", "redirect", "send"):
+for n in ("action", "redirect", "send", "templates",
+          "template_editor"):
     setattr(Rec, n, getattr(admin.Admin, n))
 Rec.one = staticmethod(admin.Admin.one)
+Rec.path = "/p/templates"
 
 Rec().action("template-new", {"name": ["از پنل"]})
 made = store.one("SELECT id FROM templates WHERE name = 'از پنل'")
@@ -168,6 +170,48 @@ check("so it does not route the backend",
 print("nor does the default template carry a tick nobody made")
 check("the default has no opt-in row",
       ("epic", "backend") not in store.template_groups(default))
+
+print("and the editor draws the group the way it actually behaves")
+# A tick on that page means "routed". An unticked group whose drawer is full
+# of ticked domains says the opposite of the summary right beside it, which
+# already reads 0 of 16 - and it is what made this look switched on.
+rec = Rec()
+rec.path = "/p/templates?t=%d" % made["id"]
+html_out = rec.templates()
+
+
+def drawer(page, first_domain):
+    """The <details> block the given domain sits in."""
+    i = page.index(first_domain)
+    start = page.rindex("<details", 0, i)
+    return page[start:page.index("</details>", i)]
+
+
+back = drawer(html_out, sorted(backend)[0])
+check("the opt-in group's own box is not ticked",
+      "name='g' value='epic.backend' checked" not in back and
+      "value='epic.backend'" in back)
+check("and none of its domains are ticked either",
+      back.count("name='d'") == len(backend) and " checked" not in back,
+      "%d of %d ticked" % (back.count("checked"), len(backend)))
+
+ordinary = drawer(html_out, "spotify.com")
+check("while a routed group still shows its domains ticked",
+      ordinary.count(" checked") == ordinary.count("name='d'") + 1,
+      "%d ticks for %d domains" % (ordinary.count(" checked"),
+                                   ordinary.count("name='d'")))
+
+print("and saving a service with no domains named means all of them")
+# What the form sends with the helper script blocked. Read as subtraction it
+# would tick the service and route nothing; nobody means that.
+Rec().action("template-save", {"id": [str(made["id"])], "g": ["spotify.main"]})
+left = set(store.bypass_for(made["id"], cat))
+check("spotify is routed, not bypassed", "spotify.com" not in left)
+check("and every one of its domains is",
+      not any(d in left for s in cat if s["key"] == "spotify"
+              for g in s["groups"] for d in g["domains"]))
+check("the rest of the catalogue went off with it",
+      "epicgames.com" in left)
 
 print("the relay writes them accordingly")
 pins_file = os.path.join(tmp, "epic-pins.conf")
