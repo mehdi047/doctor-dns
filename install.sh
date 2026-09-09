@@ -2551,7 +2551,7 @@ exit 0
 ## rather than a redeploy to every machine.
 #DEFAULT_SETTINGS = {
 #    # What a new account gets before it has paid for anything.
-#    "trial_bytes": str(500 * MB),
+#    "trial_bytes": str(1 * GB),
 #    "trial_days": "1",
 #    "plan_bytes": str(2 * GB),
 #    "plan_days": "30",
@@ -2907,7 +2907,7 @@ exit 0
 #        trial demonstrates a slow service, and the point of it is to let
 #        somebody see whether their console downloads faster through this.
 #        """
-#        return (int(self.setting("trial_bytes", str(500 * MB)) or 0),
+#        return (int(self.setting("trial_bytes", str(GB)) or 0),
 #                int(self.setting("trial_days", "1") or 1))
 #
 #    def create_user(self, tg_id, username, first_name):

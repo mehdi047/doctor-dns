@@ -140,7 +140,7 @@ u = store.user_by_phone("09121112233")
 check("account exists with a null telegram_id", u and u["telegram_id"] is None)
 check("account got the trial allowance",
       u["quota_bytes"] == int(store.setting("trial_bytes")), str(u["quota_bytes"]))
-check("the trial is 500 MB", u["quota_bytes"] == 500 * 1024 * 1024)
+check("the trial is 1 GB", u["quota_bytes"] == 1024 ** 3, str(u["quota_bytes"]))
 check("the trial runs at full speed", (u["speed_kbps"] or 0) == 0)
 check("the trial has an end date", bool(u["expires_at"]), str(u["expires_at"]))
 check("it does not renew itself", u["quota_mode"] == "oneoff", u["quota_mode"])
