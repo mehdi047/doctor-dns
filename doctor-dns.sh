@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.3.0"
+VERSION="0.3.1"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -838,6 +838,17 @@ if [ "$ROLE" = relay ]; then
 fi
 
 # ------------------------------------------------------------------- TLS
+# The helper goes on every machine, domain or no domain. Without one this run
+# installs no certificate - but the summary at the end tells the operator to
+# come back and run this command once they have a name, and a command that is
+# only installed when it is not needed is not much of an instruction.
+payload CERT > /usr/local/bin/smartdns-cert
+chmod +x /usr/local/bin/smartdns-cert
+note_file /usr/local/bin/smartdns-cert
+install_payload CERT_SERVICE /etc/systemd/system/smartdns-cert.service || true
+install_payload CERT_TIMER   /etc/systemd/system/smartdns-cert.timer   || true
+systemctl daemon-reload
+
 if [ -n "${PANEL_DOMAIN:-}" ]; then
     step "HTTPS certificate for $PANEL_DOMAIN"
     CERT_PKGS="certbot"
@@ -884,13 +895,9 @@ if [ -n "${PANEL_DOMAIN:-}" ]; then
     fi
 
     if [ -z "${PANEL_CERT:-}" ]; then
-        payload CERT > /usr/local/bin/smartdns-cert
-        chmod +x /usr/local/bin/smartdns-cert
-        note_file /usr/local/bin/smartdns-cert
-        install_payload CERT_SERVICE /etc/systemd/system/smartdns-cert.service || true
-        install_payload CERT_TIMER   /etc/systemd/system/smartdns-cert.timer   || true
-        systemctl daemon-reload
         /usr/local/bin/smartdns-cert "$PANEL_DOMAIN" || die "could not get a certificate"
+        # Only once there is something to renew. A timer running against no
+        # certificate is a unit that wakes twice a day to do nothing.
         enable_service smartdns-cert.timer
         systemctl start smartdns-cert.timer 2>/dev/null || true
     fi
@@ -5339,6 +5346,21 @@ exit 0
 #esac
 #
 #DOMAIN="$1"
+#
+## A machine installed without a domain has this script but not certbot - the
+## installer only pulls certbot in when it is about to issue something. Since
+## the whole point of running this later is that there was no domain at install
+## time, "certbot: not found" is the most likely first thing anybody sees here.
+#if ! command -v certbot >/dev/null 2>&1; then
+#    printf '    installing certbot\n'
+#    export DEBIAN_FRONTEND=noninteractive
+#    pkgs=certbot
+#    [ -f "$CF_CONF" ] && pkgs="$pkgs python3-certbot-dns-cloudflare"
+#    apt-get update -qq >/dev/null 2>&1
+#    # shellcheck disable=SC2086
+#    apt-get install -y -qq $pkgs >/dev/null 2>&1 \
+#        || die "could not install certbot:  apt-get install -y $pkgs"
+#fi
 #
 ## Already have one with plenty of life left? Do nothing. Let's Encrypt limits
 ## issuance per domain per week, and re-issuing on every installer run would

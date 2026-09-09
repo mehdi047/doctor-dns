@@ -106,6 +106,21 @@ if m:
         check("%r is refused as not a number" % bad, r.returncode != 0,
               r.stdout + r.stderr)
 
+print("the command the summary tells you to run is actually installed")
+# It used to be written only inside the "we have a domain" branch, while the
+# end-of-run message told a machine with no domain to run it. The one reader
+# who needed it was the one who could not have it.
+cert_at = src.index("payload CERT > /usr/local/bin/smartdns-cert")
+domain_gate = src.index('if [ -n "${PANEL_DOMAIN:-}" ]; then\n    step "HTTPS')
+check("smartdns-cert is installed before the domain check", cert_at < domain_gate)
+check("and only written once", src.count("payload CERT >") == 1,
+      str(src.count("payload CERT >")))
+check("the summary points at it", "smartdns-cert panel.example.com" in src)
+helper = open(os.path.join(HERE, "..", "templates", "smartdns-cert"),
+              encoding="utf-8").read()
+check("and it installs certbot itself when it is missing",
+      "command -v certbot" in helper and "apt-get install" in helper)
+
 print("smartdns-access refuses the same list")
 acc = open(ACCESS, encoding="utf-8").read()
 for p in TAKEN:

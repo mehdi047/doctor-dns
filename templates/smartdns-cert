@@ -97,6 +97,21 @@ esac
 
 DOMAIN="$1"
 
+# A machine installed without a domain has this script but not certbot - the
+# installer only pulls certbot in when it is about to issue something. Since
+# the whole point of running this later is that there was no domain at install
+# time, "certbot: not found" is the most likely first thing anybody sees here.
+if ! command -v certbot >/dev/null 2>&1; then
+    printf '    installing certbot\n'
+    export DEBIAN_FRONTEND=noninteractive
+    pkgs=certbot
+    [ -f "$CF_CONF" ] && pkgs="$pkgs python3-certbot-dns-cloudflare"
+    apt-get update -qq >/dev/null 2>&1
+    # shellcheck disable=SC2086
+    apt-get install -y -qq $pkgs >/dev/null 2>&1 \
+        || die "could not install certbot:  apt-get install -y $pkgs"
+fi
+
 # Already have one with plenty of life left? Do nothing. Let's Encrypt limits
 # issuance per domain per week, and re-issuing on every installer run would
 # burn that allowance and then fail at the moment it mattered.
