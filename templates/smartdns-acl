@@ -23,6 +23,11 @@ TABLE="inet smartdns"
 SEP=$'\x1f'
 STATE=/etc/nftables.d/20-smartdns-state.conf
 ENFORCE=/etc/nftables.d/30-smartdns-enforce.conf
+# Set by the installer to mean "close this relay as soon as there is somebody
+# to allow". A fresh relay has an empty allowlist and enforcing on an empty
+# list would cut off everyone, so the decision cannot be made at install time -
+# the sync agent acts on it when the first address arrives.
+AUTO=/etc/smart-dns/auto-enforce
 
 R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; N=$'\e[0m'
 [ -t 1 ] || { R=; G=; Y=; N=; }
@@ -275,6 +280,13 @@ RULES
         root
         nft flush chain $TABLE gate
         rm -f "$ENFORCE"
+        # Also cancel the installer's standing instruction to close the relay
+        # once somebody registers. Opening it by hand and having a background
+        # agent shut it again half a minute later would be its own bug.
+        if [ -f "$AUTO" ]; then
+            rm -f "$AUTO"
+            printf 'automatic enforcement cancelled too\n'
+        fi
         printf '%sopen%s - nothing is being blocked\n' "$Y" "$N"
         ;;
     status)

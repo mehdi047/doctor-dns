@@ -116,6 +116,15 @@ CREATE TABLE IF NOT EXISTS transactions (
     decided_at   TEXT
 );
 
+-- The operator's own browser sessions for the admin panel. In the database
+-- rather than in that process's memory, because it restarts on every upgrade
+-- and whenever its port or path changes - and being signed out by a restart
+-- left the operator staring at the same bare 404 a stranger gets.
+CREATE TABLE IF NOT EXISTS admin_sessions (
+    token      TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS ips_user ON ips(user_id);
 
@@ -1171,6 +1180,8 @@ class API(http.server.BaseHTTPRequestHandler):
             return self.reply(200, self.do_user_password_login(body))
         if self.path == "/user-receipt":
             return self.reply(200, self.do_user_receipt(body))
+        if self.path == "/user-password":
+            return self.reply(200, self.do_user_password(body))
 
         return self.reply(404, {"error": "no such endpoint"})
 
@@ -1237,6 +1248,49 @@ class API(http.server.BaseHTTPRequestHandler):
             return {"ok": False, "message": "شماره یا رمز درست نیست"}
         THROTTLE.clear("login:%s" % ip)
         return {"ok": True, "session": self.store.open_session(user["id"])}
+
+    def do_user_password(self, body):
+        """Let a customer change their own password.
+
+        The current one is required even though the session already proves
+        who they are. A session can be a borrowed phone or a browser left
+        open; asking for the password again means possession of the session
+        is not enough to take the account away from its owner.
+        """
+        user = self._session_user(body.get("session"))
+        if not user:
+            return {"ok": False, "message": "نشست معتبر نیست"}
+        if not user["password_hash"]:
+            return {"ok": False,
+                    "message": "این حساب رمز ندارد؛ با پشتیبانی تماس بگیرید"}
+        if not check_password(user, body.get("current") or ""):
+            # Same throttle as signing in: this is a password guess like any
+            # other, and a stolen session should not buy unlimited attempts.
+            ok, wait = THROTTLE.check("pw:%d" % user["id"], limit=8, window=900)
+            if not ok:
+                return {"ok": False, "message":
+                        "تلاش زیاد بوده. %d دقیقه دیگر." % max(1, wait // 60)}
+            THROTTLE.hit("pw:%d" % user["id"])
+            return {"ok": False, "message": "رمز فعلی درست نیست"}
+
+        new = body.get("new") or ""
+        if len(new) < 8:
+            return {"ok": False, "message": "رمز تازه باید دست‌کم ۸ نویسه باشد"}
+        if new == (body.get("current") or ""):
+            return {"ok": False, "message": "رمز تازه با رمز فعلی یکی است"}
+
+        self.store.set_password(user["id"], new)
+        THROTTLE.clear("pw:%d" % user["id"])
+        # Every other session ends. Changing a password is what somebody does
+        # when they think another person has their account, so leaving that
+        # person signed in would defeat the whole exercise.
+        kept = body.get("session")
+        self.store.run(
+            "DELETE FROM panel_sessions WHERE user_id = ? AND token != ?",
+            (user["id"], kept))
+        print("password changed for user %d" % user["id"], flush=True)
+        return {"ok": True,
+                "message": "رمز عوض شد. اگر جای دیگری وارد بودید، خارج شدید"}
 
     def do_user_receipt(self, body):
         """Store a photograph of a payment slip against the customer.

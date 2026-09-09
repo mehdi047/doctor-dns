@@ -78,15 +78,24 @@ Two machines with Debian or Ubuntu and a public address each:
 No pip, no npm, no containers. Python's standard library, nginx, dnsmasq,
 nftables and coturn, all from the distribution.
 
-### Turning access control on
+### Access control
 
-The relay counts traffic from the moment it is installed and blocks nobody.
-That is deliberate: switching enforcement on before customers have a way to
-register an address locks out everyone, including you.
+A fresh relay answers everyone. That is not a default anybody chose - it is
+that a relay is installed before a single address is registered, and closing
+it against an empty allowlist cuts off every user at once, the operator
+included.
+
+So the relay closes itself at the first sync that brings a registered
+address, and only registered addresses get DNS, HTTP and HTTPS from then on.
+SSH is never gated, so a wrong allowlist cannot cost anyone access to the
+machine.
 
 ```sh
-smartdns-acl enforce on
+smartdns-acl enforce status   # which it is right now
+smartdns-acl enforce off      # stay open, and cancel the automatic close
 ```
+
+`ENFORCE=no` on the installer's command line opts out from the start.
 
 ## After installing
 
@@ -95,10 +104,19 @@ smartdns status              # what this machine is doing
 smartdns-acl list            # who is allowed, and what they have used
 smartdns-shape list          # who is speed limited
 smartdns-cert example.com    # a certificate for a panel
+smartdns-access              # where the operator's panel answers
+smartdns-access password     # change it; also port and path
 ```
 
-The exit prints the operator panel's URL and password at the end of its
-install. That panel is the whole administrative interface.
+Each side prints what it set up at the end of its install: the relay names the
+DNS address and the customers' panel, the exit names the operator's panel and
+its password, shown once.
+
+The operator's panel is the whole administrative interface - customers, their
+quotas and speeds, service templates, the domain list, host monitoring,
+payment receipts, and backup and restore. `smartdns-access` exists for the one
+case the panel cannot help with: getting back in after its port or path was
+changed to something the firewall does not allow.
 
 ## How it is built
 

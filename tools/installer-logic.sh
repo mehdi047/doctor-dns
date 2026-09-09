@@ -860,10 +860,44 @@ EOF
         note_file /usr/local/bin/smartdns-admin
         install_payload ADMIN_SERVICE /etc/systemd/system/smartdns-admin.service || true
 
+        payload SMARTDNS_ACCESS > /usr/local/bin/smartdns-access
+        chmod +x /usr/local/bin/smartdns-access
+        note_file /usr/local/bin/smartdns-access
+
         # Generated once and kept. Regenerating on every run would move the URL
         # and change the password under the operator each time they upgraded.
         if [ ! -f /etc/smart-dns/admin.env ]; then
-            ADMIN_PASS="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-16)"
+            # Asked for, not assumed. The port is the operator's firewall to
+            # think about, and a password they chose is one they will still
+            # have tomorrow - a generated one gets pasted somewhere careless
+            # or lost. Both have answers, so pressing enter is fine.
+            if [ -z "${ASSUME_YES:-}" ]; then
+                printf '\n%sAdmin panel%s\n\n' "$B" "$N"
+                if [ -z "${ADMIN_PORT:-}" ]; then
+                    read -r -p "  port to serve it on [9443]: " ADMIN_PORT
+                fi
+                if [ -z "${ADMIN_PASS:-}" ]; then
+                    printf '  password [enter for a generated one]: '
+                    read -rs ADMIN_PASS; printf '\n'
+                    if [ -n "$ADMIN_PASS" ]; then
+                        printf '  again: '
+                        read -rs ADMIN_PASS2; printf '\n'
+                        [ "$ADMIN_PASS" = "$ADMIN_PASS2" ] \
+                            || die "the two passwords did not match"
+                        [ "${#ADMIN_PASS}" -ge 8 ] \
+                            || die "use a password of 8 characters or more"
+                    fi
+                fi
+            fi
+            ADMIN_PORT="${ADMIN_PORT:-9443}"
+            case "$ADMIN_PORT" in
+                *[!0-9]*|"") die "the admin port must be a number" ;;
+                53|80|443|8443|22) die "port $ADMIN_PORT is already the service's own" ;;
+            esac
+            # The path stays generated. Nobody types it from memory, and an
+            # operator asked to invent one invents a guessable one.
+            [ -n "${ADMIN_PASS:-}" ] \
+                || ADMIN_PASS="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-16)"
             ADMIN_SALT="$(openssl rand -hex 16)"
             ADMIN_HASH="$(ADMIN_PASS="$ADMIN_PASS" ADMIN_SALT="$ADMIN_SALT" python3 -c '
 import hashlib, os
@@ -874,7 +908,7 @@ print(hashlib.pbkdf2_hmac("sha256", os.environ["ADMIN_PASS"].encode(),
             cat > /etc/smart-dns/admin.env <<EOF
 # Written once at install. The password itself is not stored - only a salted
 # hash - so a forgotten password is replaced, never recovered.
-ADMIN_PORT=${ADMIN_PORT:-9443}
+ADMIN_PORT=$ADMIN_PORT
 ADMIN_PATH=$ADMIN_PATH_GEN
 ADMIN_SALT=$ADMIN_SALT
 ADMIN_HASH=$ADMIN_HASH
@@ -883,10 +917,11 @@ ADMIN_KEY=$KEY_PATH
 EOF
             umask 022
             chmod 600 /etc/smart-dns/admin.env
-            ADMIN_URL_OUT="https://$PANEL_DOMAIN:${ADMIN_PORT:-9443}/$ADMIN_PATH_GEN/"
+            ADMIN_URL_OUT="https://$PANEL_DOMAIN:$ADMIN_PORT/$ADMIN_PATH_GEN/"
             ADMIN_PASS_OUT="$ADMIN_PASS"
         else
             info "keeping the admin URL and password already set up here"
+            info "change them with: smartdns-access"
         fi
         systemctl daemon-reload
         enable_service smartdns-admin.service
@@ -989,6 +1024,20 @@ EOF
     else
         USER_PANEL_OUT="http://$SELF_IP:8080/"
     fi
+    # Ask for the relay to be closed as soon as there is somebody to allow.
+    # It cannot be closed here: a relay is paired before anyone has registered,
+    # and enforcing against an empty allowlist cuts off everyone including
+    # whoever is running this. The sync agent acts on this note at the first
+    # sync that brings an address, and `smartdns-acl enforce off` cancels it.
+    if [ "${ENFORCE:-yes}" = no ]; then
+        rm -f /etc/smart-dns/auto-enforce
+        info "ENFORCE=no - this relay will stay open until you close it by hand"
+    elif [ -f /etc/nftables.d/30-smartdns-enforce.conf ]; then
+        info "access control is already on"
+    else
+        : > /etc/smart-dns/auto-enforce
+        AUTO_ENFORCE_OUT=1
+    fi
     if systemctl is-active --quiet smartdns-sync.service; then
         info "syncing with the panel at $PANEL_HOST every 30s"
         info "customer panel on $USER_PANEL_OUT"
@@ -1069,6 +1118,19 @@ else
     Run the installer on the relay next, if you have not already.
 
 ' "$RELAY_IP"
+fi
+
+if [ -n "${AUTO_ENFORCE_OUT:-}" ]; then
+    printf '    %sAccess control%s - this relay is open right now, because nobody has
+    registered an address yet and closing it on an empty list would cut off
+    everyone. It closes itself the moment the first address is registered,
+    and only registered addresses get DNS, HTTP and HTTPS after that. SSH is
+    never affected.
+
+        smartdns-acl enforce status     see which it is
+        smartdns-acl enforce off        stay open, and cancel this
+
+' "$B" "$N"
 fi
 
 if [ -n "${USER_PANEL_OUT:-}" ]; then

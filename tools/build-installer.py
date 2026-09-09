@@ -48,6 +48,7 @@ PAYLOADS = [
     ("CERT_TIMER", "templates/smartdns-cert.timer"),
     ("ADMIN", "templates/smartdns-admin"),
     ("ADMIN_SERVICE", "templates/smartdns-admin.service"),
+    ("SMARTDNS_ACCESS", "templates/smartdns-access"),
     ("EPIC_PIN", "templates/epic-pin"),
     ("EPIC_PIN_SERVICE", "templates/epic-pin.service"),
     ("EPIC_PIN_TIMER", "templates/epic-pin.timer"),

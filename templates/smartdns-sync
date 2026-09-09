@@ -437,6 +437,41 @@ def apply_speeds(allowed):
     SHAPED = wanted
 
 
+AUTO_ENFORCE = "/etc/smart-dns/auto-enforce"
+
+
+def close_relay_when_ready(allowed_count):
+    """Switch access control on once there is somebody to allow.
+
+    The installer cannot make this call itself: a relay is installed before it
+    has a single registered address, and enforcing against an empty allowlist
+    cuts off everyone including the operator. So the installer leaves a note
+    saying what it wants, and this closes the door at the first sync that
+    brings an address.
+
+    Runs once. `smartdns-acl enforce off` deletes the note, so an operator who
+    deliberately opens the relay does not find it shut again thirty seconds
+    later.
+    """
+    if allowed_count <= 0 or not os.path.exists(AUTO_ENFORCE):
+        return
+    state = subprocess.run([ACL, "enforce", "status"], capture_output=True,
+                           text=True, timeout=30)
+    if "enforcing" in (state.stdout or ""):
+        os.unlink(AUTO_ENFORCE)      # already closed; nothing left to do
+        return
+    r = subprocess.run([ACL, "enforce", "on", "--yes"], capture_output=True,
+                       text=True, timeout=30)
+    if r.returncode != 0:
+        # Most likely the allowlist is still empty in the kernel because this
+        # is the pass that is about to fill it. Leave the note and try again
+        # on the next sync rather than reporting a problem that is not one.
+        return
+    os.unlink(AUTO_ENFORCE)
+    print("access control on: %d address(es) may use this relay"
+          % allowed_count, flush=True)
+
+
 def sync_once():
     rows = current_state()
     counters = {r["ip"]: r["total"] for r in rows}
@@ -477,6 +512,10 @@ def sync_once():
         r = acl("del", ip)
         print("removed %s%s" % (ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()),
               flush=True)
+
+    # After the set is filled, not before: enforcing while the kernel list is
+    # still empty is refused, and would leave the relay open for another cycle.
+    close_relay_when_ready(len(want))
     return len(want), len(want - have), len(have - want)
 
 
@@ -548,6 +587,15 @@ input:focus{outline:0;border-color:#238636}
 .dns .note{margin-top:12px}
 .dns input[type=file]{width:100%;padding:10px;font-size:12px;
  border:1px dashed #30363d;background:transparent;margin-bottom:4px}
+details.pw{margin-top:16px;border:1px solid #262b36;border-radius:12px;
+ background:#0f1115}
+details.pw>summary{padding:14px 16px;cursor:pointer;color:#9aa4b2;font-size:13px;
+ list-style:none}
+details.pw>summary::-webkit-details-marker{display:none}
+details.pw>summary::before{content:'b8';margin-left:8px;font-size:11px}
+details.pw[open]>summary::before{content:'be'}
+details.pw form{padding:0 16px 4px}
+details.pw .note{padding:0 16px 14px;margin-top:8px}
 .ok{color:#7dd3a0}.bad{color:#f85149}.warn{color:#e3b341}
 """
 
@@ -912,6 +960,24 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                 "Location": "/register-ip",
                 "Set-Cookie": self.cookie_for(res["session"])})
 
+        if path == "/password":
+            if not self.session():
+                return self.redirect("/")
+            form = self.form()
+            if form.get("new") != form.get("again"):
+                return self.redirect("/", "دو رمز تازه یکی نیستند", bad=True)
+            try:
+                res = post("/user-password", {
+                    "session": self.session(),
+                    "current": form.get("current", ""),
+                    "new": form.get("new", ""),
+                })
+            except Exception as e:
+                print("password change failed: %s" % e, file=sys.stderr, flush=True)
+                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+            return self.redirect("/", res.get("message", ""),
+                                 bad=not res.get("ok"))
+
         if path == "/receipt":
             if not self.session():
                 return self.redirect("/")
@@ -1029,6 +1095,21 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
             "<input type='file' name='file' required "
             "accept='image/jpeg,image/png,image/webp,application/pdf'>"
             "<button class='ghost'>فرستادن رسید</button></form></div>")
+        body.append(
+            "<details class='pw'><summary>تغییر رمز عبور</summary>"
+            "<form method='post' action='/password'>"
+            "<label>رمز فعلی</label>"
+            "<input name='current' type='password' required "
+            "autocomplete='current-password'>"
+            "<label>رمز تازه (دست‌کم ۸ نویسه)</label>"
+            "<input name='new' type='password' required minlength='8' "
+            "autocomplete='new-password'>"
+            "<label>تکرار رمز تازه</label>"
+            "<input name='again' type='password' required minlength='8' "
+            "autocomplete='new-password'>"
+            "<button class='ghost'>تغییر رمز</button></form>"
+            "<p class='note'>اگر جای دیگری وارد حسابتان باشید، با تغییر رمز "
+            "از آنجا خارج می‌شوید.</p></details>")
         body.append("<p class='alt'><a href='/logout'>خروج از حساب</a></p>")
         return self.send_html("".join(body))
 

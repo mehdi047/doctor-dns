@@ -1,0 +1,163 @@
+#!/bin/bash
+# smartdns-access - change how the admin panel is reached.
+#
+# usage: smartdns-access                    show the address it answers on
+#        smartdns-access port <number>      move it to another port
+#        smartdns-access path [new]         change the secret path, or roll one
+#        smartdns-access password [new]     set a new password
+#        smartdns-access rotate             new path and new password at once
+#
+# Three things stand in front of the panel and only one of them is a secret in
+# the cryptographic sense:
+#
+#   the port    keeps it out of the way of casual scanning, nothing more
+#   the path    an unguessable URL - it is a secret, but it travels in every
+#               request line and lands in any proxy log along the way
+#   the password the actual authentication
+#
+# So this can change all three, and the password is the one that matters. It
+# is never stored: only a salted hash goes into admin.env, which is why a
+# forgotten password is replaced rather than recovered.
+set -uo pipefail
+export PATH="$PATH:/usr/sbin:/sbin"
+
+CONF=/etc/smart-dns/admin.env
+UNIT=smartdns-admin.service
+
+R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'
+[ -t 1 ] || { R=; G=; Y=; B=; N=; }
+die() { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+[ "$(id -u)" = 0 ] || die "run as root"
+[ -f "$CONF" ] || die "$CONF is missing - this machine has no admin panel.
+    It is set up on the exit node, by the installer, once the machine has a
+    domain and a certificate."
+
+get() { sed -n "s/^$1=//p" "$CONF" | head -1; }
+
+set_key() {
+    local key="$1" value="$2" tmp
+    tmp="$(mktemp)"
+    grep -v "^${key}=" "$CONF" > "$tmp" 2>/dev/null || true
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    # Copy rather than move: the file is mode 600 and owned by root, and a
+    # move from /tmp would bring the temporary file's permissions with it.
+    cat "$tmp" > "$CONF"
+    rm -f "$tmp"
+    chmod 600 "$CONF"
+}
+
+hash_password() {
+    ADMIN_PASS="$1" ADMIN_SALT="$2" python3 -c '
+import hashlib, os
+print(hashlib.pbkdf2_hmac("sha256", os.environ["ADMIN_PASS"].encode(),
+                          bytes.fromhex(os.environ["ADMIN_SALT"]), 200000).hex())'
+}
+
+domain() {
+    # Whatever the certificate is for. The panel answers on any address the
+    # machine has, but only this name matches the certificate, so it is the
+    # only one worth printing.
+    local d
+    d="$(sed -n 's|^ADMIN_CERT=/etc/letsencrypt/live/\([^/]*\)/.*|\1|p' "$CONF" | head -1)"
+    [ -n "$d" ] || d="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    printf '%s' "${d:-this-server}"
+}
+
+show() {
+    printf '\n    %sAdmin panel%s\n\n        https://%s:%s/%s/\n\n' \
+        "$B" "$N" "$(domain)" "$(get ADMIN_PORT)" "$(get ADMIN_PATH)"
+    printf '    The password is not stored, only a hash of it. If it is lost,\n'
+    printf '    set a new one:  smartdns-access password\n\n'
+}
+
+restart() {
+    systemctl restart "$UNIT" 2>/dev/null
+    sleep 2
+    if systemctl is-active --quiet "$UNIT"; then
+        printf '%s    panel restarted%s\n' "$G" "$N"
+    else
+        printf '%s    the panel did not come back - journalctl -u %s%s\n' \
+            "$Y" "$UNIT" "$N"
+    fi
+}
+
+case "${1:-show}" in
+show|"")
+    show
+    ;;
+
+port)
+    new="${2:-}"
+    case "$new" in
+        ""|*[!0-9]*) die "usage: smartdns-access port <number>" ;;
+    esac
+    [ "$new" -ge 1 ] && [ "$new" -le 65535 ] || die "a port is 1-65535"
+    # These belong to the service itself. Moving the panel onto one of them
+    # would take down the thing it is meant to administer.
+    case "$new" in
+        53|80|443) die "port $new is the service's own - pick another" ;;
+        8443) die "port 8443 is the sync API the relays talk to" ;;
+        22) die "port 22 is ssh" ;;
+    esac
+    old="$(get ADMIN_PORT)"
+    if [ "$new" != "$old" ] && ss -tlnH "sport = :$new" 2>/dev/null | grep -q .; then
+        die "something else is already listening on $new"
+    fi
+    set_key ADMIN_PORT "$new"
+    printf '    port %s -> %s\n' "$old" "$new"
+    restart
+    show
+    ;;
+
+path)
+    new="${2:-}"
+    if [ -z "$new" ]; then
+        new="$(openssl rand -hex 12)"
+    else
+        case "$new" in
+            */*|*' '*|*'?'*|*'#'*) die "a path is one segment: letters, digits, - and _" ;;
+            *[!A-Za-z0-9_-]*) die "use only letters, digits, - and _" ;;
+        esac
+        [ "${#new}" -ge 8 ] || die "too short to be unguessable - use 8 or more"
+    fi
+    set_key ADMIN_PATH "$new"
+    printf '    the old address stops working now.\n'
+    restart
+    show
+    ;;
+
+password)
+    new="${2:-}"
+    if [ -z "$new" ]; then
+        # -s so it is not echoed, and asked twice because it cannot be read
+        # back afterwards to check.
+        printf '  new password (8 or more, not shown as you type): '
+        read -rs new; printf '\n'
+        printf '  again: '
+        read -rs again; printf '\n'
+        [ "$new" = "$again" ] || die "they did not match - nothing changed"
+    fi
+    [ "${#new}" -ge 8 ] || die "use 8 characters or more"
+    salt="$(openssl rand -hex 16)"
+    hash="$(hash_password "$new" "$salt")" || die "could not hash the password"
+    [ -n "$hash" ] || die "could not hash the password"
+    set_key ADMIN_SALT "$salt"
+    set_key ADMIN_HASH "$hash"
+    printf '    password changed. Everyone signed in is signed out.\n'
+    # Sessions live in the panel's memory, so restarting is what ends them -
+    # which is the point of changing a password.
+    restart
+    ;;
+
+rotate)
+    "$0" path >/dev/null
+    "$0" password "${2:-}"
+    show
+    ;;
+
+*)
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

@@ -860,10 +860,44 @@ EOF
         note_file /usr/local/bin/smartdns-admin
         install_payload ADMIN_SERVICE /etc/systemd/system/smartdns-admin.service || true
 
+        payload SMARTDNS_ACCESS > /usr/local/bin/smartdns-access
+        chmod +x /usr/local/bin/smartdns-access
+        note_file /usr/local/bin/smartdns-access
+
         # Generated once and kept. Regenerating on every run would move the URL
         # and change the password under the operator each time they upgraded.
         if [ ! -f /etc/smart-dns/admin.env ]; then
-            ADMIN_PASS="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-16)"
+            # Asked for, not assumed. The port is the operator's firewall to
+            # think about, and a password they chose is one they will still
+            # have tomorrow - a generated one gets pasted somewhere careless
+            # or lost. Both have answers, so pressing enter is fine.
+            if [ -z "${ASSUME_YES:-}" ]; then
+                printf '\n%sAdmin panel%s\n\n' "$B" "$N"
+                if [ -z "${ADMIN_PORT:-}" ]; then
+                    read -r -p "  port to serve it on [9443]: " ADMIN_PORT
+                fi
+                if [ -z "${ADMIN_PASS:-}" ]; then
+                    printf '  password [enter for a generated one]: '
+                    read -rs ADMIN_PASS; printf '\n'
+                    if [ -n "$ADMIN_PASS" ]; then
+                        printf '  again: '
+                        read -rs ADMIN_PASS2; printf '\n'
+                        [ "$ADMIN_PASS" = "$ADMIN_PASS2" ] \
+                            || die "the two passwords did not match"
+                        [ "${#ADMIN_PASS}" -ge 8 ] \
+                            || die "use a password of 8 characters or more"
+                    fi
+                fi
+            fi
+            ADMIN_PORT="${ADMIN_PORT:-9443}"
+            case "$ADMIN_PORT" in
+                *[!0-9]*|"") die "the admin port must be a number" ;;
+                53|80|443|8443|22) die "port $ADMIN_PORT is already the service's own" ;;
+            esac
+            # The path stays generated. Nobody types it from memory, and an
+            # operator asked to invent one invents a guessable one.
+            [ -n "${ADMIN_PASS:-}" ] \
+                || ADMIN_PASS="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-16)"
             ADMIN_SALT="$(openssl rand -hex 16)"
             ADMIN_HASH="$(ADMIN_PASS="$ADMIN_PASS" ADMIN_SALT="$ADMIN_SALT" python3 -c '
 import hashlib, os
@@ -874,7 +908,7 @@ print(hashlib.pbkdf2_hmac("sha256", os.environ["ADMIN_PASS"].encode(),
             cat > /etc/smart-dns/admin.env <<EOF
 # Written once at install. The password itself is not stored - only a salted
 # hash - so a forgotten password is replaced, never recovered.
-ADMIN_PORT=${ADMIN_PORT:-9443}
+ADMIN_PORT=$ADMIN_PORT
 ADMIN_PATH=$ADMIN_PATH_GEN
 ADMIN_SALT=$ADMIN_SALT
 ADMIN_HASH=$ADMIN_HASH
@@ -883,10 +917,11 @@ ADMIN_KEY=$KEY_PATH
 EOF
             umask 022
             chmod 600 /etc/smart-dns/admin.env
-            ADMIN_URL_OUT="https://$PANEL_DOMAIN:${ADMIN_PORT:-9443}/$ADMIN_PATH_GEN/"
+            ADMIN_URL_OUT="https://$PANEL_DOMAIN:$ADMIN_PORT/$ADMIN_PATH_GEN/"
             ADMIN_PASS_OUT="$ADMIN_PASS"
         else
             info "keeping the admin URL and password already set up here"
+            info "change them with: smartdns-access"
         fi
         systemctl daemon-reload
         enable_service smartdns-admin.service
@@ -989,6 +1024,20 @@ EOF
     else
         USER_PANEL_OUT="http://$SELF_IP:8080/"
     fi
+    # Ask for the relay to be closed as soon as there is somebody to allow.
+    # It cannot be closed here: a relay is paired before anyone has registered,
+    # and enforcing against an empty allowlist cuts off everyone including
+    # whoever is running this. The sync agent acts on this note at the first
+    # sync that brings an address, and `smartdns-acl enforce off` cancels it.
+    if [ "${ENFORCE:-yes}" = no ]; then
+        rm -f /etc/smart-dns/auto-enforce
+        info "ENFORCE=no - this relay will stay open until you close it by hand"
+    elif [ -f /etc/nftables.d/30-smartdns-enforce.conf ]; then
+        info "access control is already on"
+    else
+        : > /etc/smart-dns/auto-enforce
+        AUTO_ENFORCE_OUT=1
+    fi
     if systemctl is-active --quiet smartdns-sync.service; then
         info "syncing with the panel at $PANEL_HOST every 30s"
         info "customer panel on $USER_PANEL_OUT"
@@ -1069,6 +1118,19 @@ else
     Run the installer on the relay next, if you have not already.
 
 ' "$RELAY_IP"
+fi
+
+if [ -n "${AUTO_ENFORCE_OUT:-}" ]; then
+    printf '    %sAccess control%s - this relay is open right now, because nobody has
+    registered an address yet and closing it on an empty list would cut off
+    everyone. It closes itself the moment the first address is registered,
+    and only registered addresses get DNS, HTTP and HTTPS after that. SSH is
+    never affected.
+
+        smartdns-acl enforce status     see which it is
+        smartdns-acl enforce off        stay open, and cancel this
+
+' "$B" "$N"
 fi
 
 if [ -n "${USER_PANEL_OUT:-}" ]; then
@@ -1697,6 +1759,11 @@ exit 0
 #SEP=$'\x1f'
 #STATE=/etc/nftables.d/20-smartdns-state.conf
 #ENFORCE=/etc/nftables.d/30-smartdns-enforce.conf
+## Set by the installer to mean "close this relay as soon as there is somebody
+## to allow". A fresh relay has an empty allowlist and enforcing on an empty
+## list would cut off everyone, so the decision cannot be made at install time -
+## the sync agent acts on it when the first address arrives.
+#AUTO=/etc/smart-dns/auto-enforce
 #
 #R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; N=$'\e[0m'
 #[ -t 1 ] || { R=; G=; Y=; N=; }
@@ -1949,6 +2016,13 @@ exit 0
 #        root
 #        nft flush chain $TABLE gate
 #        rm -f "$ENFORCE"
+#        # Also cancel the installer's standing instruction to close the relay
+#        # once somebody registers. Opening it by hand and having a background
+#        # agent shut it again half a minute later would be its own bug.
+#        if [ -f "$AUTO" ]; then
+#            rm -f "$AUTO"
+#            printf 'automatic enforcement cancelled too\n'
+#        fi
 #        printf '%sopen%s - nothing is being blocked\n' "$Y" "$N"
 #        ;;
 #    status)
@@ -2439,6 +2513,15 @@ exit 0
 #    status       TEXT NOT NULL DEFAULT 'pending',
 #    created_at   TEXT NOT NULL,
 #    decided_at   TEXT
+#);
+#
+#-- The operator's own browser sessions for the admin panel. In the database
+#-- rather than in that process's memory, because it restarts on every upgrade
+#-- and whenever its port or path changes - and being signed out by a restart
+#-- left the operator staring at the same bare 404 a stranger gets.
+#CREATE TABLE IF NOT EXISTS admin_sessions (
+#    token      TEXT PRIMARY KEY,
+#    expires_at TEXT NOT NULL
 #);
 #
 #CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
@@ -3496,6 +3579,8 @@ exit 0
 #            return self.reply(200, self.do_user_password_login(body))
 #        if self.path == "/user-receipt":
 #            return self.reply(200, self.do_user_receipt(body))
+#        if self.path == "/user-password":
+#            return self.reply(200, self.do_user_password(body))
 #
 #        return self.reply(404, {"error": "no such endpoint"})
 #
@@ -3562,6 +3647,49 @@ exit 0
 #            return {"ok": False, "message": "شماره یا رمز درست نیست"}
 #        THROTTLE.clear("login:%s" % ip)
 #        return {"ok": True, "session": self.store.open_session(user["id"])}
+#
+#    def do_user_password(self, body):
+#        """Let a customer change their own password.
+#
+#        The current one is required even though the session already proves
+#        who they are. A session can be a borrowed phone or a browser left
+#        open; asking for the password again means possession of the session
+#        is not enough to take the account away from its owner.
+#        """
+#        user = self._session_user(body.get("session"))
+#        if not user:
+#            return {"ok": False, "message": "نشست معتبر نیست"}
+#        if not user["password_hash"]:
+#            return {"ok": False,
+#                    "message": "این حساب رمز ندارد؛ با پشتیبانی تماس بگیرید"}
+#        if not check_password(user, body.get("current") or ""):
+#            # Same throttle as signing in: this is a password guess like any
+#            # other, and a stolen session should not buy unlimited attempts.
+#            ok, wait = THROTTLE.check("pw:%d" % user["id"], limit=8, window=900)
+#            if not ok:
+#                return {"ok": False, "message":
+#                        "تلاش زیاد بوده. %d دقیقه دیگر." % max(1, wait // 60)}
+#            THROTTLE.hit("pw:%d" % user["id"])
+#            return {"ok": False, "message": "رمز فعلی درست نیست"}
+#
+#        new = body.get("new") or ""
+#        if len(new) < 8:
+#            return {"ok": False, "message": "رمز تازه باید دست‌کم ۸ نویسه باشد"}
+#        if new == (body.get("current") or ""):
+#            return {"ok": False, "message": "رمز تازه با رمز فعلی یکی است"}
+#
+#        self.store.set_password(user["id"], new)
+#        THROTTLE.clear("pw:%d" % user["id"])
+#        # Every other session ends. Changing a password is what somebody does
+#        # when they think another person has their account, so leaving that
+#        # person signed in would defeat the whole exercise.
+#        kept = body.get("session")
+#        self.store.run(
+#            "DELETE FROM panel_sessions WHERE user_id = ? AND token != ?",
+#            (user["id"], kept))
+#        print("password changed for user %d" % user["id"], flush=True)
+#        return {"ok": True,
+#                "message": "رمز عوض شد. اگر جای دیگری وارد بودید، خارج شدید"}
 #
 #    def do_user_receipt(self, body):
 #        """Store a photograph of a payment slip against the customer.
@@ -4194,6 +4322,41 @@ exit 0
 #    SHAPED = wanted
 #
 #
+#AUTO_ENFORCE = "/etc/smart-dns/auto-enforce"
+#
+#
+#def close_relay_when_ready(allowed_count):
+#    """Switch access control on once there is somebody to allow.
+#
+#    The installer cannot make this call itself: a relay is installed before it
+#    has a single registered address, and enforcing against an empty allowlist
+#    cuts off everyone including the operator. So the installer leaves a note
+#    saying what it wants, and this closes the door at the first sync that
+#    brings an address.
+#
+#    Runs once. `smartdns-acl enforce off` deletes the note, so an operator who
+#    deliberately opens the relay does not find it shut again thirty seconds
+#    later.
+#    """
+#    if allowed_count <= 0 or not os.path.exists(AUTO_ENFORCE):
+#        return
+#    state = subprocess.run([ACL, "enforce", "status"], capture_output=True,
+#                           text=True, timeout=30)
+#    if "enforcing" in (state.stdout or ""):
+#        os.unlink(AUTO_ENFORCE)      # already closed; nothing left to do
+#        return
+#    r = subprocess.run([ACL, "enforce", "on", "--yes"], capture_output=True,
+#                       text=True, timeout=30)
+#    if r.returncode != 0:
+#        # Most likely the allowlist is still empty in the kernel because this
+#        # is the pass that is about to fill it. Leave the note and try again
+#        # on the next sync rather than reporting a problem that is not one.
+#        return
+#    os.unlink(AUTO_ENFORCE)
+#    print("access control on: %d address(es) may use this relay"
+#          % allowed_count, flush=True)
+#
+#
 #def sync_once():
 #    rows = current_state()
 #    counters = {r["ip"]: r["total"] for r in rows}
@@ -4234,6 +4397,10 @@ exit 0
 #        r = acl("del", ip)
 #        print("removed %s%s" % (ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()),
 #              flush=True)
+#
+#    # After the set is filled, not before: enforcing while the kernel list is
+#    # still empty is refused, and would leave the relay open for another cycle.
+#    close_relay_when_ready(len(want))
 #    return len(want), len(want - have), len(have - want)
 #
 #
@@ -4305,6 +4472,15 @@ exit 0
 #.dns .note{margin-top:12px}
 #.dns input[type=file]{width:100%;padding:10px;font-size:12px;
 # border:1px dashed #30363d;background:transparent;margin-bottom:4px}
+#details.pw{margin-top:16px;border:1px solid #262b36;border-radius:12px;
+# background:#0f1115}
+#details.pw>summary{padding:14px 16px;cursor:pointer;color:#9aa4b2;font-size:13px;
+# list-style:none}
+#details.pw>summary::-webkit-details-marker{display:none}
+#details.pw>summary::before{content:'b8';margin-left:8px;font-size:11px}
+#details.pw[open]>summary::before{content:'be'}
+#details.pw form{padding:0 16px 4px}
+#details.pw .note{padding:0 16px 14px;margin-top:8px}
 #.ok{color:#7dd3a0}.bad{color:#f85149}.warn{color:#e3b341}
 #"""
 #
@@ -4669,6 +4845,24 @@ exit 0
 #                "Location": "/register-ip",
 #                "Set-Cookie": self.cookie_for(res["session"])})
 #
+#        if path == "/password":
+#            if not self.session():
+#                return self.redirect("/")
+#            form = self.form()
+#            if form.get("new") != form.get("again"):
+#                return self.redirect("/", "دو رمز تازه یکی نیستند", bad=True)
+#            try:
+#                res = post("/user-password", {
+#                    "session": self.session(),
+#                    "current": form.get("current", ""),
+#                    "new": form.get("new", ""),
+#                })
+#            except Exception as e:
+#                print("password change failed: %s" % e, file=sys.stderr, flush=True)
+#                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
+#            return self.redirect("/", res.get("message", ""),
+#                                 bad=not res.get("ok"))
+#
 #        if path == "/receipt":
 #            if not self.session():
 #                return self.redirect("/")
@@ -4786,6 +4980,21 @@ exit 0
 #            "<input type='file' name='file' required "
 #            "accept='image/jpeg,image/png,image/webp,application/pdf'>"
 #            "<button class='ghost'>فرستادن رسید</button></form></div>")
+#        body.append(
+#            "<details class='pw'><summary>تغییر رمز عبور</summary>"
+#            "<form method='post' action='/password'>"
+#            "<label>رمز فعلی</label>"
+#            "<input name='current' type='password' required "
+#            "autocomplete='current-password'>"
+#            "<label>رمز تازه (دست‌کم ۸ نویسه)</label>"
+#            "<input name='new' type='password' required minlength='8' "
+#            "autocomplete='new-password'>"
+#            "<label>تکرار رمز تازه</label>"
+#            "<input name='again' type='password' required minlength='8' "
+#            "autocomplete='new-password'>"
+#            "<button class='ghost'>تغییر رمز</button></form>"
+#            "<p class='note'>اگر جای دیگری وارد حسابتان باشید، با تغییر رمز "
+#            "از آنجا خارج می‌شوید.</p></details>")
 #        body.append("<p class='alt'><a href='/logout'>خروج از حساب</a></p>")
 #        return self.send_html("".join(body))
 #
@@ -5067,6 +5276,7 @@ exit 0
 #import http.server
 #import json
 #import os
+#import re
 #import secrets
 #import sqlite3
 #import ssl
@@ -5135,6 +5345,24 @@ exit 0
 #    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 #
 #
+#def panel_host():
+#    """The name this panel is reachable by - whatever its certificate is for.
+#
+#    It listens on every address the machine has, but only this name matches
+#    the certificate, so it is the only one worth printing back.
+#    """
+#    cert = CFG.get("ADMIN_CERT", "")
+#    if cert.startswith("/etc/letsencrypt/live/"):
+#        return cert.split("/")[4]
+#    return "this-server"
+#
+#
+## Ports that belong to the service itself. Moving the panel onto one of them
+## takes down the thing it exists to administer.
+#RESERVED_PORTS = {53: "DNS", 80: "HTTP", 443: "HTTPS",
+#                  8443: "the relays' sync API", 22: "SSH"}
+#
+#
 #def remaining_days(ts):
 #    """Days left until `ts`, as placeholder text for the day field.
 #
@@ -5181,6 +5409,14 @@ exit 0
 #        self.db.row_factory = sqlite3.Row
 #        self.db.execute("PRAGMA foreign_keys = ON")
 #        self.db.execute("PRAGMA journal_mode = WAL")
+#
+#        # Created here as well as in the panel's schema: this process can be
+#        # the first to open the database on a machine where the panel has not
+#        # started yet, and a missing table would mean nobody could sign in.
+#        self.db.execute(
+#            "CREATE TABLE IF NOT EXISTS admin_sessions ("
+#            " token TEXT PRIMARY KEY, expires_at TEXT NOT NULL)")
+#        self.db.commit()
 #
 #    def q(self, sql, args=()):
 #        with self.lock:
@@ -5395,6 +5631,7 @@ exit 0
 #        banner = "<div class='msg %s'>%s</div>" % (msg_kind, html.escape(msg))
 #    return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 #<meta name="viewport" content="width=device-width,initial-scale=1">
+#<link rel="icon" href="data:,">
 #<title>%s</title><style>%s</style></head><body><div class="wrap">
 #<header><h1>%s</h1><nav>%s<a href='/%s/logout'>خروج</a></nav></header>
 #%s%s</div></body></html>""" % (html.escape(title), CSS, html.escape(title), nav,
@@ -5403,14 +5640,18 @@ exit 0
 #
 #def login_page(cfg, error=None):
 #    err = "<div class='msg err'>%s</div>" % html.escape(error) if error else ""
+#    # The action is spelled out rather than left to default to the current
+#    # URL. A form with no action posts wherever the browser happens to be,
+#    # which after a bookmark to a page that has moved is not the panel.
 #    return """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 #<meta name="viewport" content="width=device-width,initial-scale=1">
+#<link rel="icon" href="data:,">
 #<title>ورود</title><style>%s</style></head><body><div class="wrap"><div class="login">
 #<div class="card"><h2>پنل مدیریت</h2>%s
-#<form method="post"><div class="f"><label>رمز عبور</label>
+#<form method="post" action="/%s/"><div class="f"><label>رمز عبور</label>
 #<input type="password" name="password" autofocus style="width:100%%"></div>
 #<button type="submit" style="width:100%%">ورود</button></form></div>
-#</div></div></body></html>""" % (CSS, err)
+#</div></div></body></html>""" % (CSS, err, cfg["ADMIN_PATH"])
 #
 #
 #def bar(used, total):
@@ -5424,7 +5665,15 @@ exit 0
 #
 #
 ## ----------------------------------------------------------------- handler
-#SESSIONS = {}          # token -> expiry
+## Sessions live in the database, not in this process. They used to be a dict,
+## which meant every restart signed the operator out - and this panel restarts
+## whenever it is upgraded, whenever its port or path is changed, and after a
+## restore. Being signed out is not only an annoyance: without a session, a
+## visit to the bare address is answered with the same bare 404 a stranger
+## gets, which is how "the panel 404s sometimes" was really happening.
+##
+## Failed attempts stay in memory. Losing that count on restart only makes
+## guessing slightly easier for someone who cannot cause restarts anyway.
 #ATTEMPTS = {}          # address -> [count, first_failure_time]
 #STORE = None
 #CFG = {}
@@ -5652,6 +5901,32 @@ exit 0
 #            "<button class='ghost'>انصراف</button></form></div>" % (p, p))
 #        return "".join(body)
 #
+#    def moving_to(self, port, path):
+#        """Hand back the new address, then restart onto it.
+#
+#        A redirect would be wrong: the browser would follow it to the old
+#        address, which is about to stop answering. So this is a page, with the
+#        new address on it, and the restart happens a second later - by which
+#        time the operator has the link in front of them.
+#        """
+#        url = "https://%s:%s/%s/" % (panel_host(), port, path)
+#        self.send(page("آدرس تازه",
+#                       "<div class='card'><h2>آدرس پنل عوض شد</h2>"
+#                       "<p>از این به بعد اینجاست — همین حالا ذخیره‌اش کنید:</p>"
+#                       "<p><code>%s</code></p>"
+#                       "<p class='muted'>پنل تا چند ثانیهٔ دیگر روی آدرس تازه "
+#                       "بالا می‌آید. اگر باز نشد، به احتمال زیاد فایروال یا "
+#                       "security group سرور پورت را نمی‌گذارد رد شود؛ از روی "
+#                       "خود سرور با <code>smartdns-access</code> برش گردانید."
+#                       "</p></div>" % html.escape(url), CFG, "settings"),
+#                  200, {"Refresh": "6; url=%s" % url})
+#        try:
+#            self.wfile.flush()
+#        except Exception:
+#            pass
+#        print("panel moving to %s" % url, flush=True)
+#        threading.Timer(1.0, os._exit, (0,)).start()
+#
 #    def apply_restore(self):
 #        path = PENDING.get("path")
 #        if not path or not os.path.exists(path):
@@ -5702,14 +5977,20 @@ exit 0
 #        return (params.get(key) or [default])[0].strip()
 #
 #    # -- auth -------------------------------------------------------------
-#    def session_ok(self):
+#    def session_token(self):
 #        cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
-#        token = cookie["sdns"].value if "sdns" in cookie else ""
+#        return cookie["sdns"].value if "sdns" in cookie else ""
+#
+#    def session_ok(self):
+#        token = self.session_token()
 #        if not token:
 #            return False
-#        expiry = SESSIONS.get(token)
-#        if not expiry or expiry < time.time():
-#            SESSIONS.pop(token, None)
+#        row = STORE.one("SELECT expires_at FROM admin_sessions WHERE token = ?",
+#                        (token,))
+#        if not row:
+#            return False
+#        if (parse_ts(row["expires_at"]) or datetime.now(timezone.utc))                 <= datetime.now(timezone.utc):
+#            STORE.run("DELETE FROM admin_sessions WHERE token = ?", (token,))
 #            return False
 #        return True
 #
@@ -5737,16 +6018,36 @@ exit 0
 #        rest = path[len(prefix):].strip("/")
 #        return rest
 #
+#    def lost(self):
+#        """Answer a request that did not name the secret path.
+#
+#        A stranger gets a bare 404 and learns nothing - that is the whole
+#        point of the path. Somebody already holding a valid session is not a
+#        stranger: they have full access already, so sending them to the panel
+#        reveals nothing and saves them from the commonest way to meet this
+#        page, which is typing the host without the path, or following a
+#        bookmark from before the path or port was changed.
+#        """
+#        if self.session_ok():
+#            return self.redirect("")
+#        path = urllib.parse.urlparse(self.path).path
+#        # Logged so that "it 404s sometimes" is answerable next time. Only
+#        # paths that missed the prefix, so the secret never reaches the
+#        # journal.
+#        if not path.startswith("/" + CFG["ADMIN_PATH"]):
+#            print("404 %s from %s" % (path[:80], self.client_address[0]),
+#                  file=sys.stderr, flush=True)
+#        return self.send("<h1>404</h1>", 404)
+#
 #    def do_GET(self):
 #        rest = self.route()
-#        # Anything not under the secret prefix is answered as though nothing is
-#        # here at all, with no hint that a panel exists on this port.
 #        if rest is None:
-#            return self.send("<h1>404</h1>", 404)
+#            return self.lost()
 #        if rest == "logout":
 #            cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
 #            if "sdns" in cookie:
-#                SESSIONS.pop(cookie["sdns"].value, None)
+#                STORE.run("DELETE FROM admin_sessions WHERE token = ?",
+#                          (cookie["sdns"].value,))
 #            return self.redirect("", {"Set-Cookie": "sdns=; Max-Age=0; Path=/"})
 #        if not self.session_ok():
 #            return self.send(login_page(CFG))
@@ -5764,7 +6065,7 @@ exit 0
 #    def do_POST(self):
 #        rest = self.route()
 #        if rest is None:
-#            return self.send("<h1>404</h1>", 404)
+#            return self.lost()
 #        params = self.body_params()
 #        if not self.session_ok():
 #            if self.locked_out():
@@ -5775,7 +6076,16 @@ exit 0
 #            if given and hmac.compare_digest(
 #                    hash_password(given, CFG["ADMIN_SALT"]), want):
 #                token = secrets.token_urlsafe(32)
-#                SESSIONS[token] = time.time() + SESSION_HOURS * 3600
+#                STORE.run(
+#                    "INSERT OR REPLACE INTO admin_sessions (token, expires_at)"
+#                    " VALUES (?, ?)",
+#                    (token, (datetime.now(timezone.utc)
+#                             + timedelta(hours=SESSION_HOURS)).isoformat(
+#                                 timespec="seconds")))
+#                # Tidy up whatever has run out, so the table cannot grow
+#                # forever on a panel that is logged into daily.
+#                STORE.run("DELETE FROM admin_sessions WHERE expires_at <= ?",
+#                          (now(),))
 #                ATTEMPTS.pop(self.client_address[0], None)
 #                return self.redirect("", {
 #                    "Set-Cookie": "sdns=%s; Path=/; HttpOnly; Secure; SameSite=Strict"
@@ -5804,7 +6114,7 @@ exit 0
 #                 "restore": ("بازگردانی", self.restore_page),
 #                 "logs": ("لاگ", self.logs)}
 #        if rest not in pages:
-#            return self.send("<h1>404</h1>", 404)
+#            return self.lost()
 #        title, fn = pages[rest]
 #        active = "" if rest == "index" else rest
 #        return self.send(page(title, fn(), CFG, active, msg, kind))
@@ -6118,10 +6428,39 @@ exit 0
 #            "<p class='muted'>فایل اول فقط بررسی و توصیف می‌شود؛ جایگزینی جدا "
 #            "تأیید می‌خواهد.</p></div>" % (p, p))
 #
+#        out.append("<div class='card'><h2>آدرس این پنل</h2>"
+#                   "<p class='muted'>همین حالا: <code>https://%s:%s/%s/</code></p>"
+#                   "<div class='f'><label>پورت</label>"
+#                   "<form method='post' action='/%s/panel-port' class='row'>"
+#                   "<input name='port' value='%s' size='6'>"
+#                   "<button class='ghost'>تغییر پورت</button></form></div>"
+#                   "<div class='f'><label>مسیر مخفی</label>"
+#                   "<form method='post' action='/%s/panel-path' class='row'>"
+#                   "<input name='path' value='%s' style='min-width:280px'>"
+#                   "<button class='ghost'>تغییر مسیر</button>"
+#                   "<button class='ghost' name='random' value='1'>مسیر تصادفی</button>"
+#                   "</form></div>"
+#                   "<div class='msg err'>پورت را که عوض کنید، پنل روی پورت تازه "
+#                   "بالا می‌آید — ولی اگر سرور فایروال یا security group دارد "
+#                   "(روی AWS، Hetzner و مانندش) باید پورت تازه را <b>اول</b> "
+#                   "آنجا باز کنید، وگرنه از بیرون در دسترس نخواهد بود. اگر "
+#                   "بیرون ماندید، از روی خود سرور: <code>smartdns-access port "
+#                   "9443</code></div></div>"
+#                   % (html.escape(panel_host()), html.escape(CFG["ADMIN_PORT"]),
+#                      html.escape(CFG["ADMIN_PATH"]),
+#                      p, html.escape(CFG["ADMIN_PORT"]),
+#                      p, html.escape(CFG["ADMIN_PATH"])))
+#
 #        out.append("<div class='card'><h2>رمز این پنل</h2>"
-#                   "<form method='post' action='/%s/password' class='row'>"
-#                   "<input type='password' name='password' placeholder='رمز تازه'>"
-#                   "<button>تغییر</button></form></div>" % p)
+#                   "<form method='post' action='/%s/password'>"
+#                   "<div class='f'><label>رمز تازه (دست‌کم ۸ نویسه)</label>"
+#                   "<input type='password' name='password' style='width:100%%'>"
+#                   "</div>"
+#                   "<div class='f'><label>تکرار رمز تازه</label>"
+#                   "<input type='password' name='again' style='width:100%%'>"
+#                   "</div><button>تغییر رمز</button></form>"
+#                   "<p class='muted'>رمز ذخیره نمی‌شود، فقط هشش. با تغییر آن "
+#                   "همهٔ نشست‌های دیگر بسته می‌شوند.</p></div>" % p)
 #        return "".join(out)
 #
 #    def logs(self):
@@ -6339,8 +6678,37 @@ exit 0
 #                os.unlink(path)
 #            return self.redirect("settings?m=بازگردانی لغو شد")
 #
+#        if rest == "panel-port":
+#            port = one("port")
+#            if not port.isdigit() or not 1 <= int(port) <= 65535:
+#                return self.redirect("settings?m=!پورت باید عددی بین ۱ تا ۶۵۵۳۵ باشد")
+#            if int(port) in RESERVED_PORTS:
+#                return self.redirect(
+#                    "settings?m=!پورت %s برای %s است"
+#                    % (port, RESERVED_PORTS[int(port)]))
+#            if port == CFG["ADMIN_PORT"]:
+#                return self.redirect("settings?m=همان پورت قبلی است")
+#            set_config_key("ADMIN_PORT", port)
+#            CFG["ADMIN_PORT"] = port
+#            return self.moving_to(port, CFG["ADMIN_PATH"])
+#
+#        if rest == "panel-path":
+#            new = secrets.token_hex(12) if one("random") else one("path")
+#            if not re.match(r"^[A-Za-z0-9_-]{8,64}$", new):
+#                return self.redirect(
+#                    "settings?m=!مسیر باید ۸ تا ۶۴ نویسه از حروف، رقم، - و _ باشد")
+#            if new == CFG["ADMIN_PATH"]:
+#                return self.redirect("settings?m=همان مسیر قبلی است")
+#            set_config_key("ADMIN_PATH", new)
+#            CFG["ADMIN_PATH"] = new
+#            return self.moving_to(CFG["ADMIN_PORT"], new)
+#
 #        if rest == "password":
 #            new = one("password")
+#            # Asked twice, because it cannot be read back to check afterwards
+#            # and a typo here locks the operator out of their own panel.
+#            if new != one("again"):
+#                return self.redirect("settings?m=!دو رمز یکی نیستند")
 #            if len(new) < 8:
 #                return self.redirect("settings?m=!رمز باید حداقل ۸ نویسه باشد")
 #            salt = secrets.token_hex(16)
@@ -6350,14 +6718,11 @@ exit 0
 #            CFG["ADMIN_SALT"], CFG["ADMIN_HASH"] = salt, digest
 #            # Everyone else holding a session was authenticated with the old
 #            # password; a password change should end those.
-#            token_keep = http.cookies.SimpleCookie(
-#                self.headers.get("Cookie", ""))["sdns"].value
-#            for t in list(SESSIONS):
-#                if t != token_keep:
-#                    SESSIONS.pop(t, None)
+#            STORE.run("DELETE FROM admin_sessions WHERE token != ?",
+#                      (self.session_token(),))
 #            return self.redirect("settings?m=رمز عوض شد")
 #
-#        return self.send("<h1>404</h1>", 404)
+#        return self.lost()
 #
 #
 #DOMAIN_RE = __import__("re").compile(
@@ -6445,6 +6810,172 @@ exit 0
 #[Install]
 #WantedBy=multi-user.target
 #__END_ADMIN_SERVICE__
+
+#__BEGIN_SMARTDNS_ACCESS__
+##!/bin/bash
+## smartdns-access - change how the admin panel is reached.
+##
+## usage: smartdns-access                    show the address it answers on
+##        smartdns-access port <number>      move it to another port
+##        smartdns-access path [new]         change the secret path, or roll one
+##        smartdns-access password [new]     set a new password
+##        smartdns-access rotate             new path and new password at once
+##
+## Three things stand in front of the panel and only one of them is a secret in
+## the cryptographic sense:
+##
+##   the port    keeps it out of the way of casual scanning, nothing more
+##   the path    an unguessable URL - it is a secret, but it travels in every
+##               request line and lands in any proxy log along the way
+##   the password the actual authentication
+##
+## So this can change all three, and the password is the one that matters. It
+## is never stored: only a salted hash goes into admin.env, which is why a
+## forgotten password is replaced rather than recovered.
+#set -uo pipefail
+#export PATH="$PATH:/usr/sbin:/sbin"
+#
+#CONF=/etc/smart-dns/admin.env
+#UNIT=smartdns-admin.service
+#
+#R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'
+#[ -t 1 ] || { R=; G=; Y=; B=; N=; }
+#die() { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+#
+#[ "$(id -u)" = 0 ] || die "run as root"
+#[ -f "$CONF" ] || die "$CONF is missing - this machine has no admin panel.
+#    It is set up on the exit node, by the installer, once the machine has a
+#    domain and a certificate."
+#
+#get() { sed -n "s/^$1=//p" "$CONF" | head -1; }
+#
+#set_key() {
+#    local key="$1" value="$2" tmp
+#    tmp="$(mktemp)"
+#    grep -v "^${key}=" "$CONF" > "$tmp" 2>/dev/null || true
+#    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+#    # Copy rather than move: the file is mode 600 and owned by root, and a
+#    # move from /tmp would bring the temporary file's permissions with it.
+#    cat "$tmp" > "$CONF"
+#    rm -f "$tmp"
+#    chmod 600 "$CONF"
+#}
+#
+#hash_password() {
+#    ADMIN_PASS="$1" ADMIN_SALT="$2" python3 -c '
+#import hashlib, os
+#print(hashlib.pbkdf2_hmac("sha256", os.environ["ADMIN_PASS"].encode(),
+#                          bytes.fromhex(os.environ["ADMIN_SALT"]), 200000).hex())'
+#}
+#
+#domain() {
+#    # Whatever the certificate is for. The panel answers on any address the
+#    # machine has, but only this name matches the certificate, so it is the
+#    # only one worth printing.
+#    local d
+#    d="$(sed -n 's|^ADMIN_CERT=/etc/letsencrypt/live/\([^/]*\)/.*|\1|p' "$CONF" | head -1)"
+#    [ -n "$d" ] || d="$(hostname -I 2>/dev/null | awk '{print $1}')"
+#    printf '%s' "${d:-this-server}"
+#}
+#
+#show() {
+#    printf '\n    %sAdmin panel%s\n\n        https://%s:%s/%s/\n\n' \
+#        "$B" "$N" "$(domain)" "$(get ADMIN_PORT)" "$(get ADMIN_PATH)"
+#    printf '    The password is not stored, only a hash of it. If it is lost,\n'
+#    printf '    set a new one:  smartdns-access password\n\n'
+#}
+#
+#restart() {
+#    systemctl restart "$UNIT" 2>/dev/null
+#    sleep 2
+#    if systemctl is-active --quiet "$UNIT"; then
+#        printf '%s    panel restarted%s\n' "$G" "$N"
+#    else
+#        printf '%s    the panel did not come back - journalctl -u %s%s\n' \
+#            "$Y" "$UNIT" "$N"
+#    fi
+#}
+#
+#case "${1:-show}" in
+#show|"")
+#    show
+#    ;;
+#
+#port)
+#    new="${2:-}"
+#    case "$new" in
+#        ""|*[!0-9]*) die "usage: smartdns-access port <number>" ;;
+#    esac
+#    [ "$new" -ge 1 ] && [ "$new" -le 65535 ] || die "a port is 1-65535"
+#    # These belong to the service itself. Moving the panel onto one of them
+#    # would take down the thing it is meant to administer.
+#    case "$new" in
+#        53|80|443) die "port $new is the service's own - pick another" ;;
+#        8443) die "port 8443 is the sync API the relays talk to" ;;
+#        22) die "port 22 is ssh" ;;
+#    esac
+#    old="$(get ADMIN_PORT)"
+#    if [ "$new" != "$old" ] && ss -tlnH "sport = :$new" 2>/dev/null | grep -q .; then
+#        die "something else is already listening on $new"
+#    fi
+#    set_key ADMIN_PORT "$new"
+#    printf '    port %s -> %s\n' "$old" "$new"
+#    restart
+#    show
+#    ;;
+#
+#path)
+#    new="${2:-}"
+#    if [ -z "$new" ]; then
+#        new="$(openssl rand -hex 12)"
+#    else
+#        case "$new" in
+#            */*|*' '*|*'?'*|*'#'*) die "a path is one segment: letters, digits, - and _" ;;
+#            *[!A-Za-z0-9_-]*) die "use only letters, digits, - and _" ;;
+#        esac
+#        [ "${#new}" -ge 8 ] || die "too short to be unguessable - use 8 or more"
+#    fi
+#    set_key ADMIN_PATH "$new"
+#    printf '    the old address stops working now.\n'
+#    restart
+#    show
+#    ;;
+#
+#password)
+#    new="${2:-}"
+#    if [ -z "$new" ]; then
+#        # -s so it is not echoed, and asked twice because it cannot be read
+#        # back afterwards to check.
+#        printf '  new password (8 or more, not shown as you type): '
+#        read -rs new; printf '\n'
+#        printf '  again: '
+#        read -rs again; printf '\n'
+#        [ "$new" = "$again" ] || die "they did not match - nothing changed"
+#    fi
+#    [ "${#new}" -ge 8 ] || die "use 8 characters or more"
+#    salt="$(openssl rand -hex 16)"
+#    hash="$(hash_password "$new" "$salt")" || die "could not hash the password"
+#    [ -n "$hash" ] || die "could not hash the password"
+#    set_key ADMIN_SALT "$salt"
+#    set_key ADMIN_HASH "$hash"
+#    printf '    password changed. Everyone signed in is signed out.\n'
+#    # Sessions live in the panel's memory, so restarting is what ends them -
+#    # which is the point of changing a password.
+#    restart
+#    ;;
+#
+#rotate)
+#    "$0" path >/dev/null
+#    "$0" password "${2:-}"
+#    show
+#    ;;
+#
+#*)
+#    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+#    exit 1
+#    ;;
+#esac
+#__END_SMARTDNS_ACCESS__
 
 #__BEGIN_EPIC_PIN__
 ##!/usr/bin/env python3

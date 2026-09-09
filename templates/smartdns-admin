@@ -29,6 +29,7 @@ import http.cookies
 import http.server
 import json
 import os
+import re
 import secrets
 import sqlite3
 import ssl
@@ -97,6 +98,24 @@ def parse_ts(s):
     return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
+def panel_host():
+    """The name this panel is reachable by - whatever its certificate is for.
+
+    It listens on every address the machine has, but only this name matches
+    the certificate, so it is the only one worth printing back.
+    """
+    cert = CFG.get("ADMIN_CERT", "")
+    if cert.startswith("/etc/letsencrypt/live/"):
+        return cert.split("/")[4]
+    return "this-server"
+
+
+# Ports that belong to the service itself. Moving the panel onto one of them
+# takes down the thing it exists to administer.
+RESERVED_PORTS = {53: "DNS", 80: "HTTP", 443: "HTTPS",
+                  8443: "the relays' sync API", 22: "SSH"}
+
+
 def remaining_days(ts):
     """Days left until `ts`, as placeholder text for the day field.
 
@@ -143,6 +162,14 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
         self.db.execute("PRAGMA journal_mode = WAL")
+
+        # Created here as well as in the panel's schema: this process can be
+        # the first to open the database on a machine where the panel has not
+        # started yet, and a missing table would mean nobody could sign in.
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS admin_sessions ("
+            " token TEXT PRIMARY KEY, expires_at TEXT NOT NULL)")
+        self.db.commit()
 
     def q(self, sql, args=()):
         with self.lock:
@@ -357,6 +384,7 @@ def page(title, body, cfg, active="", msg=None, msg_kind="good"):
         banner = "<div class='msg %s'>%s</div>" % (msg_kind, html.escape(msg))
     return ("""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
 <title>%s</title><style>%s</style></head><body><div class="wrap">
 <header><h1>%s</h1><nav>%s<a href='/%s/logout'>خروج</a></nav></header>
 %s%s</div></body></html>""" % (html.escape(title), CSS, html.escape(title), nav,
@@ -365,14 +393,18 @@ def page(title, body, cfg, active="", msg=None, msg_kind="good"):
 
 def login_page(cfg, error=None):
     err = "<div class='msg err'>%s</div>" % html.escape(error) if error else ""
+    # The action is spelled out rather than left to default to the current
+    # URL. A form with no action posts wherever the browser happens to be,
+    # which after a bookmark to a page that has moved is not the panel.
     return """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
 <title>ورود</title><style>%s</style></head><body><div class="wrap"><div class="login">
 <div class="card"><h2>پنل مدیریت</h2>%s
-<form method="post"><div class="f"><label>رمز عبور</label>
+<form method="post" action="/%s/"><div class="f"><label>رمز عبور</label>
 <input type="password" name="password" autofocus style="width:100%%"></div>
 <button type="submit" style="width:100%%">ورود</button></form></div>
-</div></div></body></html>""" % (CSS, err)
+</div></div></body></html>""" % (CSS, err, cfg["ADMIN_PATH"])
 
 
 def bar(used, total):
@@ -386,7 +418,15 @@ def bar(used, total):
 
 
 # ----------------------------------------------------------------- handler
-SESSIONS = {}          # token -> expiry
+# Sessions live in the database, not in this process. They used to be a dict,
+# which meant every restart signed the operator out - and this panel restarts
+# whenever it is upgraded, whenever its port or path is changed, and after a
+# restore. Being signed out is not only an annoyance: without a session, a
+# visit to the bare address is answered with the same bare 404 a stranger
+# gets, which is how "the panel 404s sometimes" was really happening.
+#
+# Failed attempts stay in memory. Losing that count on restart only makes
+# guessing slightly easier for someone who cannot cause restarts anyway.
 ATTEMPTS = {}          # address -> [count, first_failure_time]
 STORE = None
 CFG = {}
@@ -614,6 +654,32 @@ class Admin(http.server.BaseHTTPRequestHandler):
             "<button class='ghost'>انصراف</button></form></div>" % (p, p))
         return "".join(body)
 
+    def moving_to(self, port, path):
+        """Hand back the new address, then restart onto it.
+
+        A redirect would be wrong: the browser would follow it to the old
+        address, which is about to stop answering. So this is a page, with the
+        new address on it, and the restart happens a second later - by which
+        time the operator has the link in front of them.
+        """
+        url = "https://%s:%s/%s/" % (panel_host(), port, path)
+        self.send(page("آدرس تازه",
+                       "<div class='card'><h2>آدرس پنل عوض شد</h2>"
+                       "<p>از این به بعد اینجاست — همین حالا ذخیره‌اش کنید:</p>"
+                       "<p><code>%s</code></p>"
+                       "<p class='muted'>پنل تا چند ثانیهٔ دیگر روی آدرس تازه "
+                       "بالا می‌آید. اگر باز نشد، به احتمال زیاد فایروال یا "
+                       "security group سرور پورت را نمی‌گذارد رد شود؛ از روی "
+                       "خود سرور با <code>smartdns-access</code> برش گردانید."
+                       "</p></div>" % html.escape(url), CFG, "settings"),
+                  200, {"Refresh": "6; url=%s" % url})
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+        print("panel moving to %s" % url, flush=True)
+        threading.Timer(1.0, os._exit, (0,)).start()
+
     def apply_restore(self):
         path = PENDING.get("path")
         if not path or not os.path.exists(path):
@@ -664,14 +730,20 @@ class Admin(http.server.BaseHTTPRequestHandler):
         return (params.get(key) or [default])[0].strip()
 
     # -- auth -------------------------------------------------------------
-    def session_ok(self):
+    def session_token(self):
         cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
-        token = cookie["sdns"].value if "sdns" in cookie else ""
+        return cookie["sdns"].value if "sdns" in cookie else ""
+
+    def session_ok(self):
+        token = self.session_token()
         if not token:
             return False
-        expiry = SESSIONS.get(token)
-        if not expiry or expiry < time.time():
-            SESSIONS.pop(token, None)
+        row = STORE.one("SELECT expires_at FROM admin_sessions WHERE token = ?",
+                        (token,))
+        if not row:
+            return False
+        if (parse_ts(row["expires_at"]) or datetime.now(timezone.utc))                 <= datetime.now(timezone.utc):
+            STORE.run("DELETE FROM admin_sessions WHERE token = ?", (token,))
             return False
         return True
 
@@ -699,16 +771,36 @@ class Admin(http.server.BaseHTTPRequestHandler):
         rest = path[len(prefix):].strip("/")
         return rest
 
+    def lost(self):
+        """Answer a request that did not name the secret path.
+
+        A stranger gets a bare 404 and learns nothing - that is the whole
+        point of the path. Somebody already holding a valid session is not a
+        stranger: they have full access already, so sending them to the panel
+        reveals nothing and saves them from the commonest way to meet this
+        page, which is typing the host without the path, or following a
+        bookmark from before the path or port was changed.
+        """
+        if self.session_ok():
+            return self.redirect("")
+        path = urllib.parse.urlparse(self.path).path
+        # Logged so that "it 404s sometimes" is answerable next time. Only
+        # paths that missed the prefix, so the secret never reaches the
+        # journal.
+        if not path.startswith("/" + CFG["ADMIN_PATH"]):
+            print("404 %s from %s" % (path[:80], self.client_address[0]),
+                  file=sys.stderr, flush=True)
+        return self.send("<h1>404</h1>", 404)
+
     def do_GET(self):
         rest = self.route()
-        # Anything not under the secret prefix is answered as though nothing is
-        # here at all, with no hint that a panel exists on this port.
         if rest is None:
-            return self.send("<h1>404</h1>", 404)
+            return self.lost()
         if rest == "logout":
             cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
             if "sdns" in cookie:
-                SESSIONS.pop(cookie["sdns"].value, None)
+                STORE.run("DELETE FROM admin_sessions WHERE token = ?",
+                          (cookie["sdns"].value,))
             return self.redirect("", {"Set-Cookie": "sdns=; Max-Age=0; Path=/"})
         if not self.session_ok():
             return self.send(login_page(CFG))
@@ -726,7 +818,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         rest = self.route()
         if rest is None:
-            return self.send("<h1>404</h1>", 404)
+            return self.lost()
         params = self.body_params()
         if not self.session_ok():
             if self.locked_out():
@@ -737,7 +829,16 @@ class Admin(http.server.BaseHTTPRequestHandler):
             if given and hmac.compare_digest(
                     hash_password(given, CFG["ADMIN_SALT"]), want):
                 token = secrets.token_urlsafe(32)
-                SESSIONS[token] = time.time() + SESSION_HOURS * 3600
+                STORE.run(
+                    "INSERT OR REPLACE INTO admin_sessions (token, expires_at)"
+                    " VALUES (?, ?)",
+                    (token, (datetime.now(timezone.utc)
+                             + timedelta(hours=SESSION_HOURS)).isoformat(
+                                 timespec="seconds")))
+                # Tidy up whatever has run out, so the table cannot grow
+                # forever on a panel that is logged into daily.
+                STORE.run("DELETE FROM admin_sessions WHERE expires_at <= ?",
+                          (now(),))
                 ATTEMPTS.pop(self.client_address[0], None)
                 return self.redirect("", {
                     "Set-Cookie": "sdns=%s; Path=/; HttpOnly; Secure; SameSite=Strict"
@@ -766,7 +867,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                  "restore": ("بازگردانی", self.restore_page),
                  "logs": ("لاگ", self.logs)}
         if rest not in pages:
-            return self.send("<h1>404</h1>", 404)
+            return self.lost()
         title, fn = pages[rest]
         active = "" if rest == "index" else rest
         return self.send(page(title, fn(), CFG, active, msg, kind))
@@ -1080,10 +1181,39 @@ class Admin(http.server.BaseHTTPRequestHandler):
             "<p class='muted'>فایل اول فقط بررسی و توصیف می‌شود؛ جایگزینی جدا "
             "تأیید می‌خواهد.</p></div>" % (p, p))
 
+        out.append("<div class='card'><h2>آدرس این پنل</h2>"
+                   "<p class='muted'>همین حالا: <code>https://%s:%s/%s/</code></p>"
+                   "<div class='f'><label>پورت</label>"
+                   "<form method='post' action='/%s/panel-port' class='row'>"
+                   "<input name='port' value='%s' size='6'>"
+                   "<button class='ghost'>تغییر پورت</button></form></div>"
+                   "<div class='f'><label>مسیر مخفی</label>"
+                   "<form method='post' action='/%s/panel-path' class='row'>"
+                   "<input name='path' value='%s' style='min-width:280px'>"
+                   "<button class='ghost'>تغییر مسیر</button>"
+                   "<button class='ghost' name='random' value='1'>مسیر تصادفی</button>"
+                   "</form></div>"
+                   "<div class='msg err'>پورت را که عوض کنید، پنل روی پورت تازه "
+                   "بالا می‌آید — ولی اگر سرور فایروال یا security group دارد "
+                   "(روی AWS، Hetzner و مانندش) باید پورت تازه را <b>اول</b> "
+                   "آنجا باز کنید، وگرنه از بیرون در دسترس نخواهد بود. اگر "
+                   "بیرون ماندید، از روی خود سرور: <code>smartdns-access port "
+                   "9443</code></div></div>"
+                   % (html.escape(panel_host()), html.escape(CFG["ADMIN_PORT"]),
+                      html.escape(CFG["ADMIN_PATH"]),
+                      p, html.escape(CFG["ADMIN_PORT"]),
+                      p, html.escape(CFG["ADMIN_PATH"])))
+
         out.append("<div class='card'><h2>رمز این پنل</h2>"
-                   "<form method='post' action='/%s/password' class='row'>"
-                   "<input type='password' name='password' placeholder='رمز تازه'>"
-                   "<button>تغییر</button></form></div>" % p)
+                   "<form method='post' action='/%s/password'>"
+                   "<div class='f'><label>رمز تازه (دست‌کم ۸ نویسه)</label>"
+                   "<input type='password' name='password' style='width:100%%'>"
+                   "</div>"
+                   "<div class='f'><label>تکرار رمز تازه</label>"
+                   "<input type='password' name='again' style='width:100%%'>"
+                   "</div><button>تغییر رمز</button></form>"
+                   "<p class='muted'>رمز ذخیره نمی‌شود، فقط هشش. با تغییر آن "
+                   "همهٔ نشست‌های دیگر بسته می‌شوند.</p></div>" % p)
         return "".join(out)
 
     def logs(self):
@@ -1301,8 +1431,37 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 os.unlink(path)
             return self.redirect("settings?m=بازگردانی لغو شد")
 
+        if rest == "panel-port":
+            port = one("port")
+            if not port.isdigit() or not 1 <= int(port) <= 65535:
+                return self.redirect("settings?m=!پورت باید عددی بین ۱ تا ۶۵۵۳۵ باشد")
+            if int(port) in RESERVED_PORTS:
+                return self.redirect(
+                    "settings?m=!پورت %s برای %s است"
+                    % (port, RESERVED_PORTS[int(port)]))
+            if port == CFG["ADMIN_PORT"]:
+                return self.redirect("settings?m=همان پورت قبلی است")
+            set_config_key("ADMIN_PORT", port)
+            CFG["ADMIN_PORT"] = port
+            return self.moving_to(port, CFG["ADMIN_PATH"])
+
+        if rest == "panel-path":
+            new = secrets.token_hex(12) if one("random") else one("path")
+            if not re.match(r"^[A-Za-z0-9_-]{8,64}$", new):
+                return self.redirect(
+                    "settings?m=!مسیر باید ۸ تا ۶۴ نویسه از حروف، رقم، - و _ باشد")
+            if new == CFG["ADMIN_PATH"]:
+                return self.redirect("settings?m=همان مسیر قبلی است")
+            set_config_key("ADMIN_PATH", new)
+            CFG["ADMIN_PATH"] = new
+            return self.moving_to(CFG["ADMIN_PORT"], new)
+
         if rest == "password":
             new = one("password")
+            # Asked twice, because it cannot be read back to check afterwards
+            # and a typo here locks the operator out of their own panel.
+            if new != one("again"):
+                return self.redirect("settings?m=!دو رمز یکی نیستند")
             if len(new) < 8:
                 return self.redirect("settings?m=!رمز باید حداقل ۸ نویسه باشد")
             salt = secrets.token_hex(16)
@@ -1312,14 +1471,11 @@ class Admin(http.server.BaseHTTPRequestHandler):
             CFG["ADMIN_SALT"], CFG["ADMIN_HASH"] = salt, digest
             # Everyone else holding a session was authenticated with the old
             # password; a password change should end those.
-            token_keep = http.cookies.SimpleCookie(
-                self.headers.get("Cookie", ""))["sdns"].value
-            for t in list(SESSIONS):
-                if t != token_keep:
-                    SESSIONS.pop(t, None)
+            STORE.run("DELETE FROM admin_sessions WHERE token != ?",
+                      (self.session_token(),))
             return self.redirect("settings?m=رمز عوض شد")
 
-        return self.send("<h1>404</h1>", 404)
+        return self.lost()
 
 
 DOMAIN_RE = __import__("re").compile(
