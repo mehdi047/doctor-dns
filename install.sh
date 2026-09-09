@@ -483,10 +483,18 @@ info "done"
 # Worth having on a small box - nginx under a console download opens a lot of
 # connections at once, and being killed for it is worse than being slow - but
 # it is the operator's disk, so it is never created behind their back.
+HAVE_SWAP="$(free -m | awk '/Swap/{print $2}')"
 if [ -z "${SWAP_GB:-}" ] && [ -z "${ASSUME_YES:-}" ]; then
-    if [ "$(free -m | awk '/Swap/{print $2}')" = 0 ]; then
+    if [ "${HAVE_SWAP:-0}" = 0 ]; then
         printf '\n%sThis machine has no swap.%s\n\n' "$B" "$N"
         read -r -p "  create a swap file? size in GB, or enter to skip: " SWAP_GB
+    else
+        # Say so rather than skipping in silence. An operator who expected a
+        # question and got nothing cannot tell "already handled" from "the
+        # installer forgot", and will go looking - which is exactly what
+        # happened the first time somebody ran this on a machine that had swap.
+        step "Swap"
+        info "already has ${HAVE_SWAP} MB - leaving it alone"
     fi
 fi
 if [ -n "${SWAP_GB:-}" ] && [ "${SWAP_GB}" != 0 ]; then
