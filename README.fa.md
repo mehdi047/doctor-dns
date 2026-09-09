@@ -1,4 +1,4 @@
-# چپر — smart-dns
+# doctor dns
 
 *[English](README.md)*
 

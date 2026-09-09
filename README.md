@@ -1,4 +1,4 @@
-# chapar — smart-dns
+# doctor dns
 
 *[فارسی](README.fa.md)*
 
