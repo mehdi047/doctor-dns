@@ -13,6 +13,13 @@ in one install script with no dependencies beyond what Debian ships.
 **Alpha.** Running in production on three relay/exit pairs, but the interfaces
 are still moving and there is no upgrade path between versions yet.
 
+Which is why bug reports are worth more than anything else right now. If
+something breaks, or a service you expected to work does not,
+[open an issue](https://github.com/mehdi047/doctor-dns/issues) — say which
+side it was, what you ran, and what happened. A report of one console failing
+one download is a genuinely useful thing; most of what is in here was learnt
+exactly that way.
+
 ---
 
 ## What it does
