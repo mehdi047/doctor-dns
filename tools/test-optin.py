@@ -15,6 +15,7 @@ those pins left out of it, or the tick does nothing at all.
 import importlib.machinery
 import importlib.util
 import json
+import re
 import os
 import shutil
 import sys
@@ -52,30 +53,50 @@ print("the catalogue that ships")
 cat = json.load(open(os.path.join(HERE, "..", "domains", "services.json"),
                      encoding="utf-8"))["services"]
 epic = next(s for s in cat if s["key"] == "epic")
-groups = {g["key"]: g for g in epic["groups"]}
-check("Epic has a store group and a backend group",
-      set(groups) == {"main", "backend"}, str(set(groups)))
-check("the store group is ordinary", not groups["main"].get("opt_in"))
-check("the backend group is opt-in", groups["backend"].get("opt_in") is True)
-check("it holds the hosts epic-pin pins",
-      len(groups["backend"]["domains"]) >= 15,
-      str(len(groups["backend"]["domains"])))
-check("and they are the same hosts",
-      "fortnite-public-service-prod11.ol.epicgames.com"
-      in groups["backend"]["domains"])
+check("Epic itself is only the store now",
+      [g["key"] for g in epic["groups"]] == ["main"],
+      str([g["key"] for g in epic["groups"]]))
 
+# One home for everything the installer deliberately keeps out of the hijack.
+# They were scattered before: Epic's backend was a group under Epic Games and
+# the other six were in bypass.conf and nowhere an operator could see them.
+byp = next(s for s in cat if s["key"] == "bypass")
+groups = {g["key"]: g for g in byp["groups"]}
+check("the bypass category has the four groups",
+      set(groups) == {"ea", "playstation", "epic", "azure"}, str(set(groups)))
+check("every one of them is opt-in",
+      all(g.get("opt_in") is True for g in byp["groups"]))
+check("and every one says why, in its own words",
+      all(g.get("note") for g in byp["groups"]),
+      str([g["key"] for g in byp["groups"] if not g.get("note")]))
+check("the notes are not all the same sentence",
+      len({g["note"] for g in byp["groups"]}) == 4)
+
+bypass_conf = open(os.path.join(HERE, "..", "common", "bypass.conf"),
+                   encoding="utf-8").read()
+catalogued = {d for g in byp["groups"] for d in g["domains"]}
+# The parents in bypass.conf are wildcards; the Epic group names the leaf
+# hosts under them, which is the same ground by a longer route.
+loose = [re.findall(r"^server=/([^/]+)/", bypass_conf, re.M)]
+absent = [d for d in sorted(set(loose[0]))
+          if d not in catalogued
+          and not any(x.endswith("." + d) for x in catalogued)]
+check("every name in bypass.conf is reachable from the catalogue",
+      not absent, str(absent))
+
+check("Epic's group still holds the hosts epic-pin pins",
+      len(groups["epic"]["domains"]) >= 15, str(len(groups["epic"]["domains"])))
 pinned = open(os.path.join(HERE, "..", "templates", "epic-pin"),
               encoding="utf-8").read()
-missing = [d for d in groups["backend"]["domains"] if d not in pinned]
-check("every catalogued backend host is one epic-pin knows",
-      not missing, str(missing[:3]))
+missing = [d for d in groups["epic"]["domains"] if d not in pinned]
+check("and they are the same hosts", not missing, str(missing[:3]))
 
 print("no template routes it by accident")
 tmp = tempfile.mkdtemp()
 store = panel.Store(os.path.join(tmp, "panel.db"))
 default = store.ensure_default_template(cat)["id"]
 
-backend = set(groups["backend"]["domains"])
+backend = set(groups["epic"]["domains"])
 bypass = set(store.bypass_for(default, cat))
 check("the default template does not route it",
       backend <= bypass, str(sorted(backend - bypass)[:2]))
@@ -91,13 +112,13 @@ for svc in cat:
         store.run("INSERT INTO template_services (template_id, service_key,"
                   " group_key) VALUES (?, ?, ?)", (fresh, svc["key"], g["key"]))
 store.run("DELETE FROM template_services WHERE template_id = ? AND"
-          " service_key = 'epic' AND group_key = 'backend'", (fresh,))
+          " service_key = 'bypass' AND group_key = 'epic'", (fresh,))
 check("a template that ticked everything but this does not route it",
       backend <= set(store.bypass_for(fresh, cat)))
 
 print("a template that does tick it, routes it")
 store.run("INSERT INTO template_services (template_id, service_key, group_key)"
-          " VALUES (?, 'epic', 'backend')", (fresh,))
+          " VALUES (?, 'bypass', 'epic')", (fresh,))
 check("it is no longer bypassed",
       not (backend & set(store.bypass_for(fresh, cat))))
 
@@ -114,7 +135,7 @@ check("the ticking template asks for no pins",
       profiles[str(fresh)]["pins"] is False, str(profiles.get(str(fresh), {}).get("pins")))
 
 store.run("DELETE FROM template_services WHERE template_id = ? AND"
-          " service_key = 'epic' AND group_key = 'backend'", (fresh,))
+          " service_key = 'bypass' AND group_key = 'epic'", (fresh,))
 _, profiles = store.profiles(cat, default)
 check("a template that has not ticked it keeps them",
       profiles[str(fresh)]["pins"] is True)
@@ -162,14 +183,14 @@ made = store.one("SELECT id FROM templates WHERE name = 'از پنل'")
 check("the template was created", made is not None)
 ticks = store.template_groups(made["id"])
 check("it ticked the ordinary groups", ("epic", "main") in ticks)
-check("it did NOT tick the opt-in one", ("epic", "backend") not in ticks,
+check("it did NOT tick the opt-in one", ("bypass", "epic") not in ticks,
       str(sorted(t for t in ticks if t[0] == "epic")))
 check("so it does not route the backend",
       backend <= set(store.bypass_for(made["id"], cat)))
 
 print("nor does the default template carry a tick nobody made")
 check("the default has no opt-in row",
-      ("epic", "backend") not in store.template_groups(default))
+      ("bypass", "epic") not in store.template_groups(default))
 
 print("and the editor draws the group the way it actually behaves")
 # A tick on that page means "routed". An unticked group whose drawer is full
@@ -189,8 +210,8 @@ def drawer(page, first_domain):
 
 back = drawer(html_out, sorted(backend)[0])
 check("the opt-in group's own box is not ticked",
-      "name='g' value='epic.backend' checked" not in back and
-      "value='epic.backend'" in back)
+      "name='g' value='bypass.epic' checked" not in back and
+      "value='bypass.epic'" in back)
 check("and none of its domains are ticked either",
       back.count("name='d'") == len(backend) and " checked" not in back,
       "%d of %d ticked" % (back.count("checked"), len(backend)))
@@ -234,6 +255,33 @@ mirror = src[src.index("def sync_base_dir"):]
 mirror = mirror[:mirror.index("return changed")]
 check("sync_base_dir excludes them", "EPIC_PINS" in mirror, mirror[:200])
 check("as it already does the custom domains", "CUSTOM_CONF" in mirror)
+# The one that decides whether a tick on the new groups does anything at all.
+# bypass.conf names those hosts exactly, and an exact name beats the rule that
+# hijacks the parent - so while every profile reads that file, ticking the
+# group in a template would change nothing and say nothing.
+check("and now the bypass list too", "BYPASS_CONF" in mirror, mirror[:300])
+check("which the main resolver still reads",
+      'BYPASS_CONF = "/etc/dnsmasq.d/bypass.conf"' in src)
+
+print("so ticking one of them really does route it")
+ea = {d for g in byp["groups"] if g["key"] == "ea" for d in g["domains"]}
+cur = store.run("INSERT INTO templates (name, is_default, created_at)"
+                " VALUES ('EA کامل', 0, ?)", (panel.now(),))
+tid = cur.lastrowid
+for svc in cat:
+    for g in svc["groups"]:
+        if not g.get("opt_in"):
+            store.run("INSERT INTO template_services (template_id,"
+                      " service_key, group_key) VALUES (?,?,?)",
+                      (tid, svc["key"], g["key"]))
+check("untouched, EA's game servers are bypassed",
+      ea <= set(store.bypass_for(tid, cat)))
+store.run("INSERT INTO template_services (template_id, service_key, group_key)"
+          " VALUES (?, 'bypass', 'ea')", (tid,))
+left = set(store.bypass_for(tid, cat))
+check("ticked, not one of them is", not (ea & left), str(sorted(ea & left)))
+check("and the other three stay bypassed",
+      {d for g in byp["groups"] if g["key"] != "ea" for d in g["domains"]} <= left)
 
 print("the panel warns before somebody ticks it")
 adm = open(os.path.join(HERE, "..", "templates", "smartdns-admin"),

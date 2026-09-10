@@ -1088,8 +1088,13 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 # not a matter of taste. Say why, next to the tick, rather
                 # than letting it look like every other box on the page.
                 if g.get("opt_in"):
-                    label += ("<span class='optin'>پیش‌فرض خاموش — روشن کردنش "
-                              "matchmaking فورتنایت را می‌شکند</span>")
+                    # The reason comes from the group, not from here. These
+                    # are switched off for four different reasons and only one
+                    # of them is matchmaking - a warning that says the same
+                    # thing about all of them is wrong about three.
+                    label += ("<span class='optin'>پیش‌فرض خاموش — %s</span>"
+                              % html.escape(g.get("note") or
+                                            "روشن کردنش چیزی را می‌شکند"))
                 kept = [d for d in g["domains"] if d not in off]
                 # Open the drawer when the operator has already been in here
                 # picking domains, so their exceptions are visible rather than

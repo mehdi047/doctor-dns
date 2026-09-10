@@ -209,9 +209,15 @@ def nft(*args):
 
 
 CUSTOM_CONF = "/etc/dnsmasq.d/50-smartdns-custom.conf"
+# The names the installer keeps out of the hijack: EA's game servers, the
+# console STUN hosts, Epic's backend, core.windows.net. The main resolver
+# reads this file and always will; the profiles must not, because whether
+# each of those is routed is now a tick in a template, and a rule sitting in
+# a shared file would outrank the tick.
+BYPASS_CONF = "/etc/dnsmasq.d/bypass.conf"
 # What the profile resolvers read instead of /etc/dnsmasq.d. Same files, minus
-# the operator's custom domains - those are per template, and a profile that
-# does not route them must not find them at all.
+# the ones decided per template - a profile that does not route something must
+# not find a rule for it at all.
 BASE_DIR = "/etc/smartdns-base"
 
 
@@ -238,16 +244,19 @@ def sync_base_dir():
     """Keep BASE_DIR mirroring /etc/dnsmasq.d, minus two files.
 
     Symlinks rather than copies, so `smartdns add` still reaches every
-    resolver on the machine without knowing this directory exists. The
-    operator's own domains and epic-pin's pins are left out: both are decided
-    per template, and absence is the only mechanism that works when the rules
-    would otherwise name the same host.
+    resolver on the machine without knowing this directory exists. Three files
+    are left out - the operator's own domains, epic-pin's pins, and the
+    bypass list - because each is decided per template, and absence is the
+    only mechanism that works when the rules would otherwise name the same
+    host. The panel sends every bypass this profile needs, so nothing is lost
+    by not linking the file.
     """
     os.makedirs(BASE_DIR, exist_ok=True)
     want = {f for f in os.listdir("/etc/dnsmasq.d")
             if f.endswith(".conf")
             and f not in (os.path.basename(CUSTOM_CONF),
-                          os.path.basename(EPIC_PINS))}
+                          os.path.basename(EPIC_PINS),
+                          os.path.basename(BYPASS_CONF))}
     have = set(os.listdir(BASE_DIR))
     changed = False
     for f in want - have:

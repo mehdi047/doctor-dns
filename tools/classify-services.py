@@ -48,7 +48,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # out-specify the storefront rules above them.
 # Groups that exist so they can be seen and chosen, never so they can happen
 # by default.
-OPT_IN = {"epic.backend"}
+OPT_IN = {"bypass.ea", "bypass.playstation", "bypass.epic",
+          "bypass.azure"}
 
 EXPLICIT = {
     "playstation.download": [
@@ -62,7 +63,7 @@ EXPLICIT = {
     # the one matchmaking came from. They are in the catalogue so an operator
     # can see them and decide, and marked opt-in below so that deciding
     # nothing leaves them alone. Same list epic-pin works from.
-    "epic.backend": ['account-public-service-prod.ol.epicgames.com', 'datarouter.ol.epicgames.com', 'launcher-public-service-prod06.ol.epicgames.com', 'links-public-service-live.ol.epicgames.com', 'events-public-service-live.ol.epicgames.com', 'datastorage-public-service-live.ol.epicgames.com', 'data-asset-directory-public-service-prod.ol.epicgames.com', 'fortnitecontent-website-prod07.ol.epicgames.com', 'fortnite-public-service-prod11.ol.epicgames.com', 'mcp-gc.live.fngw.ol.epicgames.com', 'gc.svc.live.fngw.ol.epicgames.com', 'ds.svc.live.fngw.ol.epicgames.com', 'fngw-svc-ds-livefn.ol.epicgames.com', 'fn-service-habanero-live-public.ogs.live.on.epicgames.com', 'fn-service-discovery-live-public.ogs.live.on.epicgames.com', 'prm-dialogue-public-api-prod.edea.live.use1a.on.epicgames.com'],
+    "bypass.epic": ['account-public-service-prod.ol.epicgames.com', 'datarouter.ol.epicgames.com', 'launcher-public-service-prod06.ol.epicgames.com', 'links-public-service-live.ol.epicgames.com', 'events-public-service-live.ol.epicgames.com', 'datastorage-public-service-live.ol.epicgames.com', 'data-asset-directory-public-service-prod.ol.epicgames.com', 'fortnitecontent-website-prod07.ol.epicgames.com', 'fortnite-public-service-prod11.ol.epicgames.com', 'mcp-gc.live.fngw.ol.epicgames.com', 'gc.svc.live.fngw.ol.epicgames.com', 'ds.svc.live.fngw.ol.epicgames.com', 'fngw-svc-ds-livefn.ol.epicgames.com', 'fn-service-habanero-live-public.ogs.live.on.epicgames.com', 'fn-service-discovery-live-public.ogs.live.on.epicgames.com', 'prm-dialogue-public-api-prod.edea.live.use1a.on.epicgames.com'],
     "xbox.download": [
         "dl.delivery.mp.microsoft.com",
         "assets1.xboxlive.com",

@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.3.1"
+VERSION="0.4.0"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -3354,7 +3354,7 @@ exit 0
 #                # backend group would tick it and see nothing happen. The
 #                # relay leaves the pins out of a profile that asked to route
 #                # them, and keeps them everywhere else.
-#                "pins": ("epic", "backend") not in self.template_groups(tid),
+#                "pins": ("bypass", "epic") not in self.template_groups(tid),
 #            }
 #        return by_ip, profiles
 #
@@ -4252,9 +4252,15 @@ exit 0
 #
 #
 #CUSTOM_CONF = "/etc/dnsmasq.d/50-smartdns-custom.conf"
+## The names the installer keeps out of the hijack: EA's game servers, the
+## console STUN hosts, Epic's backend, core.windows.net. The main resolver
+## reads this file and always will; the profiles must not, because whether
+## each of those is routed is now a tick in a template, and a rule sitting in
+## a shared file would outrank the tick.
+#BYPASS_CONF = "/etc/dnsmasq.d/bypass.conf"
 ## What the profile resolvers read instead of /etc/dnsmasq.d. Same files, minus
-## the operator's custom domains - those are per template, and a profile that
-## does not route them must not find them at all.
+## the ones decided per template - a profile that does not route something must
+## not find a rule for it at all.
 #BASE_DIR = "/etc/smartdns-base"
 #
 #
@@ -4281,16 +4287,19 @@ exit 0
 #    """Keep BASE_DIR mirroring /etc/dnsmasq.d, minus two files.
 #
 #    Symlinks rather than copies, so `smartdns add` still reaches every
-#    resolver on the machine without knowing this directory exists. The
-#    operator's own domains and epic-pin's pins are left out: both are decided
-#    per template, and absence is the only mechanism that works when the rules
-#    would otherwise name the same host.
+#    resolver on the machine without knowing this directory exists. Three files
+#    are left out - the operator's own domains, epic-pin's pins, and the
+#    bypass list - because each is decided per template, and absence is the
+#    only mechanism that works when the rules would otherwise name the same
+#    host. The panel sends every bypass this profile needs, so nothing is lost
+#    by not linking the file.
 #    """
 #    os.makedirs(BASE_DIR, exist_ok=True)
 #    want = {f for f in os.listdir("/etc/dnsmasq.d")
 #            if f.endswith(".conf")
 #            and f not in (os.path.basename(CUSTOM_CONF),
-#                          os.path.basename(EPIC_PINS))}
+#                          os.path.basename(EPIC_PINS),
+#                          os.path.basename(BYPASS_CONF))}
 #    have = set(os.listdir(BASE_DIR))
 #    changed = False
 #    for f in want - have:
@@ -6499,8 +6508,13 @@ exit 0
 #                # not a matter of taste. Say why, next to the tick, rather
 #                # than letting it look like every other box on the page.
 #                if g.get("opt_in"):
-#                    label += ("<span class='optin'>پیش‌فرض خاموش — روشن کردنش "
-#                              "matchmaking فورتنایت را می‌شکند</span>")
+#                    # The reason comes from the group, not from here. These
+#                    # are switched off for four different reasons and only one
+#                    # of them is matchmaking - a warning that says the same
+#                    # thing about all of them is wrong about three.
+#                    label += ("<span class='optin'>پیش‌فرض خاموش — %s</span>"
+#                              % html.escape(g.get("note") or
+#                                            "روشن کردنش چیزی را می‌شکند"))
 #                kept = [d for d in g["domains"] if d not in off]
 #                # Open the drawer when the operator has already been in here
 #                # picking domains, so their exceptions are visible rather than
@@ -7879,1022 +7893,1060 @@ exit 0
 
 #__BEGIN_SERVICES__
 #{
-# "services": [
-#  {
-#   "key": "playstation",
-#   "label": "PlayStation",
-#   "groups": [
+#  "services": [
 #    {
-#     "key": "online",
-#     "label": "فروشگاه، اکانت و بازی آنلاین",
-#     "domains": [
-#      "playstation.com",
-#      "playstation.net",
-#      "pscdn.co",
-#      "sonyentertainmentnetwork.com"
-#     ]
+#      "key": "playstation",
+#      "label": "PlayStation",
+#      "groups": [
+#        {
+#          "key": "online",
+#          "label": "فروشگاه، اکانت و بازی آنلاین",
+#          "domains": [
+#            "playstation.com",
+#            "playstation.net",
+#            "pscdn.co",
+#            "sonyentertainmentnetwork.com"
+#          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود بازی",
+#          "domains": [
+#            "gst.prod.dl.playstation.net",
+#            "ps5cel.np.dl.playstation.net",
+#            "uef.np.dl.playstation.net",
+#            "zeus.dl.playstation.net"
+#          ]
+#        }
+#      ]
 #    },
 #    {
-#     "key": "download",
-#     "label": "دانلود بازی",
-#     "domains": [
-#      "gst.prod.dl.playstation.net",
-#      "ps5cel.np.dl.playstation.net",
-#      "uef.np.dl.playstation.net",
-#      "zeus.dl.playstation.net"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "xbox",
-#   "label": "Xbox",
-#   "groups": [
-#    {
-#     "key": "online",
-#     "label": "فروشگاه، اکانت و بازی آنلاین",
-#     "domains": [
-#      "edgesuite.net",
-#      "gamepass.com",
-#      "mp.microsoft.com",
-#      "xbox.com",
-#      "xboxlive.com"
-#     ]
+#      "key": "xbox",
+#      "label": "Xbox",
+#      "groups": [
+#        {
+#          "key": "online",
+#          "label": "فروشگاه، اکانت و بازی آنلاین",
+#          "domains": [
+#            "edgesuite.net",
+#            "gamepass.com",
+#            "mp.microsoft.com",
+#            "xbox.com",
+#            "xboxlive.com"
+#          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود بازی",
+#          "domains": [
+#            "assets1.xboxlive.com",
+#            "dl.delivery.mp.microsoft.com",
+#            "dlassets.xboxlive.com",
+#            "xvcf1.xboxlive.com",
+#            "xvcf2.xboxlive.com"
+#          ]
+#        }
+#      ]
 #    },
 #    {
-#     "key": "download",
-#     "label": "دانلود بازی",
-#     "domains": [
-#      "assets1.xboxlive.com",
-#      "dl.delivery.mp.microsoft.com",
-#      "dlassets.xboxlive.com",
-#      "xvcf1.xboxlive.com",
-#      "xvcf2.xboxlive.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "nintendo",
-#   "label": "Nintendo",
-#   "groups": [
-#    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "nintendo.com",
-#      "nintendo.net"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "steam",
-#   "label": "Steam",
-#   "groups": [
-#    {
-#     "key": "main",
-#     "label": "فروشگاه و انجمن",
-#     "domains": [
-#      "steamcommunity.com",
-#      "steampowered.com",
-#      "steamstatic.com",
-#      "valvesoftware.com"
-#     ]
+#      "key": "nintendo",
+#      "label": "Nintendo",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "nintendo.com",
+#            "nintendo.net"
+#          ]
+#        }
+#      ]
 #    },
 #    {
-#     "key": "download",
-#     "label": "دانلود بازی",
-#     "domains": [
-#      "steamcontent.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "epic",
-#   "label": "Epic Games",
-#   "groups": [
-#    {
-#     "key": "main",
-#     "label": "فروشگاه، لانچر و اکانت",
-#     "domains": [
-#      "epicgames.com",
-#      "unrealengine.com"
-#     ]
+#      "key": "steam",
+#      "label": "Steam",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "فروشگاه و انجمن",
+#          "domains": [
+#            "steamcommunity.com",
+#            "steampowered.com",
+#            "steamstatic.com",
+#            "valvesoftware.com"
+#          ]
+#        },
+#        {
+#          "key": "download",
+#          "label": "دانلود بازی",
+#          "domains": [
+#            "steamcontent.com"
+#          ]
+#        }
+#      ]
 #    },
 #    {
-#     "key": "backend",
-#     "label": "بک‌اند بازی (matchmaking فورتنایت)",
-#     "domains": [
-#      "account-public-service-prod.ol.epicgames.com",
-#      "data-asset-directory-public-service-prod.ol.epicgames.com",
-#      "datarouter.ol.epicgames.com",
-#      "datastorage-public-service-live.ol.epicgames.com",
-#      "ds.svc.live.fngw.ol.epicgames.com",
-#      "events-public-service-live.ol.epicgames.com",
-#      "fn-service-discovery-live-public.ogs.live.on.epicgames.com",
-#      "fn-service-habanero-live-public.ogs.live.on.epicgames.com",
-#      "fngw-svc-ds-livefn.ol.epicgames.com",
-#      "fortnite-public-service-prod11.ol.epicgames.com",
-#      "fortnitecontent-website-prod07.ol.epicgames.com",
-#      "gc.svc.live.fngw.ol.epicgames.com",
-#      "launcher-public-service-prod06.ol.epicgames.com",
-#      "links-public-service-live.ol.epicgames.com",
-#      "mcp-gc.live.fngw.ol.epicgames.com",
-#      "prm-dialogue-public-api-prod.edea.live.use1a.on.epicgames.com"
-#     ],
-#     "opt_in": true
-#    }
-#   ]
-#  },
-#  {
-#   "key": "ea",
-#   "label": "EA",
-#   "groups": [
+#      "key": "epic",
+#      "label": "Epic Games",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "فروشگاه، لانچر و اکانت",
+#          "domains": [
+#            "epicgames.com",
+#            "unrealengine.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "apexlegends.com",
-#      "battlefield.com",
-#      "bioware.com",
-#      "criteriongames.com",
-#      "dice.se",
-#      "ea.com",
-#      "eaaccess.com",
-#      "eaassets-a.akamaihd.net",
-#      "eacdn.com",
-#      "eamobile.com",
-#      "eaplay.com",
-#      "easports.com",
-#      "fcmobile.com",
-#      "frostbite.com",
-#      "maxis.com",
-#      "needforspeed.com",
-#      "origin.com",
-#      "popcap.com",
-#      "respawn.com",
-#      "swtor.com",
-#      "thesims.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "blizzard",
-#   "label": "Blizzard / Activision",
-#   "groups": [
+#      "key": "ea",
+#      "label": "EA",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "apexlegends.com",
+#            "battlefield.com",
+#            "bioware.com",
+#            "criteriongames.com",
+#            "dice.se",
+#            "ea.com",
+#            "eaaccess.com",
+#            "eaassets-a.akamaihd.net",
+#            "eacdn.com",
+#            "eamobile.com",
+#            "eaplay.com",
+#            "easports.com",
+#            "fcmobile.com",
+#            "frostbite.com",
+#            "maxis.com",
+#            "needforspeed.com",
+#            "origin.com",
+#            "popcap.com",
+#            "respawn.com",
+#            "swtor.com",
+#            "thesims.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "activision.com",
-#      "battle.net",
-#      "blizzard.com",
-#      "callofduty.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "ubisoft",
-#   "label": "Ubisoft",
-#   "groups": [
+#      "key": "blizzard",
+#      "label": "Blizzard / Activision",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "activision.com",
+#            "battle.net",
+#            "blizzard.com",
+#            "callofduty.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "ubi.com",
-#      "ubisoft.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "riot",
-#   "label": "Riot Games",
-#   "groups": [
+#      "key": "ubisoft",
+#      "label": "Ubisoft",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "ubi.com",
+#            "ubisoft.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "leagueoflegends.com",
-#      "riotgames.com",
-#      "valorant.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "rockstar",
-#   "label": "Rockstar",
-#   "groups": [
+#      "key": "riot",
+#      "label": "Riot Games",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "leagueoflegends.com",
+#            "riotgames.com",
+#            "valorant.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "rockstargames.com",
-#      "take2games.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "bethesda",
-#   "label": "Bethesda",
-#   "groups": [
+#      "key": "rockstar",
+#      "label": "Rockstar",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "rockstargames.com",
+#            "take2games.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "bethesda.net"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "gog",
-#   "label": "GOG / itch.io",
-#   "groups": [
+#      "key": "bethesda",
+#      "label": "Bethesda",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "bethesda.net"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "gog.com",
-#      "humblebundle.com",
-#      "itch.io"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "roblox",
-#   "label": "Roblox",
-#   "groups": [
+#      "key": "gog",
+#      "label": "GOG / itch.io",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "gog.com",
+#            "humblebundle.com",
+#            "itch.io"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "rbxcdn.com",
-#      "roblox.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "minecraft",
-#   "label": "Minecraft",
-#   "groups": [
+#      "key": "roblox",
+#      "label": "Roblox",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "rbxcdn.com",
+#            "roblox.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "minecraft.net",
-#      "minecraftservices.com",
-#      "mojang.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "othergames",
-#   "label": "بازی‌های دیگر",
-#   "groups": [
+#      "key": "minecraft",
+#      "label": "Minecraft",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "minecraft.net",
+#            "minecraftservices.com",
+#            "mojang.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "battlecode.org",
-#      "faceit.com",
-#      "garena.com",
-#      "hoyoverse.com",
-#      "incredibuild.com",
-#      "krafton.com",
-#      "mihoyo.com",
-#      "pubg.com",
-#      "supercell.com",
-#      "unity.com",
-#      "unity3d.com",
-#      "vuforia.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "netflix",
-#   "label": "Netflix",
-#   "groups": [
+#      "key": "othergames",
+#      "label": "بازی‌های دیگر",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "battlecode.org",
+#            "faceit.com",
+#            "garena.com",
+#            "hoyoverse.com",
+#            "incredibuild.com",
+#            "krafton.com",
+#            "mihoyo.com",
+#            "pubg.com",
+#            "supercell.com",
+#            "unity.com",
+#            "unity3d.com",
+#            "vuforia.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "netflix.com",
-#      "nflxext.com",
-#      "nflximg.net",
-#      "nflxvideo.net"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "twitch",
-#   "label": "Twitch",
-#   "groups": [
+#      "key": "netflix",
+#      "label": "Netflix",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "netflix.com",
+#            "nflxext.com",
+#            "nflximg.net",
+#            "nflxvideo.net"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "ttvnw.net",
-#      "twitch.tv"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "spotify",
-#   "label": "Spotify",
-#   "groups": [
+#      "key": "twitch",
+#      "label": "Twitch",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "ttvnw.net",
+#            "twitch.tv"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "scdn.co",
-#      "spotify.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "openai",
-#   "label": "OpenAI / ChatGPT",
-#   "groups": [
+#      "key": "spotify",
+#      "label": "Spotify",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "scdn.co",
+#            "spotify.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "chatgpt.com",
-#      "oaistatic.com",
-#      "oaiusercontent.com",
-#      "openai.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "anthropic",
-#   "label": "Claude",
-#   "groups": [
+#      "key": "openai",
+#      "label": "OpenAI / ChatGPT",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "chatgpt.com",
+#            "oaistatic.com",
+#            "oaiusercontent.com",
+#            "openai.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "anthropic.com",
-#      "claude.ai"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "otherai",
-#   "label": "هوش مصنوعی دیگر",
-#   "groups": [
+#      "key": "anthropic",
+#      "label": "Claude",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "anthropic.com",
+#            "claude.ai"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "codeium.com",
-#      "cursor.com",
-#      "cursor.sh",
-#      "deepmind.google",
-#      "deepseek.com",
-#      "groq.com",
-#      "hf.co",
-#      "huggingface.co",
-#      "kaggle.com",
-#      "kaggle.net",
-#      "kaggleusercontent.com",
-#      "mistral.ai",
-#      "ollama.com",
-#      "openrouter.ai",
-#      "perplexity.ai",
-#      "tensorflow.org",
-#      "together.ai",
-#      "windsurf.com",
-#      "x.ai"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "github",
-#   "label": "GitHub",
-#   "groups": [
+#      "key": "otherai",
+#      "label": "هوش مصنوعی دیگر",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "codeium.com",
+#            "cursor.com",
+#            "cursor.sh",
+#            "deepmind.google",
+#            "deepseek.com",
+#            "groq.com",
+#            "hf.co",
+#            "huggingface.co",
+#            "kaggle.com",
+#            "kaggle.net",
+#            "kaggleusercontent.com",
+#            "mistral.ai",
+#            "ollama.com",
+#            "openrouter.ai",
+#            "perplexity.ai",
+#            "tensorflow.org",
+#            "together.ai",
+#            "windsurf.com",
+#            "x.ai"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "github.com",
-#      "githubapp.com",
-#      "githubassets.com",
-#      "githubusercontent.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "gitlab",
-#   "label": "GitLab / Bitbucket",
-#   "groups": [
+#      "key": "github",
+#      "label": "GitHub",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "github.com",
+#            "githubapp.com",
+#            "githubassets.com",
+#            "githubusercontent.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "bitbucket.org",
-#      "gitkraken.com",
-#      "gitlab-static.net",
-#      "gitlab.com",
-#      "gitlab.io",
-#      "gitpod.io"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "docker",
-#   "label": "Docker / Kubernetes",
-#   "groups": [
+#      "key": "gitlab",
+#      "label": "GitLab / Bitbucket",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "bitbucket.org",
+#            "gitkraken.com",
+#            "gitlab-static.net",
+#            "gitlab.com",
+#            "gitlab.io",
+#            "gitpod.io"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "docker.com",
-#      "docker.io",
-#      "gcr.io",
-#      "ghcr.io",
-#      "helm.sh",
-#      "k8s.io",
-#      "kubernetes.io",
-#      "quay.io",
-#      "registry.k8s.io"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "packages",
-#   "label": "مخازن پکیج",
-#   "groups": [
+#      "key": "docker",
+#      "label": "Docker / Kubernetes",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "docker.com",
+#            "docker.io",
+#            "gcr.io",
+#            "ghcr.io",
+#            "helm.sh",
+#            "k8s.io",
+#            "kubernetes.io",
+#            "quay.io",
+#            "registry.k8s.io"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "archive.ubuntu.com",
-#      "bintray.com",
-#      "centos.org",
-#      "chocolatey.org",
-#      "crates.io",
-#      "fsdn.com",
-#      "go.dev",
-#      "godoc.org",
-#      "golang.org",
-#      "gopkg.in",
-#      "gradle.org",
-#      "jfrog.io",
-#      "jfrog.org",
-#      "jitpack.io",
-#      "labix.org",
-#      "launchpad.net",
-#      "libraries.io",
-#      "maas.io",
-#      "maven.google.com",
-#      "maven.org",
-#      "npmjs.com",
-#      "npmjs.org",
-#      "nuget.org",
-#      "packagesource.com",
-#      "packagist.org",
-#      "pkg.go.dev",
-#      "pnpm.io",
-#      "pypi.org",
-#      "rubygems.org",
-#      "sonatype.org",
-#      "yarnpkg.com",
-#      "yarnpkg.org"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "microsoft",
-#   "label": "Microsoft / VS Code",
-#   "groups": [
+#      "key": "packages",
+#      "label": "مخازن پکیج",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "archive.ubuntu.com",
+#            "bintray.com",
+#            "centos.org",
+#            "chocolatey.org",
+#            "crates.io",
+#            "fsdn.com",
+#            "go.dev",
+#            "godoc.org",
+#            "golang.org",
+#            "gopkg.in",
+#            "gradle.org",
+#            "jfrog.io",
+#            "jfrog.org",
+#            "jitpack.io",
+#            "labix.org",
+#            "launchpad.net",
+#            "libraries.io",
+#            "maas.io",
+#            "maven.google.com",
+#            "maven.org",
+#            "npmjs.com",
+#            "npmjs.org",
+#            "nuget.org",
+#            "packagesource.com",
+#            "packagist.org",
+#            "pkg.go.dev",
+#            "pnpm.io",
+#            "pypi.org",
+#            "rubygems.org",
+#            "sonatype.org",
+#            "yarnpkg.com",
+#            "yarnpkg.org"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "aka.ms",
-#      "code.visualstudio.com",
-#      "dotnet.microsoft.com",
-#      "gallerycdn.vsassets.io",
-#      "learn.microsoft.com",
-#      "marketplace.visualstudio.com",
-#      "visualstudio.microsoft.com",
-#      "vscode-cdn.net",
-#      "vscode.dev"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "jetbrains",
-#   "label": "JetBrains",
-#   "groups": [
+#      "key": "microsoft",
+#      "label": "Microsoft / VS Code",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "aka.ms",
+#            "code.visualstudio.com",
+#            "dotnet.microsoft.com",
+#            "gallerycdn.vsassets.io",
+#            "learn.microsoft.com",
+#            "marketplace.visualstudio.com",
+#            "visualstudio.microsoft.com",
+#            "vscode-cdn.net",
+#            "vscode.dev"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "jetbrains.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "adobe",
-#   "label": "Adobe",
-#   "groups": [
+#      "key": "jetbrains",
+#      "label": "JetBrains",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "jetbrains.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "adobe.com",
-#      "adobelogin.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "nvidia",
-#   "label": "NVIDIA",
-#   "groups": [
+#      "key": "adobe",
+#      "label": "Adobe",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "adobe.com",
+#            "adobelogin.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "geforce.com",
-#      "nvidia.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "apple",
-#   "label": "Apple",
-#   "groups": [
+#      "key": "nvidia",
+#      "label": "NVIDIA",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "geforce.com",
+#            "nvidia.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "apple.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "google",
-#   "label": "Google",
-#   "groups": [
+#      "key": "apple",
+#      "label": "Apple",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "apple.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "accounts.google.com",
-#      "ads.google.com",
-#      "adservice.google.com",
-#      "ai.google",
-#      "aistudio.google.com",
-#      "analytics.google.com",
-#      "apis.google.com",
-#      "appengine.google.com",
-#      "apps.admob.com",
-#      "books.google.com",
-#      "business.google.com",
-#      "classroom.google.com",
-#      "clients.google.com",
-#      "clients2.google.com",
-#      "clients6.google.com",
-#      "cloud.google.com",
-#      "code.google.com",
-#      "colab.research.google.com",
-#      "design.google.com",
-#      "developer.google.com",
-#      "developers.google.com",
-#      "dl-ssl.google.com",
-#      "dl.google.com",
-#      "dns.google.com",
-#      "domains.google.com",
-#      "doubleclick.net",
-#      "doubleclickbygoogle.com",
-#      "events.google.com",
-#      "fiber.google.com",
-#      "firebase.google.com",
-#      "gemini.google.com",
-#      "google-analytics.com",
-#      "google.ai",
-#      "googleadservices.com",
-#      "googleapis.com",
-#      "googleblog.com",
-#      "googlesource.com",
-#      "googletagmanager.com",
-#      "googletagservices.com",
-#      "googleusercontent.com",
-#      "gstatic.com",
-#      "issuetracker.google.com",
-#      "labs.google",
-#      "marketingplantform.google.com",
-#      "notebooklm.google.com",
-#      "optimize.google.com",
-#      "payments.google.com",
-#      "play.google.com",
-#      "storage.googleapis.com",
-#      "surveys.google.com",
-#      "tagmanager.google.com",
-#      "withgoogle.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "discord",
-#   "label": "Discord",
-#   "groups": [
+#      "key": "google",
+#      "label": "Google",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "accounts.google.com",
+#            "ads.google.com",
+#            "adservice.google.com",
+#            "ai.google",
+#            "aistudio.google.com",
+#            "analytics.google.com",
+#            "apis.google.com",
+#            "appengine.google.com",
+#            "apps.admob.com",
+#            "books.google.com",
+#            "business.google.com",
+#            "classroom.google.com",
+#            "clients.google.com",
+#            "clients2.google.com",
+#            "clients6.google.com",
+#            "cloud.google.com",
+#            "code.google.com",
+#            "colab.research.google.com",
+#            "design.google.com",
+#            "developer.google.com",
+#            "developers.google.com",
+#            "dl-ssl.google.com",
+#            "dl.google.com",
+#            "dns.google.com",
+#            "domains.google.com",
+#            "doubleclick.net",
+#            "doubleclickbygoogle.com",
+#            "events.google.com",
+#            "fiber.google.com",
+#            "firebase.google.com",
+#            "gemini.google.com",
+#            "google-analytics.com",
+#            "google.ai",
+#            "googleadservices.com",
+#            "googleapis.com",
+#            "googleblog.com",
+#            "googlesource.com",
+#            "googletagmanager.com",
+#            "googletagservices.com",
+#            "googleusercontent.com",
+#            "gstatic.com",
+#            "issuetracker.google.com",
+#            "labs.google",
+#            "marketingplantform.google.com",
+#            "notebooklm.google.com",
+#            "optimize.google.com",
+#            "payments.google.com",
+#            "play.google.com",
+#            "storage.googleapis.com",
+#            "surveys.google.com",
+#            "tagmanager.google.com",
+#            "withgoogle.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "discord.com",
-#      "discord.gg",
-#      "discordapp.com",
-#      "discordapp.net"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "slackzoom",
-#   "label": "Slack / Zoom / Teams",
-#   "groups": [
+#      "key": "discord",
+#      "label": "Discord",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "discord.com",
+#            "discord.gg",
+#            "discordapp.com",
+#            "discordapp.net"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "jitsi.org",
-#      "slack-edge.com",
-#      "slack.com",
-#      "zoom.us"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "figma",
-#   "label": "Figma / Canva / Notion",
-#   "groups": [
+#      "key": "slackzoom",
+#      "label": "Slack / Zoom / Teams",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "jitsi.org",
+#            "slack-edge.com",
+#            "slack.com",
+#            "zoom.us"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "asana.com",
-#      "canva.com",
-#      "figma.com",
-#      "invis.io",
-#      "linear.app",
-#      "miro.com",
-#      "notion.so",
-#      "trello.com",
-#      "zeplin.io"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "cloud",
-#   "label": "کلاود و هاستینگ",
-#   "groups": [
+#      "key": "figma",
+#      "label": "Figma / Canva / Notion",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "asana.com",
+#            "canva.com",
+#            "figma.com",
+#            "invis.io",
+#            "linear.app",
+#            "miro.com",
+#            "notion.so",
+#            "trello.com",
+#            "zeplin.io"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "appspot.com",
-#      "aws.amazon.com",
-#      "bluemix.net",
-#      "c9.io",
-#      "cloudflare.com",
-#      "cloudfront.net",
-#      "cocalc.com",
-#      "codesandbox.io",
-#      "csb.app",
-#      "digitalocean.com",
-#      "download.virtualbox.org",
-#      "es.io",
-#      "firebase.com",
-#      "fly.io",
-#      "heroku.com",
-#      "hetzner.com",
-#      "ibm.com",
-#      "java.com",
-#      "linode.com",
-#      "netlify.app",
-#      "netlify.com",
-#      "oracle.com",
-#      "railway.app",
-#      "render.com",
-#      "replit.com",
-#      "softlayer.com",
-#      "sparkjava.com",
-#      "supabase.com",
-#      "vercel.app",
-#      "vercel.com",
-#      "virtualbox.org",
-#      "vmware.com",
-#      "zeit.co"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "education",
-#   "label": "آموزش و مرجع",
-#   "groups": [
+#      "key": "cloud",
+#      "label": "کلاود و هاستینگ",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "appspot.com",
+#            "aws.amazon.com",
+#            "bluemix.net",
+#            "c9.io",
+#            "cloudflare.com",
+#            "cloudfront.net",
+#            "cocalc.com",
+#            "codesandbox.io",
+#            "csb.app",
+#            "digitalocean.com",
+#            "download.virtualbox.org",
+#            "es.io",
+#            "firebase.com",
+#            "fly.io",
+#            "heroku.com",
+#            "hetzner.com",
+#            "ibm.com",
+#            "java.com",
+#            "linode.com",
+#            "netlify.app",
+#            "netlify.com",
+#            "oracle.com",
+#            "railway.app",
+#            "render.com",
+#            "replit.com",
+#            "softlayer.com",
+#            "sparkjava.com",
+#            "supabase.com",
+#            "vercel.app",
+#            "vercel.com",
+#            "virtualbox.org",
+#            "vmware.com",
+#            "zeit.co"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "acm.org",
-#      "arxiv.org",
-#      "baeldung.com",
-#      "cljdoc.org",
-#      "codex.cs.yale.edu",
-#      "coursehero.com",
-#      "coursera-apps.org",
-#      "coursera.com",
-#      "coursera.org",
-#      "datacamp.com",
-#      "edx.org",
-#      "fluttercrashcourse.com",
-#      "flutterlearn.com",
-#      "freecodecamp.org",
-#      "goanimate.com",
-#      "grabcad.com",
-#      "hackerrank.com",
-#      "ieee.org",
-#      "jenkov.com",
-#      "khanacademy.org",
-#      "mathworks.com",
-#      "medium.com",
-#      "mit.edu",
-#      "mybridge.co",
-#      "overleaf.com",
-#      "packtpub.com",
-#      "piles.overleaf.com",
-#      "proandroiddev.com",
-#      "researchgate.net",
-#      "sciencedirect.com",
-#      "serverfault.com",
-#      "spiceworks.com",
-#      "springer.com",
-#      "stackexchange.com",
-#      "stackoverflow.com",
-#      "superuser.com",
-#      "teamtreehouse.com",
-#      "udemy.com",
-#      "udemycdn-a.com",
-#      "udemycdn.com",
-#      "wikia.com",
-#      "wolframalpha.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "hardware",
-#   "label": "سخت‌افزار و درایور",
-#   "groups": [
+#      "key": "education",
+#      "label": "آموزش و مرجع",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "acm.org",
+#            "arxiv.org",
+#            "baeldung.com",
+#            "cljdoc.org",
+#            "codex.cs.yale.edu",
+#            "coursehero.com",
+#            "coursera-apps.org",
+#            "coursera.com",
+#            "coursera.org",
+#            "datacamp.com",
+#            "edx.org",
+#            "fluttercrashcourse.com",
+#            "flutterlearn.com",
+#            "freecodecamp.org",
+#            "goanimate.com",
+#            "grabcad.com",
+#            "hackerrank.com",
+#            "ieee.org",
+#            "jenkov.com",
+#            "khanacademy.org",
+#            "mathworks.com",
+#            "medium.com",
+#            "mit.edu",
+#            "mybridge.co",
+#            "overleaf.com",
+#            "packtpub.com",
+#            "piles.overleaf.com",
+#            "proandroiddev.com",
+#            "researchgate.net",
+#            "sciencedirect.com",
+#            "serverfault.com",
+#            "spiceworks.com",
+#            "springer.com",
+#            "stackexchange.com",
+#            "stackoverflow.com",
+#            "superuser.com",
+#            "teamtreehouse.com",
+#            "udemy.com",
+#            "udemycdn-a.com",
+#            "udemycdn.com",
+#            "wikia.com",
+#            "wolframalpha.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "altera.com",
-#      "amd.com",
-#      "android.com",
-#      "anydesk.com",
-#      "arduino.cc",
-#      "bitvise.com",
-#      "cisco.com",
-#      "clamav.net",
-#      "dell.com",
-#      "developer.samsung.com",
-#      "digikey.com",
-#      "download.01.org",
-#      "element14.com",
-#      "espressif.com",
-#      "intel.com",
-#      "lenovo.com",
-#      "microchip.com",
-#      "ni.com",
-#      "nirsoft.net",
-#      "qualcomm.com",
-#      "raspberrypi.com",
-#      "softonic.com",
-#      "st.com",
-#      "sun.com",
-#      "teamviewer.com",
-#      "ti.com",
-#      "xilinx.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "finance",
-#   "label": "پرداخت و مالی",
-#   "groups": [
+#      "key": "hardware",
+#      "label": "سخت‌افزار و درایور",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "altera.com",
+#            "amd.com",
+#            "android.com",
+#            "anydesk.com",
+#            "arduino.cc",
+#            "bitvise.com",
+#            "cisco.com",
+#            "clamav.net",
+#            "dell.com",
+#            "developer.samsung.com",
+#            "digikey.com",
+#            "download.01.org",
+#            "element14.com",
+#            "espressif.com",
+#            "intel.com",
+#            "lenovo.com",
+#            "microchip.com",
+#            "ni.com",
+#            "nirsoft.net",
+#            "qualcomm.com",
+#            "raspberrypi.com",
+#            "softonic.com",
+#            "st.com",
+#            "sun.com",
+#            "teamviewer.com",
+#            "ti.com",
+#            "xilinx.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "coinbase.com",
-#      "demandbase.com",
-#      "en25.com",
-#      "mailgun.com",
-#      "paypal.com",
-#      "paypalobjects.com",
-#      "salesforce.com",
-#      "sendgrid.com",
-#      "stripe.com",
-#      "upwork.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "webdev",
-#   "label": "ابزار وب و فریم‌ورک",
-#   "groups": [
+#      "key": "finance",
+#      "label": "پرداخت و مالی",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "coinbase.com",
+#            "demandbase.com",
+#            "en25.com",
+#            "mailgun.com",
+#            "paypal.com",
+#            "paypalobjects.com",
+#            "salesforce.com",
+#            "sendgrid.com",
+#            "stripe.com",
+#            "upwork.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "algolia.com",
-#      "algolia.net",
-#      "amp.dev",
-#      "ant.design",
-#      "apache.org",
-#      "arcgis.com",
-#      "atlassian.com",
-#      "atlassian.net",
-#      "b4x.com",
-#      "beans.org",
-#      "bit.dev",
-#      "bitsrc.io",
-#      "bootstrapcdn.com",
-#      "bootswatch.com",
-#      "bun.sh",
-#      "caddy.com",
-#      "caddyserver.com",
-#      "cloudera.com",
-#      "codecov.io",
-#      "curd.io",
-#      "dartlang.org",
-#      "deno.land",
-#      "developer.chrome.com",
-#      "docs.datastax.com",
-#      "elastic.co",
-#      "enterprisedb.com",
-#      "eslint.org",
-#      "explainshell.com",
-#      "expressjs.com",
-#      "flutter.dev",
-#      "flutter.io",
-#      "forums.cpanel.net",
-#      "gallery.io",
-#      "getbootstrap.com",
-#      "getcaddy.com",
-#      "godbolt.org",
-#      "grafana.com",
-#      "graphql.org",
-#      "hashicorp.com",
-#      "hyper.is",
-#      "i.stack.imgur.com",
-#      "i18next.com",
-#      "jaspersoft.com",
-#      "javacardos.com",
-#      "jenkins-ci.org",
-#      "jenkins.org",
-#      "jhipster.tech",
-#      "jungle.net",
-#      "laravel.com",
-#      "material.io",
-#      "mbed.com",
-#      "metasploit.com",
-#      "mongodb.com",
-#      "mongodb.org",
-#      "mysql.com",
-#      "nativescript.org",
-#      "nextjs.org",
-#      "nginx.com",
-#      "nodejs.org",
-#      "php.net",
-#      "polymer-project.org",
-#      "postman.com",
-#      "python.org",
-#      "qt.io",
-#      "rapid7.com",
-#      "reactjs.org",
-#      "realm.io",
-#      "releases.hashicorp.com",
-#      "ruby-doc.org",
-#      "rust-lang.org",
-#      "schema.org",
-#      "seleniumhq.org",
-#      "serialport.io",
-#      "socket.io",
-#      "sonarsource.com",
-#      "splunk.com",
-#      "spring.io",
-#      "sstatic.net",
-#      "swaggerhub.com",
-#      "swift.org",
-#      "symfony.com",
-#      "telerik.com",
-#      "terraform.io",
-#      "traviscistatus.com",
-#      "vagrantup.com",
-#      "vuejs.org",
-#      "vuetifyjs.com",
-#      "web.dev"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "assets",
-#   "label": "تصویر، فونت و قالب",
-#   "groups": [
+#      "key": "webdev",
+#      "label": "ابزار وب و فریم‌ورک",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "algolia.com",
+#            "algolia.net",
+#            "amp.dev",
+#            "ant.design",
+#            "apache.org",
+#            "arcgis.com",
+#            "atlassian.com",
+#            "atlassian.net",
+#            "b4x.com",
+#            "beans.org",
+#            "bit.dev",
+#            "bitsrc.io",
+#            "bootstrapcdn.com",
+#            "bootswatch.com",
+#            "bun.sh",
+#            "caddy.com",
+#            "caddyserver.com",
+#            "cloudera.com",
+#            "codecov.io",
+#            "curd.io",
+#            "dartlang.org",
+#            "deno.land",
+#            "developer.chrome.com",
+#            "docs.datastax.com",
+#            "elastic.co",
+#            "enterprisedb.com",
+#            "eslint.org",
+#            "explainshell.com",
+#            "expressjs.com",
+#            "flutter.dev",
+#            "flutter.io",
+#            "forums.cpanel.net",
+#            "gallery.io",
+#            "getbootstrap.com",
+#            "getcaddy.com",
+#            "godbolt.org",
+#            "grafana.com",
+#            "graphql.org",
+#            "hashicorp.com",
+#            "hyper.is",
+#            "i.stack.imgur.com",
+#            "i18next.com",
+#            "jaspersoft.com",
+#            "javacardos.com",
+#            "jenkins-ci.org",
+#            "jenkins.org",
+#            "jhipster.tech",
+#            "jungle.net",
+#            "laravel.com",
+#            "material.io",
+#            "mbed.com",
+#            "metasploit.com",
+#            "mongodb.com",
+#            "mongodb.org",
+#            "mysql.com",
+#            "nativescript.org",
+#            "nextjs.org",
+#            "nginx.com",
+#            "nodejs.org",
+#            "php.net",
+#            "polymer-project.org",
+#            "postman.com",
+#            "python.org",
+#            "qt.io",
+#            "rapid7.com",
+#            "reactjs.org",
+#            "realm.io",
+#            "releases.hashicorp.com",
+#            "ruby-doc.org",
+#            "rust-lang.org",
+#            "schema.org",
+#            "seleniumhq.org",
+#            "serialport.io",
+#            "socket.io",
+#            "sonarsource.com",
+#            "splunk.com",
+#            "spring.io",
+#            "sstatic.net",
+#            "swaggerhub.com",
+#            "swift.org",
+#            "symfony.com",
+#            "telerik.com",
+#            "terraform.io",
+#            "traviscistatus.com",
+#            "vagrantup.com",
+#            "vuejs.org",
+#            "vuetifyjs.com",
+#            "web.dev"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "3docean.net",
-#      "codecanyon.net",
-#      "cp.maxcdn.com",
-#      "envato-static.com",
-#      "envato.com",
-#      "graphicriver.net",
-#      "gravatar.com",
-#      "justpaste.it",
-#      "jwplayer.com",
-#      "myfonts.net",
-#      "photodune.net",
-#      "themeforest.net",
-#      "tinyjpg.com",
-#      "tinypng.com",
-#      "toggl.com",
-#      "unsplash.com",
-#      "videohive.net",
-#      "vmcdn.com",
-#      "wpastra.com"
-#     ]
-#    }
-#   ]
-#  },
-#  {
-#   "key": "analytics",
-#   "label": "تحلیل و تبلیغات",
-#   "groups": [
+#      "key": "assets",
+#      "label": "تصویر، فونت و قالب",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "3docean.net",
+#            "codecanyon.net",
+#            "cp.maxcdn.com",
+#            "envato-static.com",
+#            "envato.com",
+#            "graphicriver.net",
+#            "gravatar.com",
+#            "justpaste.it",
+#            "jwplayer.com",
+#            "myfonts.net",
+#            "photodune.net",
+#            "themeforest.net",
+#            "tinyjpg.com",
+#            "tinypng.com",
+#            "toggl.com",
+#            "unsplash.com",
+#            "videohive.net",
+#            "vmcdn.com",
+#            "wpastra.com"
+#          ]
+#        }
+#      ]
+#    },
 #    {
-#     "key": "main",
-#     "label": "همه",
-#     "domains": [
-#      "branch.io",
-#      "bugsnag.com",
-#      "count.ly",
-#      "crashlytics.com",
-#      "expo.io",
-#      "fabric.io",
-#      "fbsbx.com",
-#      "flurry.com",
-#      "fodev.org",
-#      "lightstep.com",
-#      "livefyre.com",
-#      "newrelic.com",
-#      "optimizely.com",
-#      "parsely.com",
-#      "sentry.io"
-#     ]
+#      "key": "analytics",
+#      "label": "تحلیل و تبلیغات",
+#      "groups": [
+#        {
+#          "key": "main",
+#          "label": "همه",
+#          "domains": [
+#            "branch.io",
+#            "bugsnag.com",
+#            "count.ly",
+#            "crashlytics.com",
+#            "expo.io",
+#            "fabric.io",
+#            "fbsbx.com",
+#            "flurry.com",
+#            "fodev.org",
+#            "lightstep.com",
+#            "livefyre.com",
+#            "newrelic.com",
+#            "optimizely.com",
+#            "parsely.com",
+#            "sentry.io"
+#          ]
+#        }
+#      ]
+#    },
+#    {
+#      "key": "bypass",
+#      "label": "دور زده‌ها",
+#      "groups": [
+#        {
+#          "key": "ea",
+#          "label": "EA — سرورهای بازی",
+#          "opt_in": true,
+#          "note": "روشن کردنش بازی‌های EA را از سرور جدا می‌کند — این‌ها روی ۴۴۳ نیستند",
+#          "domains": [
+#            "gosredirector.ea.com",
+#            "blaze.ea.com",
+#            "gameservices.ea.com",
+#            "tnt-ea.com"
+#          ]
+#        },
+#        {
+#          "key": "playstation",
+#          "label": "PlayStation — STUN و API",
+#          "opt_in": true,
+#          "note": "روشن کردنش تشخیص NAT کنسول را خراب می‌کند",
+#          "domains": [
+#            "np.playstation.net",
+#            "np.dl.playstation.net"
+#          ]
+#        },
+#        {
+#          "key": "epic",
+#          "label": "Epic Games — بک‌اند بازی",
+#          "opt_in": true,
+#          "note": "روشن کردنش matchmaking فورتنایت را می‌شکند",
+#          "domains": [
+#            "account-public-service-prod.ol.epicgames.com",
+#            "data-asset-directory-public-service-prod.ol.epicgames.com",
+#            "datarouter.ol.epicgames.com",
+#            "datastorage-public-service-live.ol.epicgames.com",
+#            "ds.svc.live.fngw.ol.epicgames.com",
+#            "events-public-service-live.ol.epicgames.com",
+#            "fn-service-discovery-live-public.ogs.live.on.epicgames.com",
+#            "fn-service-habanero-live-public.ogs.live.on.epicgames.com",
+#            "fngw-svc-ds-livefn.ol.epicgames.com",
+#            "fortnite-public-service-prod11.ol.epicgames.com",
+#            "fortnitecontent-website-prod07.ol.epicgames.com",
+#            "gc.svc.live.fngw.ol.epicgames.com",
+#            "launcher-public-service-prod06.ol.epicgames.com",
+#            "links-public-service-live.ol.epicgames.com",
+#            "mcp-gc.live.fngw.ol.epicgames.com",
+#            "prm-dialogue-public-api-prod.edea.live.use1a.on.epicgames.com"
+#          ]
+#        },
+#        {
+#          "key": "azure",
+#          "label": "Azure — core.windows.net",
+#          "opt_in": true,
+#          "note": "روشن کردنش این اتصال‌ها را قطع می‌کند — SNI در مسیر مخدوش می‌شود",
+#          "domains": [
+#            "core.windows.net"
+#          ]
+#        }
+#      ]
 #    }
-#   ]
-#  }
-# ]
+#  ]
 #}
 #__END_SERVICES__

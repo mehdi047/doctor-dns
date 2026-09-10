@@ -806,7 +806,7 @@ class Store:
                 # backend group would tick it and see nothing happen. The
                 # relay leaves the pins out of a profile that asked to route
                 # them, and keeps them everywhere else.
-                "pins": ("epic", "backend") not in self.template_groups(tid),
+                "pins": ("bypass", "epic") not in self.template_groups(tid),
             }
         return by_ip, profiles
 
