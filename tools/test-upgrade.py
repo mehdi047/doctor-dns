@@ -224,6 +224,27 @@ check("it removes the version file", 'rm -f "$STATE_DIR/version"' in un)
 check("and still leaves the database alone",
       "database left where it is" in un)
 
+print("an upgrade does not forget the domain the machine already has")
+# Everything TLS is gated on PANEL_DOMAIN, including the admin panel and its
+# restart. An upgrade that did not repeat the domain skipped the lot and still
+# announced success - the operator was left on the old admin panel, showing a
+# stale catalogue, with nothing said. The state file cannot answer this: it is
+# truncated at the start of every run.
+recall = src.index('PANEL_DOMAIN="${PANEL_DOMAIN:-}"')
+check("it looks in the relay's sync.env",
+      "/etc/smart-dns/sync.env" in src[recall:recall + 900])
+check("and in the exit's admin.env, which is all that side keeps",
+      "/etc/smart-dns/admin.env" in src[recall:recall + 900])
+check("it says so rather than doing it silently",
+      "keeping the domain this machine already has" in src)
+for name, pat in (("the certificate step", 'step "HTTPS certificate'),
+                  ("the admin panel", 'step "Admin web panel"'),
+                  ("the admin restart", "systemctl restart smartdns-admin.service"),
+                  ("the renewal timer", "enable_service smartdns-cert.timer")):
+    check("%s comes after it" % name, src.index(pat) > recall)
+check("the state file is not what it asks",
+      "recall panel-domain" not in src[recall:recall + 900])
+
 print("every optional summary variable is read defensively")
 # The script runs under `set -u`, and the variables that carry the end-of-run
 # summary are set only on the paths that have something to say. One of them

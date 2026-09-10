@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.4.0"
+VERSION="0.3.5"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -838,6 +838,35 @@ if [ "$ROLE" = relay ]; then
 fi
 
 # ------------------------------------------------------------------- TLS
+# A machine that already has a domain keeps it, even when this run was not
+# told one. Everything below is gated on PANEL_DOMAIN - the certificate, its
+# renewal timer, the admin panel and its restart - so an upgrade that did not
+# repeat the domain skipped all of it and still ended by announcing a
+# successful upgrade. The operator is then left on the previous version of the
+# one page they actually use, with nothing said. That is not hypothetical: it
+# happened here, and the symptom was an admin panel showing a stale service
+# catalogue and a stale warning under every group in it.
+#
+# The state file is no help - it is truncated at the start of every run - so
+# the answer has to come from something the machine keeps for its own sake.
+PANEL_DOMAIN="${PANEL_DOMAIN:-}"
+if [ -z "$PANEL_DOMAIN" ]; then
+    if [ -f /etc/smart-dns/sync.env ]; then
+        PANEL_DOMAIN="$(sed -n 's/^PANEL_DOMAIN=//p' /etc/smart-dns/sync.env \
+                        | head -1 || true)"
+    fi
+    # The exit keeps no sync.env. Its admin.env records where the certificate
+    # is, and that path is /etc/letsencrypt/live/<domain>/fullchain.pem.
+    if [ -z "$PANEL_DOMAIN" ] && [ -f /etc/smart-dns/admin.env ]; then
+        PANEL_DOMAIN="$(sed -n \
+            's#^ADMIN_CERT=/etc/letsencrypt/live/\([^/]*\)/.*#\1#p' \
+            /etc/smart-dns/admin.env | head -1 || true)"
+    fi
+    if [ -n "$PANEL_DOMAIN" ]; then
+        info "keeping the domain this machine already has: $PANEL_DOMAIN"
+    fi
+fi
+
 # The helper goes on every machine, domain or no domain. Without one this run
 # installs no certificate - but the summary at the end tells the operator to
 # come back and run this command once they have a name, and a command that is
