@@ -757,6 +757,40 @@ class Store:
             "SELECT service_key, group_key FROM template_services WHERE template_id = ?",
             (template_id,))}
 
+    def routed_for(self, template_id, catalogue):
+        """Domains this template DOES route, for the relay to hijack.
+
+        The relay writes these as address= rules in the profile's own
+        resolver, rather than inheriting the shared hijack list and taking
+        names back out of it with server= rules. Subtraction cannot work
+        here: both rules would name the same host, dnsmasq's longest match
+        ties, and address= wins - so every un-tick of an ordinary domain was
+        silently ignored. What a profile must not route, it must simply not
+        be told about.
+
+        The custom service is excluded: those domains reach the relay by a
+        different route, and apply_custom_domains writes them per profile.
+        """
+        routed = self.template_groups(template_id)
+        off = self.template_domains_off(template_id)
+        is_default = bool(self.one(
+            "SELECT is_default FROM templates WHERE id = ?",
+            (template_id,))["is_default"])
+        out = []
+        for svc in catalogue:
+            if svc["key"] == "custom":
+                continue
+            for grp in svc["groups"]:
+                # The default template means "everything, now and later", and
+                # the one exception is a group nobody has opted in to.
+                if is_default:
+                    if not grp.get("opt_in"):
+                        out.extend(grp["domains"])
+                    continue
+                if (svc["key"], grp["key"]) in routed:
+                    out.extend(d for d in grp["domains"] if d not in off)
+        return sorted(set(out))
+
     def bypass_for(self, template_id, catalogue):
         """Domains this template does NOT route, so the relay resolves them
         normally and the client goes straight to them."""
@@ -822,6 +856,15 @@ class Store:
             if tid == default_id:
                 continue
             profiles[str(tid)] = {
+                # What this template routes, said positively. The relay used
+                # to inherit the shared hijack list and subtract from it with
+                # server= rules, which dnsmasq resolved the other way whenever
+                # both named the same host - so an un-ticked service kept
+                # routing and nothing said otherwise.
+                "routed": self.routed_for(tid, catalogue),
+                # Still sent: names whose parent this template routes have to
+                # be taken back out, and there the subtraction does work,
+                # because the profile's rule is the longer one.
                 "bypass": self.bypass_for(tid, catalogue),
                 # Listed positively, not by omission: the relay writes these
                 # into this profile's own config, and a template that does not

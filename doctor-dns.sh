@@ -3368,6 +3368,40 @@ exit 0
 #            "SELECT service_key, group_key FROM template_services WHERE template_id = ?",
 #            (template_id,))}
 #
+#    def routed_for(self, template_id, catalogue):
+#        """Domains this template DOES route, for the relay to hijack.
+#
+#        The relay writes these as address= rules in the profile's own
+#        resolver, rather than inheriting the shared hijack list and taking
+#        names back out of it with server= rules. Subtraction cannot work
+#        here: both rules would name the same host, dnsmasq's longest match
+#        ties, and address= wins - so every un-tick of an ordinary domain was
+#        silently ignored. What a profile must not route, it must simply not
+#        be told about.
+#
+#        The custom service is excluded: those domains reach the relay by a
+#        different route, and apply_custom_domains writes them per profile.
+#        """
+#        routed = self.template_groups(template_id)
+#        off = self.template_domains_off(template_id)
+#        is_default = bool(self.one(
+#            "SELECT is_default FROM templates WHERE id = ?",
+#            (template_id,))["is_default"])
+#        out = []
+#        for svc in catalogue:
+#            if svc["key"] == "custom":
+#                continue
+#            for grp in svc["groups"]:
+#                # The default template means "everything, now and later", and
+#                # the one exception is a group nobody has opted in to.
+#                if is_default:
+#                    if not grp.get("opt_in"):
+#                        out.extend(grp["domains"])
+#                    continue
+#                if (svc["key"], grp["key"]) in routed:
+#                    out.extend(d for d in grp["domains"] if d not in off)
+#        return sorted(set(out))
+#
 #    def bypass_for(self, template_id, catalogue):
 #        """Domains this template does NOT route, so the relay resolves them
 #        normally and the client goes straight to them."""
@@ -3433,6 +3467,15 @@ exit 0
 #            if tid == default_id:
 #                continue
 #            profiles[str(tid)] = {
+#                # What this template routes, said positively. The relay used
+#                # to inherit the shared hijack list and subtract from it with
+#                # server= rules, which dnsmasq resolved the other way whenever
+#                # both named the same host - so an un-ticked service kept
+#                # routing and nothing said otherwise.
+#                "routed": self.routed_for(tid, catalogue),
+#                # Still sent: names whose parent this template routes have to
+#                # be taken back out, and there the subtraction does work,
+#                # because the profile's rule is the longer one.
 #                "bypass": self.bypass_for(tid, catalogue),
 #                # Listed positively, not by omission: the relay writes these
 #                # into this profile's own config, and a template that does not
@@ -4352,6 +4395,13 @@ exit 0
 ## each of those is routed is now a tick in a template, and a rule sitting in
 ## a shared file would outrank the tick.
 #BYPASS_CONF = "/etc/dnsmasq.d/bypass.conf"
+## The hijack list itself - every domain the service routes. The resolver on
+## :53 reads it and always will: that one serves the default template, which
+## means "everything". The profiles must not, because which of those names a
+## template routes is a tick in the panel, and a rule in a file every resolver
+## reads cannot be taken back by a rule in one that does not. Both would name
+## the same host, dnsmasq's longest match would tie, and address= would win.
+#HIJACK_CONF = "/etc/dnsmasq.d/smart-dns.conf"
 ## What the profile resolvers read instead of /etc/dnsmasq.d. Same files, minus
 ## the ones decided per template - a profile that does not route something must
 ## not find a rule for it at all.
@@ -4393,7 +4443,8 @@ exit 0
 #            if f.endswith(".conf")
 #            and f not in (os.path.basename(CUSTOM_CONF),
 #                          os.path.basename(EPIC_PINS),
-#                          os.path.basename(BYPASS_CONF))}
+#                          os.path.basename(BYPASS_CONF),
+#                          os.path.basename(HIJACK_CONF))}
 #    have = set(os.listdir(BASE_DIR))
 #    changed = False
 #    for f in want - have:
@@ -4477,12 +4528,19 @@ exit 0
 #        # rules would name the same host and dnsmasq prefers the address= one.
 #        # So absence is the mechanism, which is why this resolver reads
 #        # BASE_DIR rather than /etc/dnsmasq.d.
-#        body += ["address=/%s/%s" % (d, CFG.get("SELF_IP") or "")
+#        # What this template routes, written here rather than inherited.
+#        # Everything not in this list simply has no rule in this resolver, so
+#        # it resolves normally and the client goes straight to it - which is
+#        # what an un-ticked service is supposed to mean.
+#        me = CFG.get("SELF_IP") or ""
+#        body += ["address=/%s/%s" % (d, me)
+#                 for d in sorted(set(spec.get("routed") or []))]
+#        body += ["address=/%s/%s" % (d, me)
 #                 for d in sorted(set(spec.get("custom") or []))]
-#        # These are the names this profile does NOT route. A server= rule is
-#        # more specific than the address= rule that hijacks the parent, so
-#        # dnsmasq's longest match sends them to a real resolver instead of to
-#        # this relay.
+#        # Names whose parent this profile routes, that it must not route
+#        # itself - gosredirector.ea.com under a routed ea.com, say. Here the
+#        # subtraction does work: the profile's rule names a longer host than
+#        # the one hijacking the parent, so longest match prefers it.
 #        body += ["server=/%s/1.1.1.1" % d for d in spec.get("bypass", [])]
 #        # Epic's pins, unless this template asked to route that backend. They
 #        # come last and are address= rules, so where they appear they win -

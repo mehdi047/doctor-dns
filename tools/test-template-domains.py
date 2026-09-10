@@ -194,6 +194,72 @@ rec2.action("template-save", {
 check("no exceptions recorded", store.template_domains_off(tid2) == set(),
       str(store.template_domains_off(tid2)))
 
+print("and what the relay is told is what it can actually obey")
+# The bug this was missing. The panel worked out the right list and the relay
+# wrote it down, and dnsmasq threw it away: every profile also read the shared
+# hijack list, which names each routed domain exactly, and a server= rule
+# subtracting one of them ties on longest match and loses to address=. So an
+# un-ticked service kept routing, for every ordinary domain, silently.
+#
+# The rule the relay has to keep is simple: a domain this template must not
+# route may not have an address= line anywhere the profile's resolver reads.
+sync_spec = importlib.util.spec_from_loader(
+    "sync", importlib.machinery.SourceFileLoader(
+        "sync", os.path.join(HERE, "..", "templates", "smartdns-sync")))
+sync = importlib.util.module_from_spec(sync_spec)
+sync_spec.loader.exec_module(sync)
+
+src = open(os.path.join(HERE, "..", "templates", "smartdns-sync"),
+           encoding="utf-8").read()
+mirror = src[src.index("def sync_base_dir"):]
+mirror = mirror[:mirror.index("return changed")]
+check("the profiles do not read the shared hijack list",
+      "HIJACK_CONF" in mirror, mirror[:300])
+check("which is still where the main resolver's rules live",
+      'HIJACK_CONF = "/etc/dnsmasq.d/smart-dns.conf"' in src)
+
+# A template only becomes a profile once somebody is actually on it.
+store.run("INSERT INTO users (phone, first_name, created_at, status,"
+          " quota_bytes, quota_mode, template_id)"
+          " VALUES ('09120000077', 't', ?, 'active', 0, 'oneoff', ?)",
+          (panel.now(), tid))
+store.run("INSERT INTO ips (user_id, ip, added_at) VALUES"
+          " ((SELECT id FROM users WHERE phone='09120000077'), '198.51.100.7', ?)",
+          (panel.now(),))
+_, profs = store.profiles(CATALOGUE, default)
+spec = profs[str(tid)]
+check("the panel sends what the template routes, positively",
+      "routed" in spec, str(sorted(spec)))
+routed, bypassed = set(spec["routed"]), set(spec["bypass"])
+# Derived from the state this test has built up by now rather than assumed:
+# what the template routes is every domain of a ticked group, less the ones
+# switched off inside it one at a time.
+ticked = store.template_groups(tid)
+off = store.template_domains_off(tid)
+want = {d for svc in CATALOGUE if svc["key"] != "custom"
+        for g in svc["groups"] if (svc["key"], g["key"]) in ticked
+        for d in g["domains"] if d not in off}
+check("routed is exactly the ticked groups less the exceptions",
+      routed == want, str(sorted(routed ^ want)))
+check("every exception is out of it", not (routed & off), str(sorted(routed & off)))
+check("and nothing is in both lists", not (routed & bypassed),
+      str(sorted(routed & bypassed)))
+
+# The conf the relay would write, built the way apply_profiles builds it.
+me = "198.51.100.1"
+body = ["address=/%s/%s" % (d, me) for d in sorted(routed)]
+body += ["server=/%s/1.1.1.1" % d for d in sorted(bypassed)]
+conf = chr(10).join(body)
+for d in sorted(bypassed):
+    if ("address=/%s/" % d) in conf:
+        check("no hijack rule survives for %s" % d, False, conf[:200])
+        break
+else:
+    check("no domain it must not route has a hijack rule", True)
+one = sorted(routed)[0] if routed else ""
+check("and the ones it does route still have theirs",
+      bool(one) and ("address=/%s/%s" % (one, me)) in conf)
+
 shutil.rmtree(tmp, ignore_errors=True)
 print()
 if fails:
