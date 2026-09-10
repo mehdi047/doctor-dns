@@ -5373,13 +5373,66 @@ exit 0
 #            time.sleep(3600)
 #
 #
+## How long a visitor may take to finish the TLS handshake, and then how long
+## any one read or write may stall once it has. Per operation, not in total: a
+## receipt crawling up a slow mobile link keeps making progress and is never
+## cut off, while a connection that has simply gone quiet is let go.
+#HANDSHAKE_TIMEOUT = 10
+#IO_TIMEOUT = 30
+#
+#
+#class PanelServer(http.server.ThreadingHTTPServer):
+#    """The customer panel's server, with TLS done per connection.
+#
+#    It used to wrap the listening socket. That puts every visitor's TLS
+#    handshake inside accept(), on the single thread that accepts for all of
+#    them, with no timeout - so one phone whose connection dropped half way
+#    through a handshake froze the panel for everybody until it went away,
+#    which without a timeout could be never. On mobile networks in Iran that is
+#    an ordinary event, and it was reported as "I sent my receipt and the page
+#    stopped loading".
+#
+#    Here accept() only ever does accept(). The handshake happens in the
+#    connection's own thread, under a deadline, so a stalled visitor stalls
+#    only itself.
+#    """
+#    daemon_threads = True
+#
+#    def __init__(self, addr, handler, ctx):
+#        self.ctx = ctx
+#        super().__init__(addr, handler)
+#
+#    def finish_request(self, request, client_address):
+#        request.settimeout(HANDSHAKE_TIMEOUT)
+#        try:
+#            tls = self.ctx.wrap_socket(request, server_side=True)
+#        except (ssl.SSLError, OSError):
+#            # A scanner, a dropped phone, somebody speaking plain http to an
+#            # https port. Nothing to answer, and nobody else is kept waiting.
+#            return
+#        try:
+#            tls.settimeout(IO_TIMEOUT)
+#            self.RequestHandlerClass(tls, client_address, self)
+#        except (ssl.SSLError, OSError):
+#            pass
+#        finally:
+#            try:
+#                tls.close()
+#            except OSError:
+#                pass
+#
+#
+#def make_panel_server(ctx, port=None):
+#    return PanelServer(("0.0.0.0", PANEL_TLS_PORT if port is None else port),
+#                       UserPanel, ctx)
+#
+#
 #def serve_panel():
 #    cert = "/etc/letsencrypt/live/%s/fullchain.pem" % CFG["PANEL_DOMAIN"]
 #    key = "/etc/letsencrypt/live/%s/privkey.pem" % CFG["PANEL_DOMAIN"]
-#    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", PANEL_TLS_PORT), UserPanel)
 #    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 #    ctx.load_cert_chain(cert, key)
-#    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+#    httpd = make_panel_server(ctx)
 #    print("sync up: every %ds to %s, panel on https://%s:%d/"
 #          % (INTERVAL, CFG["PANEL_HOST"], CFG["PANEL_DOMAIN"], PANEL_TLS_PORT),
 #          flush=True)
