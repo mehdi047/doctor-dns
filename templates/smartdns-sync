@@ -671,9 +671,11 @@ def signup_form(banner=""):
             "<form method='post' action='/signup'>"
             "<label>نام</label>"
             "<input name='name' maxlength='60' autocomplete='name'>"
-            "<label>شماره موبایل</label>"
-            "<input name='phone' inputmode='numeric' required "
-            "placeholder='09123456789' autocomplete='tel'>"
+            "<label>نام کاربری</label>"
+            "<input name='username' required minlength='3' maxlength='32' "
+            "pattern='[A-Za-z0-9._-]{3,32}' placeholder='ali_reza' "
+            "autocapitalize='none' spellcheck='false' "
+            "autocomplete='username'>"
             "<label>رمز عبور (دست‌کم ۸ نویسه)</label>"
             "<input name='password' type='password' required minlength='8' "
             "autocomplete='new-password'>"
@@ -681,8 +683,9 @@ def signup_form(banner=""):
             "<input name='password2' type='password' required minlength='8' "
             "autocomplete='new-password'>"
             "<button>ساخت حساب</button></form>"
-            "<p class='note'>شماره فقط برای شناسایی حساب و تطبیق رسید پرداخت "
-            "است؛ پیامکی فرستاده نمی‌شود.</p>"
+            "<p class='note'>نام کاربری همان چیزی است که با آن وارد می‌شوید — "
+            "حروف انگلیسی، عدد، و . _ - ؛ بزرگ و کوچک فرقی ندارد. اگر قبلاً "
+            "کسی گرفته باشدش، پیغام می‌دهد.</p>"
             "<p class='alt'>حساب دارید؟ <a href='/login'>وارد شوید</a></p>"
             % html.escape(brand()))
 
@@ -691,9 +694,10 @@ def login_form(banner=""):
     return (banner +
             "<h1>ورود</h1><p class='sub'>%s</p>"
             "<form method='post' action='/login'>"
-            "<label>شماره موبایل</label>"
-            "<input name='phone' inputmode='numeric' required "
-            "placeholder='09123456789' autocomplete='tel'>"
+            "<label>نام کاربری</label>"
+            "<input name='username' required maxlength='32' "
+            "autocapitalize='none' spellcheck='false' "
+            "autocomplete='username'>"
             "<label>رمز عبور</label>"
             "<input name='password' type='password' required "
             "autocomplete='current-password'>"
@@ -959,7 +963,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         if path in ("/signup", "/login"):
             form = self.form()
             endpoint = "/user-signup" if path == "/signup" else "/user-password-login"
-            payload = {"phone": form.get("phone", ""),
+            payload = {"username": form.get("username", ""),
                        "password": form.get("password", ""),
                        "ip": self.client_ip()}
             if path == "/signup":

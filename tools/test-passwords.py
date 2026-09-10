@@ -47,9 +47,9 @@ tmp = tempfile.mkdtemp()
 db_path = os.path.join(tmp, "panel.db")
 store = panel.Store(db_path)
 
-store.create_web_user("09120000001", "صاحب حساب", "original-pass")
-owner = store.user_by_phone("09120000001")
-store.create_web_user("09120000002", "دیگری", "other-pass")
+store.create_web_user("owner", "صاحب حساب", "original-pass")
+owner = store.user_by_username("owner")
+store.create_web_user("someone_else", "دیگری", "other-pass")
 session = store.open_session(owner["id"])
 elsewhere = store.open_session(owner["id"])       # the same account, another device
 
@@ -69,9 +69,9 @@ res = api.do_user_password({"session": session, "current": "original-pass",
                             "new": "a-better-password"})
 check("accepted", res.get("ok"), str(res))
 check("the new password works",
-      panel.check_password(store.user_by_phone("09120000001"), "a-better-password"))
+      panel.check_password(store.user_by_username("owner"), "a-better-password"))
 check("the old one does not",
-      not panel.check_password(store.user_by_phone("09120000001"), "original-pass"))
+      not panel.check_password(store.user_by_username("owner"), "original-pass"))
 check("their other session was ended",
       api._session_user(elsewhere) is None)
 check("the session they used still works",
@@ -92,7 +92,7 @@ for body, why in [
     r = api.do_user_password(body)
     check("refuses %s" % why, not r.get("ok"), str(r))
 check("and the password is unchanged",
-      panel.check_password(store.user_by_phone("09120000001"), "a-better-password"))
+      panel.check_password(store.user_by_username("owner"), "a-better-password"))
 
 print("guessing the current password is throttled")
 panel.THROTTLE.clear("pw:%d" % owner["id"])
@@ -106,12 +106,12 @@ check("the ninth attempt is made to wait", "دقیقه" in blocked.get("message"
 
 print("one customer cannot change another's")
 panel.THROTTLE.clear("pw:%d" % owner["id"])
-other = store.open_session(store.user_by_phone("09120000002")["id"])
+other = store.open_session(store.user_by_username("someone_else")["id"])
 api.do_user_password({"session": other, "current": "other-pass",
                       "new": "changed-by-them"})
 check("only their own account moved",
-      panel.check_password(store.user_by_phone("09120000001"), "a-better-password")
-      and panel.check_password(store.user_by_phone("09120000002"),
+      panel.check_password(store.user_by_username("owner"), "a-better-password")
+      and panel.check_password(store.user_by_username("someone_else"),
                                "changed-by-them"))
 
 # ---------------------------------------------------------------- admin

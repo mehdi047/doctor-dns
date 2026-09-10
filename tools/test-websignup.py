@@ -76,7 +76,8 @@ store = panel.Store(db_path)
 
 cols = {r[1]: r for r in store.db.execute("PRAGMA table_info(users)")}
 check("telegram_id is nullable", cols["telegram_id"][3] == 0)
-check("phone column exists", "phone" in cols)
+check("phone column is still there for accounts that had one", "phone" in cols)
+check("username column exists", "username" in cols)
 check("password_hash column exists", "password_hash" in cols)
 check("template_id survived the rebuild", "template_id" in cols)
 check("warned survived the rebuild", "warned" in cols)
@@ -102,18 +103,28 @@ store2 = panel.Store(db_path)
 check("second open is a no-op",
       store2.one("SELECT COUNT(*) c FROM users")["c"] == 1)
 
-print("phone normalisation")
-for raw_in, want in [("09123456789", "09123456789"),
-                     ("9123456789", "09123456789"),
-                     ("+989123456789", "09123456789"),
-                     ("0098 912 345 6789", "09123456789"),
-                     ("۰۹۱۲۳۴۵۶۷۸۹", "09123456789"),
-                     ("0912-345-6789", "09123456789"),
-                     ("021 88776655", ""),
-                     ("", ""),
-                     ("abc", "")]:
-    got = panel.normal_phone(raw_in)
-    check("normal_phone(%r) -> %r" % (raw_in, want), got == want, "got %r" % got)
+print("usernames are reduced to one form")
+# Case is the one that matters. Somebody who signs up as Ali and comes back as
+# ali is one person, and must neither become two accounts nor be told their own
+# name is taken.
+for raw_in, want in [("ali", "ali"),
+                     ("Ali", "ali"),
+                     ("  ALI_reza  ", "ali_reza"),
+                     ("ali.reza-99", "ali.reza-99"),
+                     ("ab", ""),
+                     ("a" * 33, ""),
+                     ("ali reza", ""),
+                     ("ali@example.com", ""),
+                     ("...", ""),
+                     ("۰۹۱۲۳۴۵۶۷۸۹", ""),
+                     ("", "")]:
+    got = panel.normal_username(raw_in)
+    check("normal_username(%r) -> %r" % (raw_in, want), got == want,
+          "got %r" % got)
+
+check("the unique index on it exists",
+      any("users_username" in (r[0] or "") for r in store.db.execute(
+          "SELECT name FROM sqlite_master WHERE type='index'")))
 
 
 class FakeHandler:
@@ -131,12 +142,12 @@ CATALOGUE = panel.load_catalogue() + [panel.CUSTOM_SERVICE]
 DEFAULT = store.ensure_default_template(CATALOGUE)["id"]
 
 print("signup")
-res = api.do_user_signup({"phone": "۰۹۱۲۱۱۱۲۲۳۳", "password": "hunter2!!",
+res = api.do_user_signup({"username": "Ali_Reza", "password": "hunter2!!",
                           "name": "علی", "ip": "198.51.100.5"})
 check("signup succeeds", res.get("ok"), str(res))
 session = res.get("session", "")
 check("signup returns a session", bool(session))
-u = store.user_by_phone("09121112233")
+u = store.user_by_username("ali_reza")
 check("account exists with a null telegram_id", u and u["telegram_id"] is None)
 # Signing up gets an account, not traffic. The trap worth a test of its own
 # is quota_bytes: zero means unlimited everywhere in the panel, so an account
@@ -149,13 +160,13 @@ check("it does not renew itself", u["quota_mode"] == "oneoff", u["quota_mode"])
 check("no address registered yet", not store.user_ips(u["id"]))
 
 check("short password refused",
-      not api.do_user_signup({"phone": "09121112244", "password": "short",
+      not api.do_user_signup({"username": "someone", "password": "short",
                               "ip": "198.51.100.6"}).get("ok"))
-check("bad phone refused",
-      not api.do_user_signup({"phone": "12345", "password": "hunter2!!",
+check("a username that is too short is refused",
+      not api.do_user_signup({"username": "ab", "password": "hunter2!!",
                               "ip": "198.51.100.7"}).get("ok"))
-check("duplicate phone refused",
-      not api.do_user_signup({"phone": "0912 111 2233", "password": "hunter2!!",
+check("a name already taken is refused, whatever the case",
+      not api.do_user_signup({"username": "ALI_REZA", "password": "hunter2!!",
                               "ip": "198.51.100.8"}).get("ok"))
 
 print("the address page's button")
@@ -175,7 +186,7 @@ check("it is not in the allowlist",
       str(dict(store.profiles(CATALOGUE, DEFAULT)[0])))
 panel.enforce_quotas(store)
 check("and the sweep leaves it pending rather than expiring it",
-      store.user_by_phone("09121112233")["status"] == "pending")
+      store.user_by_username("ali_reza")["status"] == "pending")
 
 print("an operator giving it a plan is what turns it on")
 store.run("UPDATE users SET quota_bytes = ?, status = 'active' WHERE id = ?",
@@ -188,7 +199,7 @@ store.run("UPDATE users SET expires_at = ? WHERE id = ?",
           ((panel.datetime.now(panel.timezone.utc)
             - panel.timedelta(minutes=1)).isoformat(timespec="seconds"), u["id"]))
 panel.enforce_quotas(store)
-after = store.user_by_phone("09121112233")
+after = store.user_by_username("ali_reza")
 check("the account is marked expired", after["status"] == "expired", after["status"])
 check("an expired account is not in the allowlist",
       "203.0.113.80" not in dict(store.profiles(CATALOGUE, DEFAULT)[0]),
@@ -198,18 +209,37 @@ store.run("UPDATE users SET status = 'active', expires_at = ? WHERE id = ?",
             + panel.timedelta(days=1)).isoformat(timespec="seconds"), u["id"]))
 panel.enforce_quotas(store)
 check("an unexpired account is left alone",
-      store.user_by_phone("09121112233")["status"] == "active")
+      store.user_by_username("ali_reza")["status"] == "active")
 
+
+print("two people cannot hold the same name")
+# The check in the endpoint and the unique index say the same thing, and both
+# have to. The check gives the sentence; the index is what actually decides
+# when two signups arrive in the same instant.
+taken = api.do_user_signup({"username": "ali_reza", "password": "hunter2!!",
+                            "ip": "198.51.100.30"})
+check("a second claim is refused", not taken.get("ok"), str(taken))
+check("and says the name is taken", "نام کاربری" in taken.get("message", ""),
+      taken.get("message", ""))
+check("still only one account has it",
+      store.one("SELECT COUNT(*) c FROM users WHERE username = 'ali_reza'")["c"] == 1)
+import sqlite3 as _s
+try:
+    store.run("INSERT INTO users (username, first_name, created_at)"
+              " VALUES ('ali_reza', 'x', ?)", (panel.now(),))
+    check("the database refuses it too", False, "the insert was allowed")
+except _s.IntegrityError:
+    check("the database refuses it too", True)
 
 print("login")
 check("right password works",
-      api.do_user_password_login({"phone": "09121112233",
+      api.do_user_password_login({"username": "ali_reza",
                                   "password": "hunter2!!",
                                   "ip": "198.51.100.16"}).get("ok"))
-bad = api.do_user_password_login({"phone": "09121112233", "password": "wrong",
+bad = api.do_user_password_login({"username": "ali_reza", "password": "wrong",
                                   "ip": "198.51.100.16"})
 check("wrong password refused", not bad.get("ok"))
-unknown = api.do_user_password_login({"phone": "09129999999", "password": "wrong",
+unknown = api.do_user_password_login({"username": "nobody_here", "password": "wrong",
                                       "ip": "198.51.100.17"})
 check("unknown number gives the same message as a wrong password",
       unknown.get("message") == bad.get("message"))
@@ -217,14 +247,14 @@ check("unknown number gives the same message as a wrong password",
 print("throttling")
 panel.THROTTLE.clear("login:198.51.100.27")
 for _ in range(8):
-    api.do_user_password_login({"phone": "09121112233", "password": "no",
+    api.do_user_password_login({"username": "ali_reza", "password": "no",
                                 "ip": "198.51.100.27"})
-blocked = api.do_user_password_login({"phone": "09121112233", "password": "no",
+blocked = api.do_user_password_login({"username": "ali_reza", "password": "no",
                                       "ip": "198.51.100.27"})
 check("ninth attempt from one address is throttled",
       "دقیقه" in blocked.get("message", ""), str(blocked))
 check("a different address is unaffected",
-      api.do_user_password_login({"phone": "09121112233", "password": "hunter2!!",
+      api.do_user_password_login({"username": "ali_reza", "password": "hunter2!!",
                                   "ip": "198.51.100.28"}).get("ok"))
 
 print("dashboard data")
@@ -318,14 +348,14 @@ for n in ("action", "redirect", "send"):
     setattr(Rec, n, getattr(admin.Admin, n))
 Rec.one = staticmethod(admin.Admin.one)
 
-res = api.do_user_signup({"phone": "09129998877", "password": "hunter2!!",
+res = api.do_user_signup({"username": "zahra", "password": "hunter2!!",
                           "name": "زهرا", "ip": "198.51.100.20"})
-waiting = store.user_by_phone("09129998877")
+waiting = store.user_by_username("zahra")
 check("the second signup is pending too", waiting["status"] == "pending")
 
 Rec().action("user-save", {"id": [str(waiting["id"])], "quota_gb": ["5"],
                            "days": ["30"]})
-now_on = store.user_by_phone("09129998877")
+now_on = store.user_by_username("zahra")
 check("saving a plan activates it", now_on["status"] == "active",
       now_on["status"])
 check("with the quota that was typed",
@@ -339,8 +369,8 @@ store.run("UPDATE users SET status = 'suspended' WHERE id = ?", (now_on["id"],))
 Rec().action("user-save", {"id": [str(now_on["id"])], "quota_gb": ["9"],
                            "days": [""]})
 check("a suspended account stays suspended when its plan is edited",
-      store.user_by_phone("09129998877")["status"] == "suspended",
-      store.user_by_phone("09129998877")["status"])
+      store.user_by_username("zahra")["status"] == "suspended",
+      store.user_by_username("zahra")["status"])
 
 shutil.rmtree(tmp, ignore_errors=True)
 print()

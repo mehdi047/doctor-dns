@@ -539,7 +539,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
     def receipts(self):
         p = CFG["ADMIN_PATH"]
         rows = STORE.q(
-            "SELECT t.*, u.first_name, u.phone, u.telegram_id,"
+            "SELECT t.*, u.first_name, u.username, u.phone, u.telegram_id,"
             " length(t.receipt_blob) AS size"
             " FROM transactions t JOIN users u ON u.id = t.user_id"
             " ORDER BY CASE t.status WHEN 'pending' THEN 0 ELSE 1 END,"
@@ -550,7 +550,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
             out.append("<p class='muted'>رسیدی نرسیده.</p>")
         for r in pending:
             who = (r["first_name"] or "") + " · " + (
-                r["phone"] or str(r["telegram_id"] or "#%d" % r["user_id"]))
+                r["username"] or r["phone"]
+                or str(r["telegram_id"] or "#%d" % r["user_id"]))
             out.append(
                 "<div class='receipt'>"
                 "<div class='who'>%s<span class='muted'> · %s · %s</span></div>"
@@ -583,7 +584,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 out.append("<tr><td>%s</td><td>%s</td><td class='%s'>%s</td>"
                            "<td>%s</td></tr>"
                            % (html.escape((r["first_name"] or "") + " · " +
-                                          (r["phone"] or "")),
+                                          (r["username"] or r["phone"] or "")),
                               html.escape(r["created_at"][:16]),
                               "ok" if r["status"] == "approved" else "bad",
                               "تأیید شد" if r["status"] == "approved" else "رد شد",
@@ -923,7 +924,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
         out = ["<div class='card'><h2>کاربران (%d)</h2>" % len(rows)]
         if not rows:
             return "".join(out) + "<p class='muted'>هنوز کسی ثبت‌نام نکرده.</p></div>"
-        out.append("<table><tr><th>شناسه</th><th>آی‌پی</th><th>مصرف</th>"
+        out.append("<table><tr><th>نام کاربری</th><th>آی‌پی</th><th>مصرف</th>"
                    "<th>سهمیه (گیگ)</th><th>سرعت Mb/s</th><th>زمان (روز)</th>"
                    "<th>قالب</th><th>وضعیت</th><th></th></tr>")
         p = CFG["ADMIN_PATH"]
@@ -969,12 +970,13 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 "<input type='hidden' name='id' value='%d'>"
                 "<button class='ghost' title='صفر کردن مصرف'>صفر</button></form>"
                 "</td></tr>"
-                # A web account has no Telegram id and a bot account has no
-                # phone, so the column shows whichever this account has - and
-                # the row number when it somehow has neither.
-                % (html.escape(str(r["telegram_id"] or r["phone"]
-                                   or "#%d" % r["id"])),
-                   html.escape(r["first_name"] or r["username"] or ""),
+                # What a customer signs in with. Accounts opened before this
+                # was a username have a phone number instead, and the ones
+                # that came through the bot have neither - so the column shows
+                # whichever this account actually has.
+                % (html.escape(str(r["username"] or r["phone"]
+                                   or r["telegram_id"] or "#%d" % r["id"])),
+                   html.escape(r["first_name"] or ""),
                    html.escape(r["ip"] or "-"), human(r["used_bytes"]),
                    r["id"], p, r["id"], r["id"], r["id"], quota_gb,
                    r["id"], speed_mb, r["id"], left,

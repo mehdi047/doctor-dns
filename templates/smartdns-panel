@@ -261,6 +261,12 @@ MIGRATIONS = [
 # thing to sqlite, so this makes both paths end up identical.
 INDEXES = [
     "CREATE UNIQUE INDEX IF NOT EXISTS users_phone ON users(phone)",
+    # What a customer signs in with. The column predates this - it held the
+    # Telegram handle - and sqlite cannot add UNIQUE to a column that is
+    # already there, so the constraint arrives as an index instead. Nulls do
+    # not collide in a unique index, which is what accounts that never had one
+    # need.
+    "CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)",
 ]
 
 # Where the installer puts the service catalogue - which brands exist, which
@@ -388,6 +394,24 @@ def normal_phone(s):
     if len(digits) == 10 and digits.startswith("9"):
         return "0" + digits
     return ""
+
+
+def normal_username(s):
+    """Reduce a username to one canonical form, or return "".
+
+    Lowercased, because somebody who signs up as Ali and comes back as ali is
+    the same person and must not be able to become two accounts - nor be told
+    their own name is taken. Letters, digits, dot, dash and underscore only:
+    this ends up in log lines and in the operator's panel, and a name carrying
+    spaces or control characters is a nuisance in both.
+    """
+    v = (s or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9._-]{3,32}", v):
+        return ""
+    # A name that is only punctuation is not a name.
+    if not any(c.isalnum() for c in v):
+        return ""
+    return v
 
 
 def hash_password(password, salt):
@@ -653,7 +677,10 @@ class Store:
     def user_by_phone(self, phone):
         return self.one("SELECT * FROM users WHERE phone = ?", (phone,))
 
-    def create_web_user(self, phone, first_name, password):
+    def user_by_username(self, username):
+        return self.one("SELECT * FROM users WHERE username = ?", (username,))
+
+    def create_web_user(self, username, first_name, password):
         """Open an account from the web panel, with no Telegram behind it.
 
         It starts with nothing, the same as one opened any other way - the way
@@ -664,13 +691,13 @@ class Store:
         salt = secrets.token_hex(16)
         self.run(
             "INSERT INTO users"
-            " (telegram_id, phone, password_hash, password_salt, first_name,"
+            " (telegram_id, username, password_hash, password_salt, first_name,"
             "  created_at, status, quota_bytes, quota_mode, quota_reset_at,"
             "  expires_at)"
             " VALUES (NULL, ?, ?, ?, ?, ?, 'pending', 0, 'oneoff', NULL, NULL)",
-            (phone, hash_password(password, salt), salt, first_name, now()),
+            (username, hash_password(password, salt), salt, first_name, now()),
         )
-        return self.user_by_phone(phone)
+        return self.user_by_username(username)
 
     def set_password(self, user_id, password):
         salt = secrets.token_hex(16)
@@ -1206,8 +1233,8 @@ class API(http.server.BaseHTTPRequestHandler):
 
         The address is not registered here. Signing up and pointing the service
         at a connection are two different decisions - somebody may well sign up
-        on their phone's mobile data and only afterwards go and register the
-        home line - so the next page asks, showing the address it can see.
+        on mobile data and only afterwards go and register the home line - so
+        the next page asks, showing the address it can see.
         """
         ip = body.get("ip", "")
         ok, wait = THROTTLE.check("signup:%s" % ip, limit=4, window=3600)
@@ -1216,27 +1243,31 @@ class API(http.server.BaseHTTPRequestHandler):
                     "تعداد ثبت‌نام از این اینترنت زیاد بوده. %d دقیقه دیگر."
                     % max(1, wait // 60)}
 
-        phone = normal_phone(body.get("phone"))
-        if not phone:
-            return {"ok": False,
-                    "message": "شماره موبایل درست نیست. مثل ۰۹۱۲۳۴۵۶۷۸۹ بنویسید"}
+        username = normal_username(body.get("username"))
+        if not username:
+            return {"ok": False, "message":
+                    "نام کاربری باید ۳ تا ۳۲ نویسه باشد — حروف انگلیسی، عدد،"
+                    " و . _ -"}
         password = body.get("password") or ""
         if len(password) < 8:
             return {"ok": False, "message": "رمز باید دست‌کم ۸ نویسه باشد"}
         name = (body.get("name") or "").strip()[:60]
 
-        if self.store.user_by_phone(phone):
+        if self.store.user_by_username(username):
             return {"ok": False,
-                    "message": "این شماره قبلاً ثبت شده. وارد شوید"}
+                    "message": "این نام کاربری قبلاً گرفته شده. یکی دیگر"
+                               " بنویسید یا وارد شوید"}
         try:
-            user = self.store.create_web_user(phone, name, password)
+            user = self.store.create_web_user(username, name, password)
         except sqlite3.IntegrityError:
-            # Two signups with the same number at the same moment. The unique
-            # index is what actually decides; this only turns it into a
-            # sentence.
-            return {"ok": False, "message": "این شماره قبلاً ثبت شده. وارد شوید"}
+            # Two signups claiming the same name in the same instant. The
+            # unique index is what actually decides between them; this only
+            # turns its answer into a sentence.
+            return {"ok": False,
+                    "message": "این نام کاربری قبلاً گرفته شده. یکی دیگر"
+                               " بنویسید یا وارد شوید"}
         THROTTLE.hit("signup:%s" % ip)
-        print("web signup: %s (#%d) from %s" % (phone, user["id"], ip), flush=True)
+        print("web signup: %s (#%d) from %s" % (username, user["id"], ip), flush=True)
         return {"ok": True, "session": self.store.open_session(user["id"]),
                 "message": "حساب ساخته شد"}
 
@@ -1248,13 +1279,13 @@ class API(http.server.BaseHTTPRequestHandler):
                     "تلاش زیاد بوده. %d دقیقه دیگر امتحان کنید."
                     % max(1, wait // 60)}
 
-        phone = normal_phone(body.get("phone"))
-        user = self.store.user_by_phone(phone) if phone else None
-        # One message for a wrong number and a wrong password. Two different
-        # messages tell anybody who asks which numbers have accounts.
+        username = normal_username(body.get("username"))
+        user = self.store.user_by_username(username) if username else None
+        # One message for an unknown name and a wrong password. Two different
+        # messages tell anybody who asks which names have accounts.
         if not user or not check_password(user, body.get("password") or ""):
             THROTTLE.hit("login:%s" % ip)
-            return {"ok": False, "message": "شماره یا رمز درست نیست"}
+            return {"ok": False, "message": "نام کاربری یا رمز درست نیست"}
         THROTTLE.clear("login:%s" % ip)
         return {"ok": True, "session": self.store.open_session(user["id"])}
 
