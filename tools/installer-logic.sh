@@ -38,7 +38,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # What this file is. Written to the machine once an install finishes, so the
 # next run can tell whether it is an upgrade, a re-run, or somebody about to
 # put an older version over a newer one by accident.
-VERSION="0.3.6"
+VERSION="0.3.7"
 
 # What this install did, so uninstall can undo exactly that and nothing more.
 # Without it, removal would be guesswork: whether dnsmasq was ours or already
@@ -442,6 +442,40 @@ elif [ -n "$INSTALLED_VERSION" ]; then
     info "already at $VERSION - re-running to check and repair"
 fi
 
+# An upgrade asks nothing the machine already knows. Every answer the first
+# install was given is still here: the state file records the role and both
+# addresses on every run, and the domain sits in the config the panel serves
+# from. So an upgrade reads them back, keeps the one-time choices - swap, BBR -
+# exactly as they are, and the only question it has is the one above: whether
+# to install this version at all. It used to walk the whole questionnaire
+# again, addresses and all, as if the machine had never been set up.
+UPGRADE=""
+if [ -n "$INSTALLED_VERSION" ]; then
+    UPGRADE=1
+    was() { recall "$1" 2>/dev/null | tail -1 || true; }
+    ROLE="${ROLE:-$(was role)}"
+    if [ -z "$ROLE" ]; then
+        if [ -f /etc/smart-dns/sync.env ]; then ROLE=relay
+        elif [ -f /etc/smart-dns/panel.env ]; then ROLE=exit
+        fi
+    fi
+    if [ "$ROLE" = relay ]; then
+        PEER_IP="${PEER_IP:-$(was exit-ip)}"
+        SELF_IP="${SELF_IP:-$(was relay-ip)}"
+        # Older state files, or none: the relay's own config has both.
+        [ -n "$PEER_IP" ] || PEER_IP="$(sed -n 's/^PANEL_HOST=//p' /etc/smart-dns/sync.env 2>/dev/null | head -1 || true)"
+        [ -n "$SELF_IP" ] || SELF_IP="$(sed -n 's/^SELF_IP=//p' /etc/smart-dns/sync.env 2>/dev/null | head -1 || true)"
+    elif [ "$ROLE" = exit ]; then
+        PEER_IP="${PEER_IP:-$(was relay-ip)}"
+        SELF_IP="${SELF_IP:-$(was exit-ip)}"
+        # panel.env holds every relay this exit serves, comma separated. Any of
+        # them will do here: it is already on the list, so nothing is added.
+        [ -n "$PEER_IP" ] || PEER_IP="$(sed -n 's/^RELAY_IP=//p' /etc/smart-dns/panel.env 2>/dev/null | head -1 | cut -d, -f1 || true)"
+    fi
+    PANEL_DOMAIN="${PANEL_DOMAIN:-$(was panel-domain)}"
+    info "upgrading this ${ROLE:-machine} in place - nothing to answer"
+fi
+
 # ---------------------------------------------------------------- questions
 valid_ip() {
     local ip="$1" part
@@ -502,7 +536,7 @@ fi
 # and one database is what makes a customer's allowance mean the same thing on
 # all of them. The exit builds it unasked; the relay asks for the pairing token
 # the exit prints at the end of its own install.
-if [ "$ROLE" = relay ] && [ -z "${SYNC_TOKEN:-}" ] && [ -z "${ASSUME_YES:-}" ]; then
+if [ "$ROLE" = relay ] && [ -z "${SYNC_TOKEN:-}" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ]; then
     printf '\n%sPanel%s (optional - press enter to skip)\n\n' "$B" "$N"
     printf '  The exit server prints a pairing token at the end of its install.\n'
     read -r -p "  pairing token: " SYNC_TOKEN
@@ -511,7 +545,7 @@ fi
 # Optional, like the panel. Without it the claim link is plain http, which
 # works but sends the registration token in the clear - anyone on the path can
 # take it and register their own address against the user's account.
-if [ -z "${PANEL_DOMAIN:-}" ] && [ -z "${ASSUME_YES:-}" ]; then
+if [ -z "${PANEL_DOMAIN:-}" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ]; then
     printf '\n%sHTTPS%s (optional - press enter to skip)\n\n' "$B" "$N"
     if [ "$ROLE" = relay ]; then
         printf '  A name pointing at this machine, for the page users open to\n'
@@ -532,7 +566,7 @@ fi
 
 printf '\n%sAbout to configure:%s\n' "$B" "$N"
 printf '    role   : %s\n    relay  : %s\n    exit   : %s\n\n' "$ROLE" "$RELAY_IP" "$EXIT_IP"
-if [ -z "${ASSUME_YES:-}" ]; then
+if [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ]; then
     read -r -p "  proceed? [y/N]: " ok
     case "$ok" in y|Y|yes) ;; *) die "cancelled" ;; esac
 fi
@@ -590,10 +624,23 @@ else
     NEW_PACKAGES="$(echo "$NEW_PACKAGES" | xargs || true)"
 fi
 [ -n "$NEW_PACKAGES" ] && remember packages-installed "$NEW_PACKAGES"
-apt-get update -qq
-# shellcheck disable=SC2086
-apt-get install -y -qq $WANT >/dev/null
-info "done"
+# Only what is missing, and apt is not touched at all when nothing is. It used
+# to run apt-get update and reinstall the whole list on every run, which made
+# an upgrade slow and quietly upgraded the operator's nginx along the way -
+# neither of which an upgrade of this service was asked to do. dpkg-query, not
+# dpkg -s: a package removed but not purged still answers dpkg -s happily.
+missing=""
+for pkg in $WANT; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" || missing="$missing $pkg"
+done
+if [ -n "$missing" ]; then
+    apt-get update -qq
+    # shellcheck disable=SC2086
+    apt-get install -y -qq $missing >/dev/null
+    info "installed:$missing"
+else
+    info "all present"
+fi
 
 # ---------------------------------------------------------------- kernel
 # ------------------------------------------------------------------- swap
@@ -602,7 +649,7 @@ info "done"
 # connections at once, and being killed for it is worse than being slow - but
 # it is the operator's disk, so it is never created behind their back.
 HAVE_SWAP="$(free -m | awk '/Swap/{print $2}')"
-if [ -z "${SWAP_GB:-}" ] && [ -z "${ASSUME_YES:-}" ]; then
+if [ -z "${SWAP_GB:-}" ] && [ -z "${ASSUME_YES:-}" ] && [ -z "$UPGRADE" ]; then
     if [ "${HAVE_SWAP:-0}" = 0 ]; then
         printf '\n%sThis machine has no swap.%s\n\n' "$B" "$N"
         read -r -p "  create a swap file? size in GB, or enter to skip: " SWAP_GB
@@ -650,7 +697,7 @@ BBR_FILE=/etc/sysctl.d/99-smartdns-bbr.conf
 # rather than assumed. On a non-interactive run the existing choice stands,
 # which means an upgrade never silently changes how a working server behaves.
 if [ -z "${ENABLE_BBR:-}" ]; then
-    if [ -n "${ASSUME_YES:-}" ]; then
+    if [ -n "${ASSUME_YES:-}" ] || [ -n "$UPGRADE" ]; then
         # Keep whatever the machine is already doing. The running value matters
         # as much as the file: earlier versions set bbr from the main tuning
         # file, so on those machines there is no bbr file to find, and deciding

@@ -206,6 +206,81 @@ r = run(ASSUME_YES="1")
 out = r.stdout + r.stderr
 check("a downgrade does not", "REACHED-INSTALL" not in out, out[-300:])
 
+print("an upgrade reads its answers back instead of asking")
+# The same real block, now with the state file an earlier install left. It
+# records the role and both addresses on every run - so an upgrade should come
+# out of the version check already knowing all three, and the domain.
+harness2 = os.path.join(tmp, "upgrade.sh")
+open(harness2, "w", newline="\n", encoding="utf-8").write(
+    "#!/usr/bin/env bash\nset -euo pipefail\n"
+    'VERSION="%s"\nSTAMP=fixed\n' % VERSION +
+    'STATE_DIR="%s"\nBACKUP_DIR="%s"\n' % (posix(state), posix(backup)) +
+    'STATE="%s/install-state"\n' % posix(state) +
+    "recall() { [ -f \"$STATE\" ] && awk -v k=\"$1\" "
+    "'$1 == k { $1 = \"\"; sub(/^ /, \"\"); print }' \"$STATE\"; }\n" +
+    head +
+    'info() { printf "    %s\\n" "$*"; }\n'
+    'warn() { printf "    %s\\n" "$*"; }\n'
+    'die()  { printf "ERROR: %s\\n" "$*" >&2; exit 1; }\n' +
+    block +
+    '\nprintf "ROLE=%s PEER=%s SELF=%s DOMAIN=%s UPGRADE=%s\\n" '
+    '"${ROLE:-}" "${PEER_IP:-}" "${SELF_IP:-}" "${PANEL_DOMAIN:-}" "${UPGRADE:-}"\n')
+
+
+def upgrade_run(state_lines, installed="0.1.0", answer="y\n"):
+    put_version(installed)
+    sf = os.path.join(state, "install-state")
+    if state_lines is None:
+        if os.path.exists(sf):
+            os.remove(sf)
+    else:
+        open(sf, "w", newline="\n").write("\n".join(state_lines) + "\n")
+    r = subprocess.run([BASH, posix(harness2)], input=answer.encode(),
+                       capture_output=True, timeout=120)
+    out = r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace")
+    found = {}
+    for line in out.splitlines():
+        if line.startswith("ROLE="):
+            found = dict(kv.split("=", 1) for kv in line.split())
+    return found, out
+
+
+got, out = upgrade_run(["role relay", "relay-ip 203.0.113.10",
+                        "exit-ip 198.51.100.20", "panel-domain panel.example.com"])
+check("a relay knows it is a relay", got.get("ROLE") == "relay", out[-300:])
+check("and that its peer is the exit", got.get("PEER") == "198.51.100.20", str(got))
+check("and its own address", got.get("SELF") == "203.0.113.10", str(got))
+check("and its domain", got.get("DOMAIN") == "panel.example.com", str(got))
+check("and that this is an upgrade", got.get("UPGRADE") == "1", str(got))
+check("and it says it will ask nothing", "nothing to answer" in out, out[-300:])
+
+got, out = upgrade_run(["role exit", "relay-ip 203.0.113.10",
+                        "exit-ip 198.51.100.20"])
+check("an exit's peer is the relay", got.get("PEER") == "203.0.113.10", str(got))
+check("and its own address is the exit's", got.get("SELF") == "198.51.100.20",
+      str(got))
+
+got, out = upgrade_run(None, installed=None)
+check("a fresh machine is not an upgrade", got.get("UPGRADE") == "", str(got))
+check("and knows nothing yet, so the questions still come",
+      got.get("ROLE") == "" and got.get("PEER") == "", str(got))
+
+print("and nothing in the questionnaire is asked of an upgrade")
+logic = open(os.path.join(HERE, "installer-logic.sh"), encoding="utf-8").read()
+for what, pat in (
+        ("the pairing token", r'SYNC_TOKEN:-\}" \] && \[ -z "\$\{ASSUME_YES:-\}" \] && \[ -z "\$UPGRADE" \]'),
+        ("the domain", r'PANEL_DOMAIN:-\}" \] && \[ -z "\$\{ASSUME_YES:-\}" \] && \[ -z "\$UPGRADE" \]'),
+        ("proceed?", r'if \[ -z "\$\{ASSUME_YES:-\}" \] && \[ -z "\$UPGRADE" \]; then\n    read -r -p "  proceed\?'),
+        ("swap", r'SWAP_GB:-\}" \] && \[ -z "\$\{ASSUME_YES:-\}" \] && \[ -z "\$UPGRADE" \]'),
+        ("BBR", r'ASSUME_YES:-\}" \] \|\| \[ -n "\$UPGRADE" \]; then\n        # Keep whatever')):
+    check("%s is skipped" % what, re.search(pat, logic) is not None)
+check("the role and addresses need no guard: they are set before the questions",
+      logic.index('UPGRADE=""') < logic.index('ROLE="${ROLE:-}"; PEER_IP'))
+check("apt runs only when something is missing",
+      "if [ -n \"$missing\" ]; then\n    apt-get update -qq" in logic)
+check("and never reinstalls the whole list",
+      "apt-get install -y -qq $WANT" not in logic)
+
 print("the version is recorded only by a run that finished")
 tail = src[src.index('if [ "$fail" = 0 ]; then'):]
 tail = tail[:tail.index("else")]
