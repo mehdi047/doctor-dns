@@ -550,7 +550,7 @@ ADMIN_URL_OUT=""
 ADMIN_PASS_OUT=""
 SYNC_TOKEN_OUT=""
 USER_PANEL_OUT=""
-AUTO_ENFORCE_OUT=""
+ENFORCE_OUT=""
 
 # Start the record over, but keep what an earlier install already knew: which
 # packages were new and which files existed before we ever touched them. Those
@@ -1189,19 +1189,27 @@ EOF
     if [ -n "${PANEL_DOMAIN:-}" ]; then
         USER_PANEL_OUT="https://$PANEL_DOMAIN:8443/"
     fi
-    # Ask for the relay to be closed as soon as there is somebody to allow.
-    # It cannot be closed here: a relay is paired before anyone has registered,
-    # and enforcing against an empty allowlist cuts off everyone including
-    # whoever is running this. The sync agent acts on this note at the first
-    # sync that brings an address, and `smartdns-acl enforce off` cancels it.
+    # Closed from the moment it is installed. This used to wait for the first
+    # customer to register before shutting the door, on the reasoning that
+    # enforcing against an empty allowlist cuts everyone off - but on a fresh
+    # relay there is nobody to cut off, and what "waiting" really means is a
+    # relay that anybody who learns its address can use for free, for as long
+    # as it takes somebody to notice.
+    #
+    # Nothing here is at risk from it. SSH is never gated, the customer panel
+    # is on a port the gate does not touch, and the certificate challenge is
+    # redirected in prerouting so it reaches certbot before the gate ever sees
+    # a packet on 80.
+    rm -f /etc/smart-dns/auto-enforce
     if [ "${ENFORCE:-yes}" = no ]; then
-        rm -f /etc/smart-dns/auto-enforce
-        info "ENFORCE=no - this relay will stay open until you close it by hand"
-    elif [ -f /etc/nftables.d/30-smartdns-enforce.conf ]; then
-        info "access control is already on"
+        info "ENFORCE=no - this relay is open to everyone until you close it:"
+        info "    smartdns-acl enforce on"
+    elif smartdns-acl enforce on --yes --allow-empty >/dev/null 2>&1; then
+        ENFORCE_OUT=1
+        info "access control is on - only registered addresses get through"
     else
-        : > /etc/smart-dns/auto-enforce
-        AUTO_ENFORCE_OUT=1
+        warn "could not switch access control on - this relay is open."
+        warn "close it by hand once you have looked:  smartdns-acl enforce on"
     fi
     if systemctl is-active --quiet smartdns-sync.service; then
         info "syncing with the panel at $PANEL_HOST every 30s"
@@ -1295,15 +1303,18 @@ else
 ' "$RELAY_IP"
 fi
 
-if [ -n "$AUTO_ENFORCE_OUT" ]; then
-    printf '    %sAccess control%s - this relay is open right now, because nobody has
-    registered an address yet and closing it on an empty list would cut off
-    everyone. It closes itself the moment the first address is registered,
-    and only registered addresses get DNS, HTTP and HTTPS after that. SSH is
-    never affected.
+if [ -n "$ENFORCE_OUT" ]; then
+    printf '    %sAccess control is on%s - only addresses registered in the panel get
+    DNS, HTTP and HTTPS through this relay. Nobody is registered yet, so right
+    now that is nobody: sign a customer up, give them a plan, and let them
+    register their address from the customer panel.
 
-        smartdns-acl enforce status     see which it is
-        smartdns-acl enforce off        stay open, and cancel this
+    SSH is never gated, and the customer panel is on a port the gate does not
+    touch - so a wrong allowlist cannot lock you out of either.
+
+        smartdns-acl list               who is allowed, and what they have used
+        smartdns-acl enforce status     which way the door is
+        smartdns-acl enforce off        open it to everyone
 
 ' "$B" "$N"
 fi
@@ -1921,6 +1932,8 @@ exit 0
 ##        smartdns-acl usage <ip>          one address
 ##        smartdns-acl reset <ip>|--all    zero the counters
 ##        smartdns-acl enforce on|off|status
+##          --yes          do not ask for confirmation
+##          --allow-empty  close it with nobody registered (the installer)
 ##        smartdns-acl save                persist to disk now
 ##
 ## Add --json to list or usage for output meant for the panel rather than a
@@ -1937,10 +1950,11 @@ exit 0
 #SEP=$'\x1f'
 #STATE=/etc/nftables.d/20-smartdns-state.conf
 #ENFORCE=/etc/nftables.d/30-smartdns-enforce.conf
-## Set by the installer to mean "close this relay as soon as there is somebody
-## to allow". A fresh relay has an empty allowlist and enforcing on an empty
-## list would cut off everyone, so the decision cannot be made at install time -
-## the sync agent acts on it when the first address arrives.
+## "Close this relay as soon as there is somebody to allow." The installer no
+## longer writes it - it closes the relay itself - but relays installed before
+## that still carry one, and the sync agent still acts on it, so `enforce off`
+## has to keep clearing it. Opening a relay by hand and having a background
+## agent shut it again half a minute later would be its own bug.
 #AUTO=/etc/smart-dns/auto-enforce
 #
 #R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; N=$'\e[0m'
@@ -2157,13 +2171,27 @@ exit 0
 #    on)
 #        root
 #        count="$(dump | grep -c . )"
-#        # Switching this on with an empty allowlist would cut off every user of
-#        # the service at once, this machine's owner included. It is the one
-#        # mistake this tool can make that feels irreversible from the far end
-#        # of a broken connection, so it refuses outright.
-#        [ "$count" -gt 0 ] || die "the allowlist is empty - everyone would be cut off.
+#        yes=no; empty=no
+#        for flag in "$@"; do
+#            case "$flag" in
+#                --yes) yes=yes ;;
+#                --allow-empty) empty=yes ;;
+#            esac
+#        done
+#        # Switching this on with an empty allowlist cuts off every user of the
+#        # service at once. For somebody typing it at a terminal that is almost
+#        # always a mistake, and one that feels irreversible from the far end of
+#        # a broken connection - so it refuses.
+#        #
+#        # The installer passes --allow-empty, because there it is not a
+#        # mistake: a relay being installed has no users to cut off, and the
+#        # list being empty is exactly why it has to be closed. Left open, it is
+#        # a relay anybody who learns its address can use for free.
+#        if [ "$count" -eq 0 ] && [ "$empty" != yes ]; then
+#            die "the allowlist is empty - everyone would be cut off.
 #    Register at least your own address first:  smartdns-acl add <your ip> me"
-#        if [ "${3:-}" != --yes ] && [ -t 0 ]; then
+#        fi
+#        if [ "$yes" != yes ] && [ -t 0 ]; then
 #            printf '%s%s address(es) registered.%s Everyone else loses DNS, HTTP\n' "$Y" "$count" "$N"
 #            printf 'and HTTPS through this relay immediately. SSH is not affected.\n'
 #            printf 'Continue? [y/N] '
@@ -2188,7 +2216,13 @@ exit 0
 #RULES
 #        nft flush chain $TABLE gate
 #        nft -f "$ENFORCE" || { rm -f "$ENFORCE"; die "nft refused the rules; nothing changed"; }
-#        printf '%senforcing%s - %s address(es) may use this relay\n' "$G" "$N" "$count"
+#        if [ "$count" -eq 0 ]; then
+#            printf '%senforcing%s - nobody may use this relay yet.\n' "$G" "$N"
+#            printf 'Addresses are let in as customers register them.\n'
+#        else
+#            printf '%senforcing%s - %s address(es) may use this relay\n' \
+#                   "$G" "$N" "$count"
+#        fi
 #        ;;
 #    off)
 #        root

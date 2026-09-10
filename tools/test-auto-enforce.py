@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""The relay closing itself once somebody has registered.
+"""A relay is closed from the moment it is installed.
 
-A relay is installed before anyone has an address, and switching access
-control on against an empty allowlist cuts off every user of the service at
-once - so the installer cannot make the call. It leaves a note; the sync agent
-acts on it at the first sync that brings an address.
+It used to be open until the first customer registered, on the reasoning that
+enforcing against an empty allowlist cuts everyone off. On a fresh relay there
+is nobody to cut off, and what waiting really meant was a relay anybody who
+learnt its address could use for free until somebody noticed. So the installer
+closes it, and `smartdns-acl` takes --allow-empty to let it.
 
-What has to hold: it never fires on an empty list, it fires exactly once, it
-does not fire on a relay that was deliberately opened, and a failure to close
-leaves the note for the next attempt rather than losing the intent.
+The refusal it bypasses is still there for a person at a terminal: switching
+this on by hand with nobody registered is almost always a mistake, and one
+that feels irreversible from the far end of a broken connection.
+
+The note the installer used to leave is still honoured by the sync agent, for
+relays installed before this - so that half is tested too: it never fires on
+an empty list, fires exactly once, does not fire on a relay deliberately
+opened, and a failure to close leaves the note rather than losing the intent.
 """
 import importlib.machinery
 import importlib.util
@@ -119,15 +125,32 @@ off = acl[acl.index("    off)"):acl.index("    status)")]
 check("enforce off removes it", 'rm -f "$AUTO"' in off, off[:200])
 check("and says so", "cancelled" in off)
 
-print("the installer arms it, and ENFORCE=no does not")
+print("the installer closes the relay rather than leaving a note")
 logic = open(os.path.join(HERE, "installer-logic.sh"), encoding="utf-8").read()
-check("the installer writes the note", "> /etc/smart-dns/auto-enforce" in logic)
-check("ENFORCE=no removes it instead",
-      'rm -f /etc/smart-dns/auto-enforce' in logic)
-check("it does not re-arm a relay already enforcing",
-      "access control is already on" in logic)
-check("the summary explains what will happen",
-      "It closes itself the moment the first address is registered" in logic)
+check("it switches enforcement on",
+      "smartdns-acl enforce on --yes --allow-empty" in logic)
+check("it no longer leaves a note to do it later",
+      "> /etc/smart-dns/auto-enforce" not in logic)
+check("and clears any note an older install left",
+      "rm -f /etc/smart-dns/auto-enforce" in logic)
+check("ENFORCE=no still opts out", 'ENFORCE:-yes}" = no' in logic)
+check("a relay left open says so loudly",
+      "this relay is open to everyone until you close it" in logic)
+check("and a failure to close is not silent",
+      "could not switch access control on" in logic)
+check("the summary says only registered addresses get through",
+      "Access control is on" in logic)
+
+print("the refusal still stands for a person typing it")
+on = acl[acl.index("    on)"):acl.index("    off)")]
+check("an empty allowlist is refused by default",
+      "the allowlist is empty - everyone would be cut off" in on)
+check("unless --allow-empty is given", "--allow-empty" in on)
+check("--yes still skips the confirmation, on its own", "--yes) yes=yes" in on)
+check("the two flags are separate",
+      "--allow-empty) empty=yes" in on and '"$empty" != yes' in on)
+check("and closing an empty relay says what it means",
+      "nobody may use this relay yet" in on)
 
 shutil.rmtree(tmp, ignore_errors=True)
 print()
