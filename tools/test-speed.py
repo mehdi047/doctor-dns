@@ -127,11 +127,14 @@ def fake_run(*args, **kw):
         return FakeRun(0, json.dumps([{"kind": "htb", "handle": "1:"}]))
     if args[:3] == ("tc", "-j", "class"):
         # One customer already shaped at 8 Mbit, one stale class to clear.
+        # Customer classes sit at CLASS_BASE + mark: mark 2 is 1:102, mark 9
+        # is 1:109. 1:1 is the root class every one of them hangs under, and a
+        # customer must never land on it.
         return FakeRun(0, json.dumps([
             {"handle": "1:1", "rate": 10000000000},
             {"handle": "1:ffff", "rate": 10000000000},
-            {"handle": "1:2", "rate": 8000000},
-            {"handle": "1:9", "rate": 1000000}]))
+            {"handle": "1:102", "rate": 8000000},
+            {"handle": "1:109", "rate": 1000000}]))
     return FakeRun(0, "")
 
 
@@ -141,16 +144,18 @@ shape.apply_wanted([{"ip": "198.51.100.16", "mark": 2, "kbps": 20000},
 flat = [" ".join(c) for c in ran]
 
 check("the existing class is re-rated, not duplicated",
-      any("class replace" in f and "1:2" in f and "20000kbit" in f for f in flat),
+      any("class replace" in f and "1:102" in f and "20000kbit" in f for f in flat),
       "\n".join(flat))
 check("the new customer gets a class",
-      any("class replace" in f and "1:3" in f and "5000kbit" in f for f in flat))
-check("the new customer gets a filter on their mark",
-      any("filter add" in f and "handle 3 fw" in f and "flowid 1:3" in f for f in flat))
+      any("class replace" in f and "1:103" in f and "5000kbit" in f for f in flat))
+check("the filter is keyed on the mark, and points at the class",
+      any("filter add" in f and "handle 3 fw" in f and "flowid 1:103" in f
+          for f in flat), "\n".join(flat))
 check("each class gets fq_codel under it",
-      any("qdisc replace" in f and "parent 1:3" in f and "fq_codel" in f for f in flat))
+      any("qdisc replace" in f and "parent 1:103" in f and "fq_codel" in f
+          for f in flat))
 check("the stale class is removed",
-      any("class del" in f and "1:9" in f for f in flat), "\n".join(flat))
+      any("class del" in f and "1:109" in f for f in flat), "\n".join(flat))
 check("the stale filter is removed first",
       any("filter del" in f and "handle 9 fw" in f for f in flat))
 check("the root is not rebuilt when it already exists",
@@ -159,6 +164,31 @@ check("the address map is flushed then filled",
       any("flush map inet smartdns speed" in f for f in flat) and
       any("add element inet smartdns speed" in f and "198.51.100.16 : 2" in f
           and "198.51.100.27 : 3" in f for f in flat), "\n".join(flat))
+
+print("the very first customer does not land on the root")
+# mark 1 is what the first customer a service ever shapes gets. It used to
+# become class 1:1 - the root class every customer class hangs under - and
+# leaf qdisc handle 1:, which is the root qdisc's own handle. tc refused the
+# qdisc every thirty seconds, and the class that did get created replaced the
+# root, quietly capping the whole relay at that one customer's speed.
+ran.clear()
+shape.apply_wanted([{"ip": "198.51.100.1", "mark": 1, "kbps": 16000}])
+first = [" ".join(c) for c in ran]
+check("its class is not the root class",
+      not any("classid 1:1 " in f for f in first), "\n".join(first))
+check("nor is its leaf qdisc the root qdisc's handle",
+      not any("handle 1: fq_codel" in f for f in first), "\n".join(first))
+check("it gets a class of its own",
+      any("class replace" in f and "1:101" in f and "16000kbit" in f
+          for f in first), "\n".join(first))
+check("with fq_codel under it",
+      any("qdisc replace" in f and "parent 1:101" in f and "fq_codel" in f
+          for f in first))
+check("and the filter still carries the raw mark",
+      any("handle 1 fw" in f and "flowid 1:101" in f for f in first))
+check("no mark can reach the default class",
+      shape.minor_for(shape.MAX_MARK) < shape.DEFAULT_MINOR,
+      "%#x vs %#x" % (shape.minor_for(shape.MAX_MARK), shape.DEFAULT_MINOR))
 
 print("the shaper refuses what it cannot mark")
 for bad, why in [([{"ip": "1.1.1.1", "mark": 0, "kbps": 100}], "mark 0"),
@@ -176,7 +206,8 @@ ran.clear()
 shape.apply_wanted([])
 flat = [" ".join(c) for c in ran]
 check("every class is torn down",
-      all(any("class del" in f and "1:%x" % m in f for f in flat) for m in (2, 9)),
+      all(any("class del" in f and "1:%x" % shape.minor_for(m) in f
+              for f in flat) for m in (2, 9)),
       "\n".join(flat))
 check("the htb root is removed too",
       any("qdisc del" in f and "root" in f for f in flat), "\n".join(flat))

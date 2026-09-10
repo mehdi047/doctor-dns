@@ -44,8 +44,18 @@ ROOT_RATE = "10gbit"
 # including our own ssh session and the sync agent. Unshaped on purpose.
 DEFAULT_MINOR = 0xFFFF
 
+# Customer classes live above this, never at it. The mark identifies the
+# customer everywhere else - in the nftables map and as the fw filter's handle
+# - but it cannot be the class minor as well, because minor 1 is the root
+# class every customer class hangs under and 1: is the root qdisc's own
+# handle. The first customer ever shaped has mark 1, so both collided at once:
+# `tc qdisc replace ... parent 1:1 handle 1: fq_codel` was refused every
+# thirty seconds, and the class that did get created replaced the root class,
+# quietly capping the whole relay at that one customer's speed.
+CLASS_BASE = 0x100
+
 # Marks are account numbers, and this one is taken by the default class.
-MAX_MARK = DEFAULT_MINOR - 1
+MAX_MARK = DEFAULT_MINOR - CLASS_BASE - 1
 
 TABLE = "inet smartdns"
 MAP = "speed"
@@ -117,18 +127,20 @@ def current_classes(dev):
             if major != "1" or not minor:
                 continue
             m = int(minor, 16)
-            if m not in (1, DEFAULT_MINOR):
-                out[m] = int(c.get("rate", 0)) // 1000     # bits -> kbit
+            if m > CLASS_BASE and m != DEFAULT_MINOR:
+                # Keyed by mark, so the caller compares like with like.
+                out[m - CLASS_BASE] = int(c.get("rate", 0)) // 1000
         return out
     for line in text.splitlines():
         hit = CLASS_RE.match(line.strip())
         if not hit:
             continue
         m = int(hit.group(1), 16)
-        if m in (1, DEFAULT_MINOR):
+        if m <= CLASS_BASE or m == DEFAULT_MINOR:
             continue
         rate = RATE_RE.search(line)
-        out[m] = int(float(rate.group(1)) * SCALE[rate.group(2).upper()]) if rate else 0
+        out[m - CLASS_BASE] = (int(float(rate.group(1)) * SCALE[rate.group(2).upper()])
+                               if rate else 0)
     return out
 
 
@@ -157,30 +169,37 @@ def ensure_root(dev):
     return True
 
 
+def minor_for(mark):
+    """The class minor a mark gets. Never 1, never DEFAULT_MINOR."""
+    return CLASS_BASE + mark
+
+
 def add_class(dev, mark, kbps):
     rate = "%dkbit" % kbps
+    minor = minor_for(mark)
     tc("class", "replace", "dev", dev, "parent", "1:1",
-       "classid", "1:%x" % mark, "htb", "rate", rate, "ceil", rate,
+       "classid", "1:%x" % minor, "htb", "rate", rate, "ceil", rate,
        # A burst of roughly a tenth of a second, so a limit reads as a steady
        # speed rather than as a stutter, without letting a customer bank
        # seconds of idle time into a spike the operator pays for.
        "burst", "%dkbit" % max(15, kbps // 10))
-    tc("qdisc", "replace", "dev", dev, "parent", "1:%x" % mark,
-       "handle", "%x:" % mark, "fq_codel")
+    tc("qdisc", "replace", "dev", dev, "parent", "1:%x" % minor,
+       "handle", "%x:" % minor, "fq_codel")
     # The filter is keyed on the mark, so re-adding an identical one would
     # stack duplicates. Delete first, ignore the failure when there is none.
     tc("filter", "del", "dev", dev, "parent", "1:", "protocol", "ip",
        "prio", "1", "handle", str(mark), "fw", check=False)
     tc("filter", "add", "dev", dev, "parent", "1:", "protocol", "ip",
-       "prio", "1", "handle", str(mark), "fw", "flowid", "1:%x" % mark)
+       "prio", "1", "handle", str(mark), "fw", "flowid", "1:%x" % minor)
 
 
 def drop_class(dev, mark):
+    minor = minor_for(mark)
     tc("filter", "del", "dev", dev, "parent", "1:", "protocol", "ip",
        "prio", "1", "handle", str(mark), "fw", check=False)
-    tc("qdisc", "del", "dev", dev, "parent", "1:%x" % mark, check=False)
+    tc("qdisc", "del", "dev", dev, "parent", "1:%x" % minor, check=False)
     tc("class", "del", "dev", dev, "parent", "1:1",
-       "classid", "1:%x" % mark, check=False)
+       "classid", "1:%x" % minor, check=False)
 
 
 def set_map(wanted):
