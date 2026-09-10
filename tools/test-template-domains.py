@@ -260,6 +260,55 @@ one = sorted(routed)[0] if routed else ""
 check("and the ones it does route still have theirs",
       bool(one) and ("address=/%s/%s" % (one, me)) in conf)
 
+print("the operator's own domains, inside a template")
+# Added on the domains page, they live in the database rather than the
+# catalogue file - and the template page, drawn from the catalogue alone,
+# showed that service as having none while the relay routed them anyway.
+for d in ("kmplayer.com", "example.org"):
+    store.run("INSERT INTO custom_domains (domain, added_at) VALUES (?, ?)",
+              (d, panel.now()))
+store.run("UPDATE users SET template_id = ? WHERE phone = '09120000077'", (tid2,))
+store.run("INSERT OR IGNORE INTO template_services"
+          " (template_id, service_key, group_key) VALUES (?, 'custom', 'main')",
+          (tid2,))
+html_out = Page().templates()
+drawer = html_out[html_out.index("value='custom.main'"):]
+drawer = drawer[:drawer.index("</details>")]
+check("the template page lists them",
+      "kmplayer.com" in drawer and "example.org" in drawer, drawer[:400])
+check("ticked, since the template routes them",
+      "value='kmplayer.com' checked" in drawer, drawer[:400])
+check("and counted", "2 از 2 دامنه" in drawer, drawer[:400])
+
+rec3 = Recorder()
+rec3.action("template-save", {
+    "id": [str(tid2)], "g": ["spotify.main", "custom.main"],
+    "d": ["scdn.co", "spotify.com", "spotifycdn.com", "example.org"],
+})
+check("un-ticking one is stored like any other exception",
+      store.template_domains_off(tid2) == {"kmplayer.com"},
+      str(store.template_domains_off(tid2)))
+_, profs = store.profiles(CATALOGUE, default)
+custom = profs[str(tid2)]["custom"]
+check("and the relay is not told to route it", "kmplayer.com" not in custom,
+      str(custom))
+check("while the one left ticked still routes", "example.org" in custom,
+      str(custom))
+
+store.run("INSERT INTO custom_domains (domain, added_at) VALUES (?, ?)",
+          ("added-later.net", panel.now()))
+_, profs = store.profiles(CATALOGUE, default)
+check("one added later routes without re-saving the template",
+      "added-later.net" in profs[str(tid2)]["custom"],
+      str(profs[str(tid2)]["custom"]))
+
+rec4 = Recorder()
+rec4.action("template-save", {"id": [str(tid2)], "g": ["spotify.main"],
+                              "d": ["scdn.co", "spotify.com", "spotifycdn.com"]})
+_, profs = store.profiles(CATALOGUE, default)
+check("the whole service un-ticked routes none of them",
+      profs[str(tid2)]["custom"] == [], str(profs[str(tid2)]["custom"]))
+
 shutil.rmtree(tmp, ignore_errors=True)
 print()
 if fails:

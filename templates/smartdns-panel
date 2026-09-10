@@ -868,8 +868,11 @@ class Store:
                 "bypass": self.bypass_for(tid, catalogue),
                 # Listed positively, not by omission: the relay writes these
                 # into this profile's own config, and a template that does not
-                # route them simply has no rule for them anywhere.
-                "custom": custom if self.routes_custom(tid) else [],
+                # route them simply has no rule for them anywhere. One of them
+                # switched off inside the template is left out the same way.
+                "custom": [d for d in custom
+                           if d not in self.template_domains_off(tid)]
+                          if self.routes_custom(tid) else [],
                 # Whether this profile still wants epic-pin's work. Those pins
                 # name exact hosts, so they beat any rule that routes the
                 # parent domain - which means a template that has ticked the

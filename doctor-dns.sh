@@ -3548,8 +3548,11 @@ exit 0
 #                "bypass": self.bypass_for(tid, catalogue),
 #                # Listed positively, not by omission: the relay writes these
 #                # into this profile's own config, and a template that does not
-#                # route them simply has no rule for them anywhere.
-#                "custom": custom if self.routes_custom(tid) else [],
+#                # route them simply has no rule for them anywhere. One of them
+#                # switched off inside the template is left out the same way.
+#                "custom": [d for d in custom
+#                           if d not in self.template_domains_off(tid)]
+#                          if self.routes_custom(tid) else [],
 #                # Whether this profile still wants epic-pin's work. Those pins
 #                # name exact hosts, so they beat any rule that routes the
 #                # parent domain - which means a template that has ticked the
@@ -5992,6 +5995,19 @@ exit 0
 #    return services
 #
 #
+#def catalogue_now():
+#    """The catalogue with the operator's own domains filled in.
+#
+#    Those live in the database, not the catalogue file, so CATALOGUE carries
+#    their service with an empty list - and the template page, drawn from it,
+#    showed "your domains" as having none while the relay was routing them.
+#    """
+#    custom = [r["domain"] for r in STORE.q(
+#        "SELECT domain FROM custom_domains ORDER BY domain")]
+#    return [dict(svc, groups=[dict(g, domains=custom) for g in svc["groups"]])
+#            if svc["key"] == "custom" else svc for svc in CATALOGUE]
+#
+#
 ## -------------------------------------------------------------------- pages
 #CSS = """
 #*{box-sizing:border-box}
@@ -6735,7 +6751,7 @@ exit 0
 #            groups = STORE.template_groups(t["id"])
 #            off = STORE.template_domains_off(t["id"])
 #            n_groups = n_dom = total_dom = 0
-#            for svc in CATALOGUE:
+#            for svc in catalogue_now():
 #                for g in svc["groups"]:
 #                    total_dom += len(g["domains"])
 #                    if (svc["key"], g["key"]) in groups:
@@ -6778,7 +6794,7 @@ exit 0
 #               "<form method='post' action='/%s/template-save'>"
 #               "<input type='hidden' name='id' value='%d'>" % (p, t["id"])]
 #
-#        for svc in CATALOGUE:
+#        for svc in catalogue_now():
 #            for g in svc["groups"]:
 #                key = "%s.%s" % (svc["key"], g["key"])
 #                on = (svc["key"], g["key"]) in groups
@@ -7138,7 +7154,7 @@ exit 0
 #            keep = set(params.get("d") or [])
 #            STORE.run("DELETE FROM template_services WHERE template_id = ?", (tid,))
 #            STORE.run("DELETE FROM template_domains_off WHERE template_id = ?", (tid,))
-#            for svc in CATALOGUE:
+#            for svc in catalogue_now():
 #                for g in svc["groups"]:
 #                    if "%s.%s" % (svc["key"], g["key"]) not in wanted:
 #                        continue
