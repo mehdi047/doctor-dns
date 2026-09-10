@@ -194,24 +194,95 @@ smartdns-acl enforce off      # stay open, and cancel the automatic close
 
 ## After installing
 
-```sh
-smartdns status              # what this machine is doing
-smartdns-acl list            # who is allowed, and what they have used
-smartdns-shape list          # who is speed limited
-smartdns-cert example.com    # a certificate for a panel
-smartdns-access              # where the operator's panel answers
-smartdns-access password     # change it; also port and path
-```
-
 Each side prints what it set up at the end of its install: the relay names the
 DNS address and the customers' panel, the exit names the operator's panel and
 its password, shown once.
 
-The operator's panel is the whole administrative interface - customers, their
+The operator's panel is the whole administrative interface — customers, their
 quotas and speeds, service templates, the domain list, host monitoring,
-payment receipts, and backup and restore. `smartdns-access` exists for the one
-case the panel cannot help with: getting back in after its port or path was
-changed to something the firewall does not allow.
+payment receipts, and backup and restore. Everything below is for the cases a
+web page cannot serve: reading state over ssh, and getting back into a panel
+you can no longer reach.
+
+### On the exit
+
+**`smartdns-access`** — where the admin panel is, and how to change it. Run it
+with no arguments and it prints the full address, read from the config the
+panel actually serves.
+
+```sh
+smartdns-access                  # the URL it answers on - forgot it? start here
+smartdns-access port 9443        # move it, if a firewall is in the way
+smartdns-access path [new]       # change the secret path, or roll a fresh one
+smartdns-access password [new]   # set a new one; the old is not recoverable
+smartdns-access rotate           # new path and new password at once
+```
+
+Of those three, only the password is authentication. The port keeps the panel
+out of the way of casual scanning and nothing more; the path is unguessable
+but travels in every request line and lands in any proxy log on the way. The
+password is never stored — only a salted hash — which is why a forgotten one
+is replaced rather than recovered.
+
+### On the relay
+
+**`smartdns`** — the list of domains that go through the relay.
+
+```sh
+smartdns status                  # what this machine is doing
+smartdns list                    # every domain being routed
+smartdns find spotify            # which ones match
+smartdns add example.com         # route one more
+smartdns del example.com         # stop routing it
+smartdns bypass api.example.com  # never route this one, even though its
+                                 # parent is routed - for services that are
+                                 # not on 443 at all
+smartdns test example.com        # what this relay answers for it
+```
+
+**`smartdns-acl`** — who may use the relay, and what they have used. The panel
+drives this rather than touching nftables itself, so there is one place where
+the rules about what is legal live.
+
+```sh
+smartdns-acl list                # everyone, with usage
+smartdns-acl usage 5.188.44.19   # one address
+smartdns-acl add 5.188.44.19 ali # register one by hand
+smartdns-acl del 5.188.44.19
+smartdns-acl reset <ip>|--all    # zero the counters
+smartdns-acl enforce status      # open, or only registered addresses?
+smartdns-acl enforce on          # close it
+smartdns-acl enforce off         # open it to everyone
+smartdns-acl save                # persist to disk now
+```
+
+`enforce on` refuses when nobody is registered — closing a live relay against
+an empty list cuts off every customer at once, and that is a mistake which
+feels irreversible from the far end of a broken connection. Add
+`--allow-empty` if you mean it. `--json` on `list` or `usage` gives output
+meant for a program.
+
+**`smartdns-shape`** — per-customer download limits, htb + fq_codel.
+
+```sh
+smartdns-shape list              # what is in force
+smartdns-shape off               # remove all shaping
+```
+
+The sync agent applies these from the panel every thirty seconds, so set
+speeds there rather than here.
+
+### On either
+
+```sh
+smartdns-cert panel.example.com  # get or renew a certificate for that name
+sudo bash doctor-dns.sh --version
+sudo bash doctor-dns.sh --uninstall
+```
+
+`smartdns-cert` borrows port 80 for the twenty seconds a challenge takes, so
+console downloads through a relay stall for that long and resume. A timer
+renews on its own once there is something to renew.
 
 ## How it is built
 
