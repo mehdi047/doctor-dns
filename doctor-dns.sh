@@ -874,6 +874,9 @@ fi
 payload CERT > /usr/local/bin/smartdns-cert
 chmod +x /usr/local/bin/smartdns-cert
 note_file /usr/local/bin/smartdns-cert
+payload SMARTDNS_LOGS > /usr/local/bin/smartdns-logs
+chmod +x /usr/local/bin/smartdns-logs
+note_file /usr/local/bin/smartdns-logs
 install_payload CERT_SERVICE /etc/systemd/system/smartdns-cert.service || true
 install_payload CERT_TIMER   /etc/systemd/system/smartdns-cert.timer   || true
 systemctl daemon-reload
@@ -7454,6 +7457,81 @@ exit 0
 #    ;;
 #esac
 #__END_SMARTDNS_ACCESS__
+
+#__BEGIN_SMARTDNS_LOGS__
+##!/bin/bash
+## smartdns-logs - what this machine has been doing, all in one place.
+##
+## usage: smartdns-logs          recent logs of every part, and whether each runs
+##        smartdns-logs -f       follow them live (ctrl-c to stop)
+##        smartdns-logs -n 500   more lines per part (default 100)
+#set -uo pipefail
+#
+#n=100
+#follow=no
+#while [ $# -gt 0 ]; do
+#    case "$1" in
+#        -f|--follow) follow=yes ;;
+#        -n) shift; n="${1:-}" ;;
+#        -h|--help) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+#        *) echo "unknown option: $1  (try -h)" >&2; exit 1 ;;
+#    esac
+#    shift
+#done
+#case "$n" in ''|*[!0-9]*) echo "-n wants a number of lines" >&2; exit 1 ;; esac
+#[ "$(id -u)" = 0 ] || { echo "run as root:  sudo smartdns-logs" >&2; exit 1; }
+#
+## Which side this is decides which parts it has. The timers are listed for
+## their status - a oneshot service reads "inactive" between runs, which looks
+## like a fault and is not - and the services for their logs.
+#if [ -f /etc/smart-dns/sync.env ]; then
+#    role=relay
+#    status="smartdns-sync dnsmasq nginx coturn epic-pin.timer smartdns-acl-save.timer"
+#    logs="smartdns-sync dnsmasq nginx coturn epic-pin smartdns-acl-save"
+#    for f in /etc/smartdns-profiles/*.conf; do
+#        [ -e "$f" ] || continue
+#        status="$status smartdns-dns@$(basename "$f" .conf)"
+#        logs="$logs smartdns-dns@$(basename "$f" .conf)"
+#    done
+#elif [ -f /etc/smart-dns/panel.env ]; then
+#    role=exit
+#    status="smartdns-panel smartdns-admin nginx smartdns-cert.timer"
+#    logs="smartdns-panel smartdns-admin nginx smartdns-cert"
+#else
+#    echo "doctor dns is not installed on this machine" >&2
+#    exit 1
+#fi
+#
+#if [ "$follow" = yes ]; then
+#    args=()
+#    for u in $logs; do args+=(-u "$u"); done
+#    exec journalctl "${args[@]}" -f -n 20 --no-pager -o short-iso
+#fi
+#
+#printf 'doctor dns %s - %s\n' \
+#       "$(cat /var/lib/smart-dns/version 2>/dev/null || echo '?')" "$role"
+#echo
+#echo "== services"
+#for u in $status; do
+#    printf '  %-26s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null)"
+#done
+#failed="$(systemctl list-units --state=failed --no-legend 2>/dev/null)"
+#if [ -n "$failed" ]; then
+#    echo
+#    echo "== failed"
+#    echo "$failed"
+#fi
+#for u in $logs; do
+#    echo
+#    echo "== $u"
+#    journalctl -u "$u" -n "$n" --no-pager -o short-iso 2>/dev/null
+#done
+#if [ -s /var/log/nginx/error.log ]; then
+#    echo
+#    echo "== nginx errors"
+#    tail -n "$n" /var/log/nginx/error.log
+#fi
+#__END_SMARTDNS_LOGS__
 
 #__BEGIN_EPIC_PIN__
 ##!/usr/bin/env python3

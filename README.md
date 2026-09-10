@@ -276,6 +276,7 @@ speeds there rather than here.
 
 ```sh
 smartdns-cert panel.example.com  # get or renew a certificate for that name
+smartdns-logs                    # what this machine has been doing; -f to follow
 sudo bash doctor-dns.sh --version
 sudo bash doctor-dns.sh --uninstall
 ```

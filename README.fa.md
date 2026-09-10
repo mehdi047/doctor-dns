@@ -206,6 +206,7 @@ smartdns-shape off               # همهٔ محدودیت‌ها را بردا�
 
 ```sh
 smartdns-cert panel.example.com  # گواهی برای آن نام بگیر یا تمدید کن
+smartdns-logs                    # لاگ همهٔ بخش‌های این ماشین؛ -f برای دنبال‌کردن زنده
 sudo bash doctor-dns.sh --version
 sudo bash doctor-dns.sh --uninstall
 ```
