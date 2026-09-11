@@ -393,9 +393,6 @@ Long live the free internet🌐
 
 </div>
 
-Keeping it going costs time and money: test servers, domains, and hours
-of chasing bugs. If it has been useful to you, buy me a coffee ☕
-
 <div align="center">
 
 | | |
