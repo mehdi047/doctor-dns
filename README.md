@@ -387,9 +387,9 @@ reach the service from.
 
 **It is free, and it stays free.**
 
-Support open source software❤️<br>
+Support open source softwares❤️<br>
 Long live free software🕊<br>
-Long live the free internet🌐
+Long live free internet🌐
 
 </div>
 
