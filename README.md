@@ -385,3 +385,30 @@ MIT. See [LICENSE](LICENSE).
 
 The domain list is assembled from public sources and from testing; it is not
 exhaustive and will drift as services change.
+
+---
+
+<div align="center">
+
+## ☕ Support this project
+
+**It is free, and it stays free.**
+
+Support open source software❤️<br>
+Long live free software🕊<br>
+Long live the free internet🌐
+
+</div>
+
+Keeping it going costs time and money: test servers, domains, and hours
+of chasing bugs. If it has been useful to you, buy me a coffee ☕
+
+<div align="center">
+
+| | |
+|:--|:--|
+| **TON** | `UQAh8oTWt8ec-q4I1zxga1sUYmKmvcQKGDYwspDrsGmUlQKI` |
+| **Tether — BEP20** | `0x8aE738721Ca6Fd9a8a375Df3AC4A144ed5695355` |
+| **Tether — TRON (TRC20)** | `TPiyEnb41qTZz8eM6eqnRwXbPXBZCNS1pm` |
+
+</div>
