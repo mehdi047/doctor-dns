@@ -100,6 +100,7 @@ install_payload() {
         | sed -e "s#__RELAY_IP__#${RELAY_IP}#g" \
               -e "s#__EXIT_IP__#${EXIT_IP}#g" \
               -e "s#__MODULE_PATH__#${MOD:-__MODULE_PATH__}#g" \
+              -e "${NO_GOOGLE_V6:+/# google-v6 begin/,/# google-v6 end/d}" \
         > "$tmp"
     [ -s "$tmp" ] || die "payload $name is empty - is this file complete?"
     # Whether this file was ours or already here decides what uninstall does
@@ -217,8 +218,12 @@ esac
 # A download that stopped early is still a runnable script. Everything below
 # `exit 0` is a comment, so bash parses half a file quite happily and would
 # then set the machine up with configs silently missing - which is worse than
-# not running at all. A whole one always ends on a payload terminator.
-tail -2 "$SELF" | grep -q '^#__END_' || die "this file is incomplete - the
+# not running at all. A whole one ends on one exact line the build writes after
+# the last payload, and only an exact match will do: a cut that landed just
+# after the terminator of a payload in the middle, or half way through one -
+# "#__END_ACL_SAVE_S" - passed the looser test this used to be, and went on to
+# install with twenty configs missing.
+[ "$(tail -n 1 "$SELF")" = "#__DOCTOR_DNS_COMPLETE__" ] || die "this file is incomplete - the
     download stopped early. Fetch it again:
         curl -fsSLO https://raw.githubusercontent.com/mehdi047/doctor-dns/main/doctor-dns.sh"
 command -v apt-get >/dev/null 2>&1 || die "this installer expects Debian or Ubuntu"
@@ -746,6 +751,22 @@ step "nginx"
 MOD="$(find /usr/lib/nginx/modules -name ngx_stream_module.so 2>/dev/null | head -1)"
 [ -n "$MOD" ] || die "the nginx stream module is missing - libnginx-mod-stream did not install"
 info "stream module: $MOD"
+# Google refuses Gemini and its other AI services to some exits' IPv4 addresses
+# and serves the same pages to the same machine over IPv6, so where the exit
+# has working IPv6, Google's own names leave over it. That needs a resolver
+# that can be told to ask for AAAA records only, which nginx has from 1.23.1 -
+# older, or without IPv6, the block is left out and nothing changes.
+NO_GOOGLE_V6=1
+if [ "$ROLE" = exit ]; then
+    ngv="$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9.]*\).*#\1#p')"
+    if [ "$(printf '%s\n%s\n' 1.23.1 "${ngv:-0}" | sort -V | head -1)" = 1.23.1 ] \
+       && curl -6 -s -o /dev/null -m 10 https://www.google.com/ 2>/dev/null; then
+        NO_GOOGLE_V6=""
+        info "Google's own names leave over IPv6 (Gemini is refused to some exits' IPv4)"
+    else
+        info "no working IPv6 here, or nginx older than 1.23.1 - Google leaves over IPv4"
+    fi
+fi
 if [ "$ROLE" = relay ]; then
     install_payload RELAY_NGINX /etc/nginx/nginx.conf && NGINX_CHANGED=1 || true
 else
@@ -1091,6 +1112,7 @@ EOF
                     warn "    80    the proxy, and how certificates are proved"
                     warn "   443    the proxy"
                     warn "  8443    the sync API the relays connect to"
+                    warn "  8446    the exit's own route to Google over IPv6"
                     warn "on a relay, 3478 is taken as well."
                     warn "pick anything else, and open it in your firewall."
                     printf '\n'
@@ -1114,8 +1136,9 @@ EOF
                 *[!0-9]*|"") die "the admin port must be a number" ;;
                 22) die "port 22 is ssh" ;;
                 8443) die "port 8443 is the sync API the relays connect to" ;;
+                8446) die "port 8446 is the exit's own route to Google over IPv6" ;;
                 53|80|443) die "port $ADMIN_PORT is the service's own - pick
-    another. 22, 53, 80, 443 and 8443 are all taken." ;;
+    another. 22, 53, 80, 443, 8443 and 8446 are all taken." ;;
             esac
             # The path stays generated. Nobody types it from memory, and an
             # operator asked to invent one invents a guessable one.

@@ -228,8 +228,12 @@ def api(path, obj, tok="tok"):
 at = mark()
 status, _, _ = api("/sync", {}, tok="wrong")
 out = since(at)
+# The status is not checked here: the API refuses before reading the body, so
+# the client may see its connection reset rather than the 401 - it has said
+# what it had to. The line in the log is what this is about.
 check("a paired relay with the wrong secret is a warning that says so",
-      status == 401 and "<4>api: 127.0.0.1 is a paired relay but sent the wrong secret" in out,
+      status in (401, None)
+      and "<4>api: 127.0.0.1 is a paired relay but sent the wrong secret" in out,
       out)
 
 at = mark()

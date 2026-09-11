@@ -30,7 +30,7 @@ BUILT = os.path.join(HERE, "..", "doctor-dns.sh")
 ACCESS = os.path.join(HERE, "..", "templates", "smartdns-access")
 fails = []
 
-TAKEN = ["22", "53", "80", "443", "8443"]
+TAKEN = ["22", "53", "80", "443", "8443", "8446"]
 FREE = ["9443", "2053", "31337"]
 
 

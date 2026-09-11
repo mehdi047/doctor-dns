@@ -162,10 +162,11 @@ can see, but a firewall rule you wrote yourself it cannot.
 | **443** tcp | the SNI proxy | the same |
 | **3478** udp | STUN, so a console can work out its own NAT | — |
 | **8443** tcp | the customer panel — TLS only, so a relay without a certificate serves no panel at all | the sync API the relays connect to |
+| **8446** tcp | — | loopback only: the exit's route to Google over IPv6, where it has IPv6 |
 | **22** tcp | ssh — never gated, so a wrong allowlist cannot lock you out | the same |
 
 The admin panel is the one port you choose. It defaults to **9443** and can be
-anything free; the installer stops you at 22, 53, 80, 443 and 8443, and
+anything free; the installer stops you at 22, 53, 80, 443, 8443 and 8446, and
 `smartdns-access port` applies the same rule later, plus a check that nothing
 else is already listening.
 

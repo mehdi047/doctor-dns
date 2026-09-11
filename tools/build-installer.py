@@ -71,13 +71,20 @@ def main():
         if name == "RELAY_NGINX":
             body = body.replace("load_module MODULE_PATH;",
                                 "load_module __MODULE_PATH__;")
-        if "#__BEGIN_" in body or "#__END_" in body:
+        if ("#__BEGIN_" in body or "#__END_" in body
+                or "#__DOCTOR_DNS_COMPLETE__" in body):
             raise SystemExit("%s contains a payload marker" % path)
         parts.append("#__BEGIN_%s__" % name)
         commented = [("#" + line) for line in body.split("\n")]
         parts.append("\n".join(commented))
         parts.append("#__END_%s__" % name)
         parts.append("")
+
+    # The very last line, and what the installer checks for before it does
+    # anything: a download that stopped early ends somewhere else. One exact
+    # line rather than "a terminator" - a cut can land on a middle payload's.
+    parts.append("#__DOCTOR_DNS_COMPLETE__")
+    parts.append("")
 
     text = "\n".join(parts)
     dest = os.path.join(ROOT, "doctor-dns.sh")

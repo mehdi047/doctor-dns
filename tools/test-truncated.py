@@ -108,10 +108,31 @@ check("and stopped before asking anything",
       "Which side is this machine" not in out and "APT-REACHED" not in out,
       out[-300:])
 
-print("the last payload terminator is what it looks for")
-check("the built file ends on one",
-      whole.rstrip(b"\n").split(b"\n")[-1].startswith(b"#__END_"),
-      whole.rstrip(b"\n").split(b"\n")[-1][:40].decode("utf-8", "replace"))
+print("and one cut right at a payload in the middle")
+# The two cuts that got past the old test, which took any line starting
+# #__END_ in the last two: one landing just after a middle payload's
+# terminator, and one landing half way through it. 120000 bytes happened to
+# be the second, once the script had grown.
+mid = whole.index(b"\n#__END_ACL_SAVE_SERVICE__\n") + 1
+for label, data in (("just after its terminator",
+                     whole[:mid + len(b"#__END_ACL_SAVE_SERVICE__\n")]),
+                    ("half way through its terminator",
+                     whole[:mid + len(b"#__END_ACL_SAVE_S")])):
+    r = run(data)
+    out = r.stdout + r.stderr
+    check("%s: it says it is incomplete" % label, "incomplete" in out, out[-300:])
+    check("%s: and stopped before asking anything" % label,
+          "Which side is this machine" not in out and "APT-REACHED" not in out,
+          out[-300:])
+
+print("the line it looks for")
+last = whole.rstrip(b"\n").split(b"\n")[-1]
+check("the built file ends on it exactly", last == b"#__DOCTOR_DNS_COMPLETE__",
+      last[:40].decode("utf-8", "replace"))
+# Once in the check, once at the end - a payload carrying it would make a cut
+# at that payload look whole.
+check("and nowhere else", whole.count(b"#__DOCTOR_DNS_COMPLETE__") == 2,
+      str(whole.count(b"#__DOCTOR_DNS_COMPLETE__")))
 
 print("it still refuses to run for anyone but root")
 r = run(whole, FAKE_UID="1000")

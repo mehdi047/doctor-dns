@@ -98,6 +98,7 @@ port)
     case "$new" in
         53|80|443) die "port $new is the service's own - pick another" ;;
         8443) die "port 8443 is the sync API the relays talk to" ;;
+        8446) die "port 8446 is the exit's own route to Google over IPv6" ;;
         22) die "port 22 is ssh" ;;
     esac
     old="$(get ADMIN_PORT)"
