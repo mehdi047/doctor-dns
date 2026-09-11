@@ -865,6 +865,12 @@ if [ "$ROLE" = relay ]; then
     chmod +x /usr/local/bin/smartdns
     info "try: smartdns status"
 
+    step "smartdns-rules command, for what each template does with a domain"
+    note_file /usr/local/bin/smartdns-rules
+    payload SMARTDNS_RULES > /usr/local/bin/smartdns-rules
+    chmod +x /usr/local/bin/smartdns-rules
+    info "try: smartdns-rules check gemini.google.com"
+
     step "epic-pin, keeping Epic's backend on addresses that answer from here"
     # epic-pins.conf is written later by epic-pin itself, but it is ours either
     # way and uninstall needs to know to take it with us.
@@ -2717,6 +2723,7 @@ exit 0
 #import sys
 #import threading
 #import time
+#import traceback
 #import unicodedata
 #import urllib.error
 #import urllib.parse
@@ -3193,8 +3200,7 @@ exit 0
 #        with io_open(SERVICES_FILE) as fh:
 #            return json.load(fh).get("services", [])
 #    except Exception as e:
-#        print("no service catalogue at %s: %s" % (SERVICES_FILE, e),
-#              file=sys.stderr, flush=True)
+#        log(ERROR, "no service catalogue at %s: %s" % (SERVICES_FILE, e))
 #        return []
 #
 #
@@ -3567,6 +3573,13 @@ exit 0
 #        return [r["domain"] for r in self.q(
 #            "SELECT domain FROM custom_domains ORDER BY domain")]
 #
+#    def template_names(self):
+#        """Every template's name by id, and which is the default - so the
+#        relay's own tools can say "test" where its resolvers only know "2"."""
+#        rows = self.q("SELECT id, name, is_default FROM templates")
+#        return {"default": next((r["id"] for r in rows if r["is_default"]), None),
+#                "names": {str(r["id"]): r["name"] for r in rows}}
+#
 #    def routes_custom(self, template_id):
 #        """Whether this template routes the operator's own domains.
 #
@@ -3852,6 +3865,99 @@ exit 0
 #                          (bit, u["id"]))
 #
 #
+## ------------------------------------------------------------------ logging
+## journald reads a leading <N> on a line as its syslog level. Warnings and
+## errors carry one, so `journalctl -p warning` - which is what
+## `smartdns-logs -e` runs - shows exactly the problems. Ordinary lines stay
+## unmarked and land at info, as they always did. Before this everything
+## landed at info, stderr included, and a failure looked like a heartbeat.
+#INFO, WARN, ERROR = 6, 4, 3
+## The visitor went away, or never finished saying hello. Not a fault here.
+#GONE = (ConnectionError, TimeoutError, ssl.SSLError)
+#
+#
+#def log(level, msg):
+#    tag = "<%d>" % level if level < INFO else ""
+#    for line in str(msg).splitlines() or [""]:
+#        print(tag + line, flush=True)
+#
+#
+#def log_exception(what):
+#    """An error with its traceback, every line at error level. journald makes
+#    each line its own entry, and at info all but the first would be lost
+#    among the ordinary ones."""
+#    log(ERROR, "%s\n%s" % (what, traceback.format_exc().rstrip()))
+#
+#
+#def log_access(h, prefix, code, path, who=""):
+#    """One line for one request: what was asked, the answer, how long it took
+#    and who asked. Server errors at error level; everything else is info."""
+#    try:
+#        code = int(code)
+#    except (TypeError, ValueError):
+#        code = 0
+#    ms = (time.monotonic() - getattr(h, "_t0", time.monotonic())) * 1000
+#    # 501 is a scanner's GET to a POST-only port: the visitor's mistake.
+#    log(ERROR if code >= 500 and code != 501 else INFO, "%s %s %s %d %dms from %s%s" % (
+#        prefix, getattr(h, "command", None) or "-", path, code, ms,
+#        h.client_address[0], " " + who if who else ""))
+#
+#
+## How long a visitor may take over the TLS handshake, and then how long any one
+## read or write may stall. Per operation, so a receipt crawling up from a
+## relay that keeps moving is never cut off, while a quiet connection is let go.
+#HANDSHAKE_TIMEOUT = 10
+#IO_TIMEOUT = 30
+#
+#
+#class TLSServer(http.server.ThreadingHTTPServer):
+#    """TLS per connection, under a deadline - never on the listening socket.
+#
+#    Wrapping the listening socket runs every visitor's handshake inside
+#    accept(), on the one thread that accepts for all of them and with no
+#    timeout, so a single connection that opens and then says nothing freezes
+#    the server for everybody until it goes away. The customer panel froze
+#    exactly that way in production, and this server was built the same way -
+#    here it would have been worse: this port is public, the relay check comes
+#    after the handshake, and while it hung no relay could sync, so nobody new
+#    was let in and nobody whose time ran out was cut off. Here accept() only
+#    accepts; a stalled visitor stalls only its own thread.
+#
+#    ctx=None serves plain http. That is for tests - serve_api never does.
+#    """
+#    daemon_threads = True
+#
+#    def __init__(self, addr, handler, ctx):
+#        self.ctx = ctx
+#        super().__init__(addr, handler)
+#
+#    def finish_request(self, request, client_address):
+#        if self.ctx is None:
+#            return super().finish_request(request, client_address)
+#        request.settimeout(HANDSHAKE_TIMEOUT)
+#        try:
+#            tls = self.ctx.wrap_socket(request, server_side=True)
+#        except (ssl.SSLError, OSError):
+#            return      # a scanner, or plain http to an https port
+#        try:
+#            tls.settimeout(IO_TIMEOUT)
+#            self.RequestHandlerClass(tls, client_address, self)
+#        except (ssl.SSLError, OSError):
+#            pass
+#        finally:
+#            try:
+#                tls.close()
+#            except OSError:
+#                pass
+#
+#    def handle_error(self, request, client_address):
+#        # Whatever a handler did not catch, with its traceback, at error
+#        # level. http.server's default prints it at info, where nobody looks.
+#        if isinstance(sys.exc_info()[1], GONE):
+#            return
+#        log_exception("request from %s failed" % client_address[0])
+#
+#
 ## --------------------------------------------------------------- sync API
 #class API(http.server.BaseHTTPRequestHandler):
 #    server_version = "smartdns"
@@ -3860,8 +3966,28 @@ exit 0
 #    relays = ()
 #    tg = None
 #
-#    def log_message(self, *a):
-#        pass
+#    def log_message(self, fmt, *args):
+#        # http.server's own notes - a malformed request, a timeout. The access
+#        # line is log_request below.
+#        log(INFO, "api %s from %s" % (fmt % args, self.client_address[0]))
+#
+#    def parse_request(self):
+#        self._t0 = time.monotonic()
+#        return super().parse_request()
+#
+#    def log_request(self, code="-", size="-"):
+#        """One line per request, except the heartbeat: every relay syncs every
+#        thirty seconds, and a line for each would bury everything else. A sync
+#        is logged when it fails or crawls."""
+#        path = urllib.parse.urlparse(getattr(self, "path", "") or "").path[:120]
+#        took = time.monotonic() - getattr(self, "_t0", time.monotonic())
+#        try:
+#            fine = int(code) == 200
+#        except (TypeError, ValueError):
+#            fine = False
+#        if path == "/sync" and fine and took < 2:
+#            return
+#        log_access(self, "api", code, path, getattr(self, "_who", ""))
 #
 #    def reply(self, code, obj):
 #        body = json.dumps(obj).encode()
@@ -3882,7 +4008,14 @@ exit 0
 #        want = "Bearer " + self.secret
 #        # Constant time, so the comparison cannot be used to guess the secret
 #        # one character at a time.
-#        return hmac.compare_digest(given, want)
+#        if hmac.compare_digest(given, want):
+#            return True
+#        # One of our own relays with the wrong secret is a broken pairing,
+#        # not a scanner, and nothing works on that relay until it is fixed.
+#        # Strangers get only their request line.
+#        log(WARN, "api: %s is a paired relay but sent the wrong secret - its "
+#            "SYNC_SECRET does not match this panel's" % self.client_address[0])
+#        return False
 #
 #    def do_POST(self):
 #        if not self.authorised():
@@ -3912,7 +4045,7 @@ exit 0
 #            try:
 #                enforce_quotas(self.store)
 #            except Exception as e:
-#                print("quota pass failed: %r" % e, file=sys.stderr, flush=True)
+#                log_exception("quota pass failed: %r" % e)
 #            by_ip, profiles = self.store.profiles(CATALOGUE, DEFAULT_TEMPLATE[0])
 #            # The label goes into the nftables element as a comment, so that
 #            # `smartdns-acl list` on the relay is readable without the
@@ -3929,6 +4062,7 @@ exit 0
 #                "SELECT domain FROM custom_domains ORDER BY domain")]
 #            return self.reply(200, {"allowed": allowed, "profiles": profiles,
 #                                    "extra_domains": extra,
+#                                    "templates": self.store.template_names(),
 #                                    })
 #
 #        # ---- user panel, served by the relay on the customer's behalf ----
@@ -3952,6 +4086,9 @@ exit 0
 #        row = self.store.one(
 #            "SELECT u.* FROM panel_sessions s JOIN users u ON u.id = s.user_id"
 #            " WHERE s.token = ? AND s.expires_at > ?", (token or "", now()))
+#        if row:
+#            # Named on the request line: which customer, never the session.
+#            self._who = "user #%d" % row["id"]
 #        return row
 #
 #    def do_user_signup(self, body):
@@ -4001,6 +4138,7 @@ exit 0
 #        ip = body.get("ip", "")
 #        ok, wait = THROTTLE.check("login:%s" % ip, limit=8, window=900)
 #        if not ok:
+#            log(WARN, "api login throttled for %s: too many failed attempts" % ip)
 #            return {"ok": False, "message":
 #                    "تلاش زیاد بوده. %d دقیقه دیگر امتحان کنید."
 #                    % max(1, wait // 60)}
@@ -4011,8 +4149,13 @@ exit 0
 #        # messages tell anybody who asks which names have accounts.
 #        if not user or not check_password(user, body.get("password") or ""):
 #            THROTTLE.hit("login:%s" % ip)
+#            # The name tried and where from - enough to answer "I can't get
+#            # in". Never the password.
+#            log(INFO, "api login failed for %r from %s" % (username, ip))
 #            return {"ok": False, "message": "نام کاربری یا رمز درست نیست"}
 #        THROTTLE.clear("login:%s" % ip)
+#        self._who = "user #%d" % user["id"]
+#        log(INFO, "api login: user #%d (%s) from %s" % (user["id"], username, ip))
 #        return {"ok": True, "session": self.store.open_session(user["id"])}
 #
 #    def do_user_password(self, body):
@@ -4168,11 +4311,13 @@ exit 0
 #    API.secret = cfg["SYNC_SECRET"]
 #    # Comma separated, so one exit can serve several relays.
 #    API.relays = tuple(x.strip() for x in cfg["RELAY_IP"].split(",") if x.strip())
-#    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", API_PORT), API)
 #    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 #    ctx.load_cert_chain(CERT, KEY)
-#    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-#    httpd.serve_forever()
+#    make_api_server(ctx).serve_forever()
+#
+#
+#def make_api_server(ctx, port=None):
+#    return TLSServer(("0.0.0.0", API_PORT if port is None else port), API, ctx)
 #
 #
 #def watch_self(store):
@@ -4188,7 +4333,7 @@ exit 0
 #            store.record_metrics("exit", health.sample())
 #            store.prune_metrics()
 #        except Exception as e:
-#            print("self health failed: %r" % e, file=sys.stderr, flush=True)
+#            log(WARN, "self health failed: %r" % e)
 #        time.sleep(30)
 #
 #
@@ -4286,11 +4431,13 @@ exit 0
 #import http.server
 #import json
 #import os
+#import re
 #import ssl
 #import subprocess
 #import sys
 #import threading
 #import time
+#import traceback
 #import urllib.parse
 #
 #CONFIG = "/etc/smart-dns/sync.env"
@@ -4324,6 +4471,44 @@ exit 0
 #
 #
 #CFG = None
+#
+#
+## ------------------------------------------------------------------ logging
+## journald reads a leading <N> on a line as its syslog level. Warnings and
+## errors carry one, so `journalctl -p warning` - which is what
+## `smartdns-logs -e` runs - shows exactly the problems. Ordinary lines stay
+## unmarked and land at info, as they always did. Before this everything
+## landed at info, stderr included, and a failure looked like a heartbeat.
+#INFO, WARN, ERROR = 6, 4, 3
+## The visitor went away, or never finished saying hello. Not a fault here.
+#GONE = (ConnectionError, TimeoutError, ssl.SSLError)
+#
+#
+#def log(level, msg):
+#    tag = "<%d>" % level if level < INFO else ""
+#    for line in str(msg).splitlines() or [""]:
+#        print(tag + line, flush=True)
+#
+#
+#def log_exception(what):
+#    """An error with its traceback, every line at error level. journald makes
+#    each line its own entry, and at info all but the first would be lost
+#    among the ordinary ones."""
+#    log(ERROR, "%s\n%s" % (what, traceback.format_exc().rstrip()))
+#
+#
+#def log_access(h, prefix, code, path, who=""):
+#    """One line for one request: what was asked, the answer, how long it took
+#    and who asked. Server errors at error level; everything else is info."""
+#    try:
+#        code = int(code)
+#    except (TypeError, ValueError):
+#        code = 0
+#    ms = (time.monotonic() - getattr(h, "_t0", time.monotonic())) * 1000
+#    # 501 is a scanner's GET to a POST-only port: the visitor's mistake.
+#    log(ERROR if code >= 500 and code != 501 else INFO, "%s %s %s %d %dms from %s%s" % (
+#        prefix, getattr(h, "command", None) or "-", path, code, ms,
+#        h.client_address[0], " " + who if who else ""))
 #
 #
 #def post(path, payload):
@@ -4478,9 +4663,37 @@ exit 0
 ## the ones decided per template - a profile that does not route something must
 ## not find a rule for it at all.
 #BASE_DIR = "/etc/smartdns-base"
+## The main resolver's config directory. A name rather than a literal so a test
+## can lay a relay out somewhere else.
+#DNSMASQ_D = "/etc/dnsmasq.d"
 #
 #
 #EPIC_PINS = "/etc/dnsmasq.d/epic-pins.conf"
+#
+## The templates' names, as the panel knows them. Only smartdns-rules reads this
+## - the resolvers go by number - but "test" means something to an operator
+## where "profile 2" does not.
+#TEMPLATE_NAMES = "/var/lib/smart-dns/templates.json"
+#
+#
+#def save_template_names(info):
+#    """Keep the names the panel sent. Returns whether the file changed."""
+#    if not isinstance(info, dict) or not isinstance(info.get("names"), dict):
+#        return False      # an older panel, which does not send them
+#    text = json.dumps({"default": info.get("default"), "names": info["names"]},
+#                      ensure_ascii=False, sort_keys=True) + "\n"
+#    try:
+#        with open(TEMPLATE_NAMES, encoding="utf-8") as fh:
+#            if fh.read() == text:
+#                return False
+#    except OSError:
+#        pass
+#    os.makedirs(os.path.dirname(TEMPLATE_NAMES), exist_ok=True)
+#    tmp = TEMPLATE_NAMES + ".tmp"
+#    with open(tmp, "w", encoding="utf-8") as fh:
+#        fh.write(text)
+#    os.replace(tmp, TEMPLATE_NAMES)
+#    return True
 #
 #
 #def epic_pin_lines():
@@ -4511,7 +4724,7 @@ exit 0
 #    by not linking the file.
 #    """
 #    os.makedirs(BASE_DIR, exist_ok=True)
-#    want = {f for f in os.listdir("/etc/dnsmasq.d")
+#    want = {f for f in os.listdir(DNSMASQ_D)
 #            if f.endswith(".conf")
 #            and f not in (os.path.basename(CUSTOM_CONF),
 #                          os.path.basename(EPIC_PINS),
@@ -4520,12 +4733,87 @@ exit 0
 #    have = set(os.listdir(BASE_DIR))
 #    changed = False
 #    for f in want - have:
-#        os.symlink(os.path.join("/etc/dnsmasq.d", f), os.path.join(BASE_DIR, f))
+#        os.symlink(os.path.join(DNSMASQ_D, f), os.path.join(BASE_DIR, f))
 #        changed = True
 #    for f in have - want:
 #        os.unlink(os.path.join(BASE_DIR, f))
 #        changed = True
 #    return changed
+#
+#
+#RULE_LINE = re.compile(r"^(address|server|local)=/(.+)/([^/]*)$")
+#
+#
+#def base_settings():
+#    """The main resolver's settings, less its rules, for the profiles to share.
+#
+#    They sit in the same file as the hijack list - the upstream servers,
+#    no-resolv, the cache, the addresses to listen on - and that is a file the
+#    profiles must not read. Leaving it out took the settings with it: a
+#    template's resolver fell back to /etc/resolv.conf for its upstreams and to
+#    dnsmasq's default cache of 150 names, over the slowest link there is. So
+#    the settings are copied across and only the rules stay behind.
+#    """
+#    try:
+#        with open(HIJACK_CONF) as fh:
+#            lines = [l.strip() for l in fh]
+#    except OSError:
+#        return []
+#    return [l for l in lines
+#            if l and not l.startswith("#") and not RULE_LINE.match(l)]
+#
+#
+#def rule_sets(text, me):
+#    """What one resolver's config routes, bypasses and pins, as sets."""
+#    out = {"routes": set(), "bypasses": set(), "pins": set()}
+#    for line in (text or "").splitlines():
+#        m = RULE_LINE.match(line.strip())
+#        if not m:
+#            continue
+#        kind, domains, target = m.groups()
+#        for d in filter(None, domains.split("/")):
+#            if kind != "address":
+#                out["bypasses"].add(d)
+#            elif target == me:
+#                out["routes"].add(d)
+#            else:
+#                # With its address, so a pin moving somewhere new shows up as
+#                # the change it is rather than as nothing.
+#                out["pins"].add("%s=%s" % (d, target))
+#    return out
+#
+#
+#def signed(names, sign, limit=15):
+#    out = [sign + n for n in names[:limit]]
+#    if len(names) > limit:
+#        out.append("(%s%d more)" % (sign, len(names) - limit))
+#    return out
+#
+#
+#def describe_change(old_text, new_text, me):
+#    """What changed between two versions of a resolver's rules, in one line:
+#    each name that started or stopped being routed, bypassed or pinned.
+#
+#    This is the record of why a name went where it went. A count said that
+#    something changed; it could not say that gemini.google.com stopped going
+#    through the relay at 14:02, which is the question an operator is asking.
+#    """
+#    new = rule_sets(new_text, me)
+#    if old_text is None:
+#        return "routes %d, bypasses %d, pins %d" % (
+#            len(new["routes"]), len(new["bypasses"]), len(new["pins"]))
+#    old = rule_sets(old_text, me)
+#    parts = []
+#    for key in ("routes", "bypasses", "pins"):
+#        plus, minus = sorted(new[key] - old[key]), sorted(old[key] - new[key])
+#        if plus or minus:
+#            parts.append("%s %s" % (key, " ".join(signed(plus, "+") + signed(minus, "-"))))
+#    return "; ".join(parts) or "settings only"
+#
+#
+#def template_label(key, names):
+#    name = (names or {}).get(str(key))
+#    return "template %s (%s)" % (key, name) if name else "template %s" % key
 #
 #
 #def apply_custom_domains(domains):
@@ -4560,15 +4848,20 @@ exit 0
 #        else:
 #            with open(CUSTOM_CONF, "w") as fh:
 #                fh.write(current)
-#        print("custom domains rejected by dnsmasq - reverted",
-#              file=sys.stderr, flush=True)
+#        log(ERROR, "custom domains rejected by dnsmasq - reverted")
 #        return False
 #    sh("systemctl", "restart", "dnsmasq")
-#    print("custom domains: %d applied" % len(set(domains)), flush=True)
+#    old, new = rule_sets(current, self_ip)["routes"], set(domains)
+#    print("custom domains: %s (now %d)"
+#          % (" ".join(signed(sorted(new - old), "+") + signed(sorted(old - new), "-"))
+#             or "rewritten", len(new)), flush=True)
 #    return True
 #
 #
-#def apply_profiles(profiles, assignment, restart=False):
+#KNOWN_NAMES = {}
+#
+#
+#def apply_profiles(profiles, assignment, restart=False, names=None):
 #    """Give each template its own resolver, and point each address at one.
 #
 #    dnsmasq cannot answer differently per client, so the split is done with one
@@ -4580,6 +4873,10 @@ exit 0
 #    the main resolver on port 53 already does, and every address not named in a
 #    redirect falls through to it.
 #    """
+#    # A name outlives its template in the log: one deleted in the panel is no
+#    # longer in what the panel sends, but its retirement should still say which.
+#    KNOWN_NAMES.update(names or {})
+#    names = KNOWN_NAMES
 #    os.makedirs(PROFILE_DIR, exist_ok=True)
 #    if sync_base_dir():
 #        restart = True
@@ -4589,12 +4886,14 @@ exit 0
 #
 #    # Read once: every profile that wants them gets the same lines.
 #    epic_pins = epic_pin_lines()
+#    settings = base_settings()
 #
 #    wanted_units = set()
 #    for key, spec in sorted(profiles.items()):
 #        port = ports[key]
 #        body = ["# generated by smartdns-sync - do not edit",
 #                "port=%d" % port]
+#        body += settings
 #        # The operator's own domains, listed only for templates that route
 #        # them. They cannot be un-routed by rule the way a service can: both
 #        # rules would name the same host and dnsmasq prefers the address= one.
@@ -4622,10 +4921,11 @@ exit 0
 #            body += epic_pins
 #        conf = os.path.join(PROFILE_DIR, "%s.conf" % key)
 #        text = "\n".join(body) + "\n"
-#        changed = True
+#        old = None
 #        if os.path.exists(conf):
 #            with open(conf) as fh:
-#                changed = fh.read() != text
+#                old = fh.read()
+#        changed = old != text
 #        if changed:
 #            with open(conf, "w") as fh:
 #                fh.write(text)
@@ -4638,8 +4938,11 @@ exit 0
 #        # and silently miss everybody on a template.
 #        if changed or not active or restart:
 #            sh("systemctl", "restart", unit)
-#            print("profile %s on port %d (%d bypassed)"
-#                  % (key, port, len(spec.get("bypass", []))), flush=True)
+#            why = (describe_change(old, text, me) if changed
+#                   else "was not running" if not active
+#                   else "shared config changed")
+#            print("%s on port %d restarted - %s"
+#                  % (template_label(key, names), port, why), flush=True)
 #
 #    # Stop resolvers for profiles nobody is on any more, and delete their
 #    # config, so a template an admin removed does not linger as a process.
@@ -4654,14 +4957,21 @@ exit 0
 #                os.remove(os.path.join(PROFILE_DIR, "%s.conf" % key))
 #            except OSError:
 #                pass
-#            print("profile %s retired" % key, flush=True)
+#            print("%s retired - nobody is on it" % template_label(key, names),
+#                  flush=True)
 #
-#    apply_redirects(ports, assignment)
+#    apply_redirects(ports, assignment, names)
 #
 #
-#def apply_redirects(ports, assignment):
+## Who was on which template at the last sync, so a move is logged once rather
+## than every thirty seconds. None until the first pass has looked.
+#LAST_ASSIGNMENT = None
+#
+#
+#def apply_redirects(ports, assignment, names=None):
 #    """Point each address at its profile's resolver, with one nftables set per
 #    profile and a redirect rule per set."""
+#    global LAST_ASSIGNMENT
 #    if nft("list", "table", "ip", NAT_TABLE).returncode != 0:
 #        nft("add", "table", "ip", NAT_TABLE)
 #    nft("add", "chain", "ip", NAT_TABLE, "pre",
@@ -4683,6 +4993,28 @@ exit 0
 #                "ip saddr @%s udp dport 53 redirect to :%d" % (setname, port))
 #            nft("add", "rule", "ip", NAT_TABLE, "pre",
 #                "ip saddr @%s tcp dport 53 redirect to :%d" % (setname, port))
+#
+#    # Sets no rule points at any more - a template that lost its last customer.
+#    # Harmless left behind, but misleading: they go on listing addresses that
+#    # the default resolver is really answering.
+#    # The whole table, not `list sets ip <table>`: nft takes only a family
+#    # there, refuses the table name, and the cleanup silently did nothing.
+#    listed = nft("list", "table", "ip", NAT_TABLE)
+#    for setname in re.findall(r"set (prof_\S+) \{", listed.stdout or ""):
+#        if setname[len("prof_"):] not in ports:
+#            nft("delete", "set", "ip", NAT_TABLE, setname)
+#
+#    now = {ip: prof for ip, prof in assignment.items() if prof in ports}
+#    if LAST_ASSIGNMENT is not None:
+#        for ip in sorted(set(now) | set(LAST_ASSIGNMENT)):
+#            was, got = LAST_ASSIGNMENT.get(ip), now.get(ip)
+#            if was == got:
+#                continue
+#            if got:
+#                print("%s now on %s" % (ip, template_label(got, names)), flush=True)
+#            else:
+#                print("%s left %s" % (ip, template_label(was, names)), flush=True)
+#    LAST_ASSIGNMENT = now
 #
 #
 #def acl(*args):
@@ -4725,15 +5057,14 @@ exit 0
 #        # than every half minute, and carry on - unshaped is the old
 #        # behaviour, not a broken one.
 #        if SHAPED is None:
-#            print("%s is missing - speed limits will not be applied" % SHAPE,
-#                  file=sys.stderr, flush=True)
+#            log(WARN, "%s is missing - speed limits will not be applied" % SHAPE)
 #        SHAPED = wanted
 #        return
 #    r = subprocess.run([SHAPE, "apply"], input=json.dumps(wanted),
 #                       capture_output=True, text=True, timeout=60)
 #    if r.returncode != 0:
 #        # Leave SHAPED alone so the next pass tries again.
-#        print("shaping failed: %s" % r.stderr.strip(), file=sys.stderr, flush=True)
+#        log(ERROR, "shaping failed: %s" % r.stderr.strip())
 #        return
 #    if r.stdout.strip():
 #        print(r.stdout.strip(), flush=True)
@@ -4786,6 +5117,10 @@ exit 0
 #    except Exception as e:
 #        host = {"error": str(e)}
 #    answer = post("/sync", {"counters": counters, "host": host})
+#    try:
+#        save_template_names(answer.get("templates"))
+#    except Exception as e:
+#        log(WARN, "template names not saved: %s" % e)
 #
 #    names = {a["ip"]: a.get("name", "") for a in answer.get("allowed", [])}
 #    want = set(names)
@@ -4798,23 +5133,24 @@ exit 0
 #        changed = apply_custom_domains(answer.get("extra_domains") or [])
 #        assignment = {a["ip"]: a.get("profile", "")
 #                      for a in answer.get("allowed", []) if a.get("profile")}
-#        apply_profiles(answer.get("profiles") or {}, assignment, restart=changed)
+#        apply_profiles(answer.get("profiles") or {}, assignment, restart=changed,
+#                       names=(answer.get("templates") or {}).get("names"))
 #    except Exception as e:
-#        print("profiles failed: %s" % e, file=sys.stderr, flush=True)
+#        log_exception("profiles failed: %s" % e)
 #
 #    try:
 #        apply_speeds(answer.get("allowed") or [])
 #    except Exception as e:
-#        print("speeds failed: %s" % e, file=sys.stderr, flush=True)
+#        log_exception("speeds failed: %s" % e)
 #
 #    for ip in sorted(want - have):
 #        r = acl("add", ip, names[ip]) if names[ip] else acl("add", ip)
-#        print("added %s%s" % (ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()),
-#              flush=True)
+#        log(INFO if r.returncode == 0 else ERROR, "added %s%s" % (
+#            ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()))
 #    for ip in sorted(have - want):
 #        r = acl("del", ip)
-#        print("removed %s%s" % (ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()),
-#              flush=True)
+#        log(INFO if r.returncode == 0 else ERROR, "removed %s%s" % (
+#            ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()))
 #
 #    # After the set is filled, not before: enforcing while the kernel list is
 #    # still empty is refused, and would leave the relay open for another cycle.
@@ -4837,7 +5173,9 @@ exit 0
 #            # already in the kernel keeps working throughout - a sync outage
 #            # must never cut off paying users.
 #            if fails <= 3 or fails % 20 == 0:
-#                print("sync failed (%d): %s" % (fails, e), file=sys.stderr, flush=True)
+#                # A warning while it could be a blip on the link; an error
+#                # once it has gone on long enough to be an outage.
+#                log(WARN if fails < 3 else ERROR, "sync failed (%d): %s" % (fails, e))
 #        time.sleep(INTERVAL)
 #
 #
@@ -5087,8 +5425,20 @@ exit 0
 #    server_version = "smartdns"
 #    protocol_version = "HTTP/1.1"
 #
-#    def log_message(self, *a):
-#        pass
+#    def log_message(self, fmt, *args):
+#        # http.server's own notes - a malformed request, a timeout. The access
+#        # line is log_request below.
+#        log(INFO, "panel %s from %s" % (fmt % args, self.client_address[0]))
+#
+#    def parse_request(self):
+#        self._t0 = time.monotonic()
+#        return super().parse_request()
+#
+#    def log_request(self, code="-", size="-"):
+#        # The path only. The query carries nothing but the message shown after
+#        # a form, and the cookie - the session - is never written anywhere.
+#        log_access(self, "panel", code,
+#                   urllib.parse.urlparse(getattr(self, "path", "") or "").path[:120])
 #
 #    def client_ip(self):
 #        # The socket, never a header. Trusting X-Forwarded-For here would let
@@ -5240,7 +5590,7 @@ exit 0
 #            try:
 #                res = post(endpoint, payload)
 #            except Exception as e:
-#                print("%s failed: %s" % (endpoint, e), file=sys.stderr, flush=True)
+#                log(ERROR, "panel: %s failed: %s" % (endpoint, e))
 #                return self.redirect(path, "الان نشد، چند دقیقه دیگر", bad=True)
 #            if not res.get("ok"):
 #                return self.redirect(path, res.get("message", "خطا"), bad=True)
@@ -5264,7 +5614,7 @@ exit 0
 #                    "new": form.get("new", ""),
 #                })
 #            except Exception as e:
-#                print("password change failed: %s" % e, file=sys.stderr, flush=True)
+#                log(ERROR, "panel: password change failed: %s" % e)
 #                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
 #            return self.redirect("/", res.get("message", ""),
 #                                 bad=not res.get("ok"))
@@ -5286,7 +5636,7 @@ exit 0
 #                    "data": base64.b64encode(blob).decode("ascii"),
 #                })
 #            except Exception as e:
-#                print("receipt failed: %s" % e, file=sys.stderr, flush=True)
+#                log(ERROR, "panel: receipt failed: %s" % e)
 #                return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
 #            return self.redirect("/", res.get("message", ""),
 #                                 bad=not res.get("ok"))
@@ -5296,7 +5646,8 @@ exit 0
 #        try:
 #            res = post("/user-claim", {"session": self.session(),
 #                                       "ip": self.client_ip()})
-#        except Exception:
+#        except Exception as e:
+#            log(ERROR, "panel: user-claim failed: %s" % e)
 #            res = {"ok": False, "message": "الان نشد"}
 #        return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 #
@@ -5307,7 +5658,7 @@ exit 0
 #        try:
 #            info = post("/user-info", {"session": token, "ip": self.client_ip()})
 #        except Exception as e:
-#            print("user-info failed: %s" % e, file=sys.stderr, flush=True)
+#            log(ERROR, "panel: user-info failed: %s" % e)
 #            return self.send_html("<div class='icon'>⚠️</div><h1>الان نشد</h1>"
 #                                  "<p class='sub'>چند دقیقه دیگر دوباره.</p>", 502)
 #        if not info.get("ok"):
@@ -5456,6 +5807,8 @@ exit 0
 #        super().__init__(addr, handler)
 #
 #    def finish_request(self, request, client_address):
+#        if self.ctx is None:      # plain http, for tests only
+#            return super().finish_request(request, client_address)
 #        request.settimeout(HANDSHAKE_TIMEOUT)
 #        try:
 #            tls = self.ctx.wrap_socket(request, server_side=True)
@@ -5473,6 +5826,13 @@ exit 0
 #                tls.close()
 #            except OSError:
 #                pass
+#
+#    def handle_error(self, request, client_address):
+#        # Whatever a handler did not catch, with its traceback, at error
+#        # level. http.server's default prints it at info, where nobody looks.
+#        if isinstance(sys.exc_info()[1], GONE):
+#            return
+#        log_exception("request from %s failed" % client_address[0])
 #
 #
 #def make_panel_server(ctx, port=None):
@@ -5738,6 +6098,7 @@ exit 0
 #import sys
 #import threading
 #import time
+#import traceback
 #import urllib.parse
 #from datetime import datetime, timedelta, timezone
 #
@@ -5768,12 +6129,10 @@ exit 0
 #        r = subprocess.run(["systemctl"] + list(args), capture_output=True,
 #                           text=True, timeout=30)
 #        if r.returncode != 0:
-#            print("systemctl %s: %s" % (" ".join(args), r.stderr.strip()),
-#                  file=sys.stderr, flush=True)
+#            log(WARN, "systemctl %s: %s" % (" ".join(args), r.stderr.strip()))
 #        return r.returncode == 0
 #    except Exception as e:
-#        print("systemctl %s failed: %r" % (" ".join(args), e),
-#              file=sys.stderr, flush=True)
+#        log(WARN, "systemctl %s failed: %r" % (" ".join(args), e))
 #        return False
 #
 #
@@ -6143,6 +6502,117 @@ exit 0
 ## Failed attempts stay in memory. Losing that count on restart only makes
 ## guessing slightly easier for someone who cannot cause restarts anyway.
 #ATTEMPTS = {}          # address -> [count, first_failure_time]
+## ------------------------------------------------------------------ logging
+## journald reads a leading <N> on a line as its syslog level. Warnings and
+## errors carry one, so `journalctl -p warning` - which is what
+## `smartdns-logs -e` runs - shows exactly the problems. Ordinary lines stay
+## unmarked and land at info, as they always did. Before this everything
+## landed at info, stderr included, and a failure looked like a heartbeat.
+#INFO, WARN, ERROR = 6, 4, 3
+## The visitor went away, or never finished saying hello. Not a fault here.
+#GONE = (ConnectionError, TimeoutError, ssl.SSLError)
+#
+#
+#def log(level, msg):
+#    tag = "<%d>" % level if level < INFO else ""
+#    for line in str(msg).splitlines() or [""]:
+#        print(tag + line, flush=True)
+#
+#
+#def log_exception(what):
+#    """An error with its traceback, every line at error level. journald makes
+#    each line its own entry, and at info all but the first would be lost
+#    among the ordinary ones."""
+#    log(ERROR, "%s\n%s" % (what, traceback.format_exc().rstrip()))
+#
+#
+#def log_access(h, prefix, code, path, who=""):
+#    """One line for one request: what was asked, the answer, how long it took
+#    and who asked. Server errors at error level; everything else is info."""
+#    try:
+#        code = int(code)
+#    except (TypeError, ValueError):
+#        code = 0
+#    ms = (time.monotonic() - getattr(h, "_t0", time.monotonic())) * 1000
+#    # 501 is a scanner's GET to a POST-only port: the visitor's mistake.
+#    log(ERROR if code >= 500 and code != 501 else INFO, "%s %s %s %d %dms from %s%s" % (
+#        prefix, getattr(h, "command", None) or "-", path, code, ms,
+#        h.client_address[0], " " + who if who else ""))
+#
+#
+## Form fields never written to the journal, whatever the action.
+#SECRET_FIELDS = re.compile(r"pass|token|secret|session|salt|hash", re.I)
+#
+#
+#def describe(params):
+#    """An action's form, fit for the journal: no passwords or tokens, and a
+#    long list - a template's domains - as a count rather than every name."""
+#    out = []
+#    for k in sorted(params):
+#        vals = [v for v in params[k] if v != ""]
+#        if not vals:
+#            continue
+#        if SECRET_FIELDS.search(k):
+#            out.append("%s=***" % k)
+#        elif len(vals) > 4:
+#            out.append("%s=[%d]" % (k, len(vals)))
+#        else:
+#            out.append("%s=%s" % (k, ",".join(v[:40] for v in vals)))
+#    return " " + " ".join(out) if out else ""
+#
+#
+## How long a visitor may take over the TLS handshake, and then how long any one
+## read or write may stall. Per operation, so an upload that keeps moving is
+## never cut off, while a connection that has gone quiet is let go.
+#HANDSHAKE_TIMEOUT = 10
+#IO_TIMEOUT = 30
+#
+#
+#class TLSServer(http.server.ThreadingHTTPServer):
+#    """TLS per connection, under a deadline - never on the listening socket.
+#
+#    Wrapping the listening socket runs every visitor's handshake inside
+#    accept(), on the one thread that accepts for all of them and with no
+#    timeout, so a single connection that opens and then says nothing freezes
+#    the server for everybody until it goes away. The customer panel froze
+#    exactly that way in production, and this server was built the same way.
+#    Here accept() only accepts; a stalled visitor stalls only its own thread.
+#
+#    ctx=None serves plain http. That is for tests - main() refuses to.
+#    """
+#    daemon_threads = True
+#
+#    def __init__(self, addr, handler, ctx):
+#        self.ctx = ctx
+#        super().__init__(addr, handler)
+#
+#    def finish_request(self, request, client_address):
+#        if self.ctx is None:
+#            return super().finish_request(request, client_address)
+#        request.settimeout(HANDSHAKE_TIMEOUT)
+#        try:
+#            tls = self.ctx.wrap_socket(request, server_side=True)
+#        except (ssl.SSLError, OSError):
+#            return      # a scanner, a dropped phone, plain http to an https port
+#        try:
+#            tls.settimeout(IO_TIMEOUT)
+#            self.RequestHandlerClass(tls, client_address, self)
+#        except (ssl.SSLError, OSError):
+#            pass
+#        finally:
+#            try:
+#                tls.close()
+#            except OSError:
+#                pass
+#
+#    def handle_error(self, request, client_address):
+#        # Whatever a handler did not catch, with its traceback, at error
+#        # level. http.server's default prints it at info, where nobody looks.
+#        if isinstance(sys.exc_info()[1], GONE):
+#            return
+#        log_exception("request from %s failed" % client_address[0])
+#
+#
 #STORE = None
 #CFG = {}
 #
@@ -6151,8 +6621,29 @@ exit 0
 #    server_version = "smartdns"
 #    protocol_version = "HTTP/1.1"
 #
-#    def log_message(self, *a):
-#        pass
+#    def log_message(self, fmt, *args):
+#        # http.server's own notes - a malformed request, a timeout. They can
+#        # quote the raw request line, so the secret path is masked here too.
+#        msg = fmt % args
+#        if CFG.get("ADMIN_PATH"):
+#            msg = msg.replace(CFG["ADMIN_PATH"], "<admin>")
+#        log(INFO, "admin %s from %s" % (msg, self.client_address[0]))
+#
+#    def parse_request(self):
+#        self._t0 = time.monotonic()
+#        return super().parse_request()
+#
+#    def log_request(self, code="-", size="-"):
+#        log_access(self, "admin", code, self.shown_path())
+#
+#    def shown_path(self):
+#        """The path for the journal, with the secret part shown as <admin>
+#        and the query - only ever the message after an action - left off."""
+#        path = urllib.parse.urlparse(getattr(self, "path", "") or "").path
+#        secret = CFG.get("ADMIN_PATH") or ""
+#        if secret and (path == "/" + secret or path.startswith("/" + secret + "/")):
+#            path = "/<admin>" + path[len(secret) + 1:]
+#        return path[:120]
 #
 #    # -- plumbing ---------------------------------------------------------
 #    def send(self, body, code=200, headers=None):
@@ -6191,6 +6682,12 @@ exit 0
 #            fields = []
 #            for item in query.split("&"):
 #                key, _, value = item.partition("=")
+#                # A message starting with ! is a refusal - a bad number, a
+#                # name already taken. The request line cannot say which; this
+#                # can.
+#                if key == "m" and value.startswith("!"):
+#                    log(WARN, "admin %s refused: %s"
+#                        % (getattr(self, "_action", "-"), value[1:]))
 #                fields.append("%s=%s" % (key, urllib.parse.quote(value, safe="")))
 #            query = "?" + "&".join(fields)
 #        h = {"Location": "/%s/%s%s" % (CFG["ADMIN_PATH"], base, query)}
@@ -6219,7 +6716,7 @@ exit 0
 #            with open(path, "rb") as fh:
 #                blob = fh.read()
 #        except Exception as e:
-#            print("backup failed: %r" % e, file=sys.stderr, flush=True)
+#            log_exception("backup failed: %r" % e)
 #            return self.redirect("settings?m=!پشتیبان‌گیری نشد: %s" % e)
 #        finally:
 #            try:
@@ -6417,7 +6914,7 @@ exit 0
 #                    pass
 #            systemctl("start", "smartdns-panel")
 #        except Exception as e:
-#            print("restore failed: %r" % e, file=sys.stderr, flush=True)
+#            log_exception("restore failed: %r" % e)
 #            systemctl("start", "smartdns-panel")
 #            return self.redirect("settings?m=!بازگردانی نشد: %s" % e)
 #        PENDING.clear()
@@ -6499,13 +6996,8 @@ exit 0
 #        """
 #        if self.session_ok():
 #            return self.redirect("")
-#        path = urllib.parse.urlparse(self.path).path
-#        # Logged so that "it 404s sometimes" is answerable next time. Only
-#        # paths that missed the prefix, so the secret never reaches the
-#        # journal.
-#        if not path.startswith("/" + CFG["ADMIN_PATH"]):
-#            print("404 %s from %s" % (path[:80], self.client_address[0]),
-#                  file=sys.stderr, flush=True)
+#        # Its request line names the path and who asked, the secret part
+#        # masked, so "it 404s sometimes" stays answerable.
 #        return self.send("<h1>404</h1>", 404)
 #
 #    def do_GET(self):
@@ -6527,7 +7019,7 @@ exit 0
 #        try:
 #            return self.view(rest)
 #        except Exception as e:
-#            print("admin GET %s failed: %r" % (rest, e), file=sys.stderr, flush=True)
+#            log_exception("admin GET %s failed" % rest)
 #            return self.send(page("خطا", "<div class='card'>%s</div>"
 #                                  % html.escape(str(e)), CFG), 500)
 #
@@ -6538,6 +7030,8 @@ exit 0
 #        params = self.body_params()
 #        if not self.session_ok():
 #            if self.locked_out():
+#                log(WARN, "admin login refused from %s: too many failed attempts"
+#                    % self.client_address[0])
 #                return self.send(login_page(
 #                    CFG, "تلاش‌های ناموفق زیاد. چند دقیقه صبر کنید."))
 #            given = self.one(params, "password")
@@ -6556,15 +7050,24 @@ exit 0
 #                STORE.run("DELETE FROM admin_sessions WHERE expires_at <= ?",
 #                          (now(),))
 #                ATTEMPTS.pop(self.client_address[0], None)
+#                log(INFO, "admin login from %s" % self.client_address[0])
 #                return self.redirect("", {
 #                    "Set-Cookie": "sdns=%s; Path=/; HttpOnly; Secure; SameSite=Strict"
 #                                  % token})
 #            self.note_failure()
+#            if given:
+#                log(WARN, "admin login failed from %s (%d in a row)"
+#                    % (self.client_address[0],
+#                       ATTEMPTS.get(self.client_address[0], (0, 0))[0]))
 #            return self.send(login_page(CFG, "رمز اشتباه است."))
+#        # What was done, before doing it - so an action that then fails is
+#        # still on the record, next to the error it caused.
+#        self._action = rest
+#        log(INFO, "admin action %s%s" % (rest, describe(params)))
 #        try:
 #            return self.action(rest, params)
 #        except Exception as e:
-#            print("admin POST %s failed: %r" % (rest, e), file=sys.stderr, flush=True)
+#            log_exception("admin POST %s failed" % rest)
 #            return self.send(page("خطا", "<div class='card'>%s</div>"
 #                                  % html.escape(str(e)), CFG), 500)
 #
@@ -7306,6 +7809,10 @@ exit 0
 #    os.replace(tmp, CONFIG)
 #
 #
+#def make_admin_server(ctx, port):
+#    return TLSServer(("0.0.0.0", port), Admin, ctx)
+#
+#
 #def main():
 #    global STORE, CFG, CATALOGUE
 #    CFG = load_config()
@@ -7313,13 +7820,12 @@ exit 0
 #    STORE = Store(DB)
 #
 #    port = int(CFG["ADMIN_PORT"])
-#    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), Admin)
 #    cert = CFG.get("ADMIN_CERT")
 #    key = CFG.get("ADMIN_KEY")
 #    if cert and key and os.path.exists(cert):
 #        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 #        ctx.load_cert_chain(cert, key)
-#        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+#        httpd = make_admin_server(ctx, port)
 #        scheme = "https"
 #    else:
 #        # Refuse rather than silently serve a login form in the clear: the
@@ -7526,17 +8032,30 @@ exit 0
 ## smartdns-logs - what this machine has been doing, all in one place.
 ##
 ## usage: smartdns-logs          recent logs of every part, and whether each runs
+##        smartdns-logs -e       only warnings and errors
 ##        smartdns-logs -f       follow them live (ctrl-c to stop)
 ##        smartdns-logs -n 500   more lines per part (default 100)
+##        smartdns-logs --report all of it in one file to send, secrets masked
 #set -uo pipefail
+#
+## Where this machine's config lives. A variable only so a test can point it
+## somewhere else; nothing else sets it.
+#ETC="${SMARTDNS_ETC:-/etc/smart-dns}"
 #
 #n=100
 #follow=no
+#report=""
+#errors=""
+## journald's own level filter. The programs mark their warnings and errors
+## with a syslog level, so this is exactly the problems and nothing else.
+#prio=()
 #while [ $# -gt 0 ]; do
 #    case "$1" in
+#        -e|--errors) errors=yes; prio=(-p warning) ;;
 #        -f|--follow) follow=yes ;;
+#        --report) report=yes ;;
 #        -n) shift; n="${1:-}" ;;
-#        -h|--help) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+#        -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 #        *) echo "unknown option: $1  (try -h)" >&2; exit 1 ;;
 #    esac
 #    shift
@@ -7547,7 +8066,7 @@ exit 0
 ## Which side this is decides which parts it has. The timers are listed for
 ## their status - a oneshot service reads "inactive" between runs, which looks
 ## like a fault and is not - and the services for their logs.
-#if [ -f /etc/smart-dns/sync.env ]; then
+#if [ -f "$ETC/sync.env" ]; then
 #    role=relay
 #    status="smartdns-sync dnsmasq nginx coturn epic-pin.timer smartdns-acl-save.timer"
 #    logs="smartdns-sync dnsmasq nginx coturn epic-pin smartdns-acl-save"
@@ -7556,7 +8075,7 @@ exit 0
 #        status="$status smartdns-dns@$(basename "$f" .conf)"
 #        logs="$logs smartdns-dns@$(basename "$f" .conf)"
 #    done
-#elif [ -f /etc/smart-dns/panel.env ]; then
+#elif [ -f "$ETC/panel.env" ]; then
 #    role=exit
 #    status="smartdns-panel smartdns-admin nginx smartdns-cert.timer"
 #    logs="smartdns-panel smartdns-admin nginx smartdns-cert"
@@ -7565,10 +8084,76 @@ exit 0
 #    exit 1
 #fi
 #
+## Every secret in this machine's config, replaced wherever it turns up in a
+## report. None should ever reach a log, but a report is made to be handed to
+## somebody else. Paths are left alone: they are where things are, not keys.
+#MASK=$(cat <<'PY'
+#import glob, re, sys
+#found = set()
+#for path in glob.glob(sys.argv[1] + "/*.env"):
+#    try:
+#        with open(path) as fh:
+#            for line in fh:
+#                key, _, value = line.strip().partition("=")
+#                value = value.strip().strip("\"'")
+#                if (re.search(r"SECRET|PATH|HASH|SALT|TOKEN|PASS", key)
+#                        and len(value) >= 6 and not value.startswith("/")):
+#                    found.add(value.encode())
+#    except OSError:
+#        pass
+#data = sys.stdin.buffer.read()
+#for value in sorted(found, key=len, reverse=True):
+#    data = data.replace(value, b"<secret>")
+#sys.stdout.buffer.write(data)
+#PY
+#)
+#
+## One file with everything worth sending when something is wrong - the state of
+## each part, its warnings and errors, its recent logs - with the secrets masked.
+## It still holds customers' addresses and usernames: those are what the logs
+## are about, and the reader is told so.
+#if [ -n "$report" ]; then
+#    out="${SMARTDNS_REPORT_DIR:-/tmp}/doctor-dns-report-$role-$(date -u +%Y%m%d-%H%M%S).txt"
+#    umask 077
+#    {
+#        echo "doctor dns report - $role - $(date -u '+%F %T') UTC"
+#        echo "version  $(cat /var/lib/smart-dns/version 2>/dev/null || echo '?')"
+#        echo "system   $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-?}"), kernel $(uname -r)"
+#        echo "up       $(uptime -p 2>/dev/null || echo '?')"
+#        # A clock that has drifted breaks TLS between the two machines and
+#        # moves every expiry date, so it earns a line in any report.
+#        echo "clock    $(timedatectl show -p NTPSynchronized --value 2>/dev/null \
+#                         | sed 's/^yes$/synchronised/; s/^no$/NOT synchronised/')"
+#        echo
+#        echo "== disk and memory"
+#        df -h / 2>/dev/null | tail -1
+#        free -m 2>/dev/null | sed -n '1,2p'
+#        if [ "$role" = relay ]; then
+#            echo
+#            echo "== routing"
+#            smartdns-rules 2>&1
+#            echo
+#            echo "== access control"
+#            smartdns-acl enforce status 2>&1 | head -3
+#        fi
+#        echo
+#        echo "################ warnings and errors ################"
+#        bash "$0" -e -n 300
+#        echo
+#        echo "################ recent logs ################"
+#        bash "$0" -n 150
+#    } 2>&1 | python3 -c "$MASK" "$ETC" > "$out"
+#    echo "report written: $out ($(du -k "$out" | cut -f1) KB)"
+#    echo "Secrets and the admin panel's address are masked. It does hold your"
+#    echo "customers' IP addresses and usernames, from the logs - send it only"
+#    echo "to someone you trust."
+#    exit 0
+#fi
+#
 #if [ "$follow" = yes ]; then
 #    args=()
 #    for u in $logs; do args+=(-u "$u"); done
-#    exec journalctl "${args[@]}" -f -n 20 --no-pager -o short-iso
+#    exec journalctl "${args[@]}" ${prio[@]+"${prio[@]}"} -f -n 20 --no-pager -o short-iso
 #fi
 #
 #printf 'doctor dns %s - %s\n' \
@@ -7587,14 +8172,480 @@ exit 0
 #for u in $logs; do
 #    echo
 #    echo "== $u"
-#    journalctl -u "$u" -n "$n" --no-pager -o short-iso 2>/dev/null
+#    journalctl -u "$u" ${prio[@]+"${prio[@]}"} -n "$n" --no-pager -o short-iso 2>/dev/null
 #done
 #if [ -s /var/log/nginx/error.log ]; then
 #    echo
 #    echo "== nginx errors"
-#    tail -n "$n" /var/log/nginx/error.log
+#    if [ -n "$errors" ]; then
+#        # "access forbidden by rule" is the exit turning away everyone but its
+#        # relay - the gate doing its job, at nginx's error level. Not a problem.
+#        grep -v 'access forbidden by rule' /var/log/nginx/error.log | tail -n "$n"
+#    else
+#        tail -n "$n" /var/log/nginx/error.log
+#    fi
 #fi
 #__END_SMARTDNS_LOGS__
+
+#__BEGIN_SMARTDNS_RULES__
+##!/usr/bin/env python3
+#"""smartdns-rules - what each template's resolver does with a domain.
+#
+#usage: smartdns-rules                  every resolver on this relay, and what it routes
+#       smartdns-rules show [TEMPLATE]  what one template redirects, bypasses and pins
+#       smartdns-rules check DOMAIN...  what every template does with these names
+#
+#Every template that has customers gets its own dnsmasq on this relay; the
+#default template is the resolver on port 53. `check` answers from both sides:
+#the rule that decides the name, read from that resolver's own files, and the
+#answer the resolver actually gives when asked. A resolver still running on old
+#config shows up as the two disagreeing.
+#
+#Nothing here reads a customer's traffic. It says where a name would go, not
+#who asked for it.
+#"""
+#import collections
+#import json
+#import os
+#import random
+#import re
+#import signal
+#import socket
+#import struct
+#import subprocess
+#import sys
+#
+#SYNC_ENV = "/etc/smart-dns/sync.env"
+#DNSMASQ_D = "/etc/dnsmasq.d"
+#BASE_DIR = "/etc/smartdns-base"
+#PROFILE_DIR = "/etc/smartdns-profiles"
+#TEMPLATE_NAMES = "/var/lib/smart-dns/templates.json"
+#CUSTOM_CONF = "50-smartdns-custom.conf"
+#ACL = "/usr/local/bin/smartdns-acl"
+#NFT = "/usr/sbin/nft"
+#NAT_TABLE = "smartdns_nat"
+#MAIN_PORT = 53
+#HOST = "127.0.0.1"
+#TIMEOUT = 3.0
+#
+## address=/a.com/b.com/1.2.3.4, server=/a.com/1.1.1.1, local=/a.com/. A server=
+## line with no slashes is an upstream, not a rule about any name.
+#RULE_LINE = re.compile(r"^(address|server|local)=/(.+)/([^/]*)$")
+#DOMAIN = re.compile(r"^[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?)*$")
+#
+#Rule = collections.namedtuple("Rule", "kind domain target source")
+#
+#
+#def run(*args):
+#    try:
+#        return subprocess.run(list(args), capture_output=True, text=True,
+#                              timeout=20)
+#    except (OSError, subprocess.SubprocessError):
+#        return None
+#
+#
+#def self_ip():
+#    try:
+#        with open(SYNC_ENV) as fh:
+#            for line in fh:
+#                k, _, v = line.strip().partition("=")
+#                if k.strip() == "SELF_IP":
+#                    return v.strip().strip('"').strip("'")
+#    except OSError:
+#        pass
+#    return None
+#
+#
+## ------------------------------------------------------------------ reading
+#def conf_dir_files(d):
+#    """The files dnsmasq reads from a --conf-dir: all of them, less the ones
+#    it skips itself and the package manager's leftovers."""
+#    try:
+#        names = sorted(os.listdir(d))
+#    except OSError:
+#        return []
+#    out = []
+#    for n in names:
+#        if n.startswith(".") or n.endswith("~") or (n.startswith("#") and n.endswith("#")):
+#            continue
+#        if n.endswith((".dpkg-dist", ".dpkg-old", ".dpkg-new")):
+#            continue
+#        p = os.path.join(d, n)
+#        if os.path.isfile(p):
+#            out.append(p)
+#    return out
+#
+#
+#def read_rules(path):
+#    rules = []
+#    try:
+#        fh = open(path, encoding="utf-8", errors="replace")
+#    except OSError:
+#        return rules
+#    with fh:
+#        for line in fh:
+#            m = RULE_LINE.match(line.strip())
+#            if not m:
+#                continue
+#            kind, domains, target = m.groups()
+#            for d in domains.split("/"):
+#                d = d.strip().lower().rstrip(".")
+#                if d:
+#                    rules.append(Rule(kind, d, target.strip(), os.path.basename(path)))
+#    return rules
+#
+#
+#def conf_port(path):
+#    try:
+#        with open(path) as fh:
+#            for line in fh:
+#                if line.startswith("port="):
+#                    return int(line.split("=", 1)[1])
+#    except (OSError, ValueError):
+#        pass
+#    return None
+#
+#
+#def load_names():
+#    """Template names by id, and the default's id, as the panel last sent them."""
+#    try:
+#        with open(TEMPLATE_NAMES, encoding="utf-8") as fh:
+#            info = json.load(fh)
+#        names = {str(k): str(v) for k, v in (info.get("names") or {}).items()}
+#        return names, str(info.get("default") or "")
+#    except (OSError, ValueError, AttributeError):
+#        return {}, ""
+#
+#
+#class Resolver:
+#    def __init__(self, key, port, files, name=""):
+#        self.key, self.port, self.files, self.name = key, port, files, name
+#        self.rules = [r for f in files for r in read_rules(f)]
+#
+#    @property
+#    def unit(self):
+#        return "dnsmasq" if self.key == "main" else "smartdns-dns@%s" % self.key
+#
+#    def label(self):
+#        if self.key == "main":
+#            return "%s (default)" % self.name if self.name else "default template"
+#        return self.name or "template %s" % self.key
+#
+#    def decide(self, name):
+#        """The rule dnsmasq applies to `name`: the longest domain that covers
+#        it, and at a tie address= over server= - which is how this dnsmasq
+#        behaves, measured, and why a template cannot un-route a name that
+#        another file it reads routes."""
+#        best = key = None
+#        for r in self.rules:
+#            if r.domain == "#":
+#                length = 0
+#            elif name == r.domain or name.endswith("." + r.domain):
+#                length = len(r.domain)
+#            else:
+#                continue
+#            k = (length, 1 if r.kind == "address" else 0)
+#            if key is None or k > key:
+#                best, key = r, k
+#        return best
+#
+#
+#def resolvers():
+#    names, default = load_names()
+#    out = [Resolver("main", MAIN_PORT, conf_dir_files(DNSMASQ_D),
+#                    names.get(default, ""))]
+#    try:
+#        confs = [f for f in os.listdir(PROFILE_DIR) if f.endswith(".conf")]
+#    except OSError:
+#        confs = []
+#    for f in sorted(confs, key=lambda f: (len(f), f)):
+#        path = os.path.join(PROFILE_DIR, f)
+#        key = f[:-len(".conf")]
+#        out.append(Resolver(key, conf_port(path), conf_dir_files(BASE_DIR) + [path],
+#                            names.get(key, "")))
+#    return out
+#
+#
+#def meaning(rule, me):
+#    """(where it goes, how to say it) for the rule deciding a name."""
+#    if rule is None:
+#        return "direct", "no rule"
+#    shown = "%s=/%s/%s" % (rule.kind, rule.domain, rule.target)
+#    if rule.kind == "address":
+#        if rule.target == me:
+#            return "relay", shown
+#        if rule.target in ("", "#", "0.0.0.0", "::"):
+#            return "blocked", shown
+#        return "pinned", shown
+#    if rule.kind == "server":
+#        return "direct", shown
+#    return "local", shown
+#
+#
+## ------------------------------------------------------------------ asking
+#def skip_name(buf, off):
+#    while True:
+#        n = buf[off]
+#        if n == 0:
+#            return off + 1
+#        if n & 0xC0 == 0xC0:
+#            return off + 2
+#        off += 1 + n
+#
+#
+#def ask(name, port, host=None, timeout=None):
+#    """The A records a resolver gives for `name`: a list, empty when it
+#    answered with none, or None when it did not answer at all."""
+#    qid = random.randrange(65536)
+#    packet = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+#    for label in name.encode("idna").split(b"."):
+#        if label:
+#            packet += bytes([len(label)]) + label
+#    packet += b"\x00" + struct.pack(">HH", 1, 1)
+#    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#    s.settimeout(timeout or TIMEOUT)
+#    try:
+#        s.sendto(packet, (host or HOST, port))
+#        while True:
+#            data, _ = s.recvfrom(4096)
+#            if len(data) >= 12 and struct.unpack(">H", data[:2])[0] == qid:
+#                break
+#    except OSError:
+#        return None
+#    finally:
+#        s.close()
+#    try:
+#        qd, an = struct.unpack(">HH", data[4:8])
+#        off = 12
+#        for _ in range(qd):
+#            off = skip_name(data, off) + 4
+#        ips = []
+#        for _ in range(an):
+#            off = skip_name(data, off)
+#            typ, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+#            off += 10
+#            if typ == 1 and rdlen == 4:
+#                ips.append(socket.inet_ntoa(data[off:off + 4]))
+#            off += rdlen
+#        return ips
+#    except (IndexError, struct.error):
+#        return []
+#
+#
+## --------------------------------------------------------------- customers
+#def assignment():
+#    """Registered addresses per resolver port, read off the redirect rules.
+#
+#    Not off the sets alone: a set no rule points at is a leftover, and the
+#    addresses in it are really answered by the default resolver on 53.
+#    """
+#    r = run(NFT, "list", "chain", "ip", NAT_TABLE, "pre")
+#    ports = {}
+#    if r is not None and r.returncode == 0:
+#        for m in re.finditer(r"ip saddr @(\S+) (?:udp|tcp) dport 53 redirect to :(\d+)",
+#                             r.stdout):
+#            ports[m.group(1)] = int(m.group(2))
+#    by_port = {}
+#    for setname, port in ports.items():
+#        members = set()
+#        r = run(NFT, "-j", "list", "set", "ip", NAT_TABLE, setname)
+#        if r is not None and r.returncode == 0:
+#            try:
+#                for item in json.loads(r.stdout).get("nftables", []):
+#                    for e in (item.get("set") or {}).get("elem") or []:
+#                        if isinstance(e, dict):
+#                            e = (e.get("elem") or {}).get("val", e)
+#                        if isinstance(e, str):
+#                            members.add(e)
+#            except (ValueError, AttributeError):
+#                pass
+#        by_port.setdefault(port, set()).update(members)
+#    return by_port
+#
+#
+#def registered():
+#    r = run(ACL, "list", "--json")
+#    if r is None or r.returncode != 0:
+#        return None
+#    try:
+#        return {row["ip"] for row in json.loads(r.stdout)}
+#    except (ValueError, TypeError, KeyError):
+#        return None
+#
+#
+#def state(unit):
+#    r = run("systemctl", "is-active", unit)
+#    return (r.stdout.strip() or "unknown") if r is not None else "unknown"
+#
+#
+## ---------------------------------------------------------------- commands
+#def counts(res, me):
+#    """Distinct names per kind. Not lines: every bypass is written twice, once
+#    per public resolver, and would otherwise count double."""
+#    seen = collections.defaultdict(set)
+#    for r in res.rules:
+#        seen[meaning(r, me)[0]].add(r.domain)
+#    return collections.Counter({k: len(v) for k, v in seen.items()})
+#
+#
+#def cmd_summary():
+#    me = self_ip()
+#    rs = resolvers()
+#    regs = registered()
+#    ports = assignment()
+#    on_profile = set().union(*ports.values()) if ports else set()
+#    print("doctor dns routing - this relay answers as %s" % (me or "?"))
+#    print()
+#    print("  %5s  %9s  %8s  %6s  %6s  %-9s %s"
+#          % ("PORT", "CUSTOMERS", "REDIRECT", "BYPASS", "PINNED", "STATE", "TEMPLATE"))
+#    for res in rs:
+#        if res.key == "main":
+#            n = len(regs - on_profile) if regs is not None else "?"
+#        else:
+#            n = len(ports.get(res.port, ())) if regs is not None or ports else 0
+#        c = counts(res, me)
+#        print("  %5s  %9s  %8d  %6d  %6d  %-9s %s"
+#              % (res.port or "?", n, c["relay"], c["direct"], c["pinned"],
+#                 state(res.unit), res.label()))
+#    print()
+#    print("A template with no customers has no resolver here, so is not listed.")
+#    if regs is None:
+#        print("(customers are counted from the firewall - run as root to see them)")
+#    print("try: smartdns-rules check <domain>    smartdns-rules show <template>")
+#    return 0
+#
+#
+#def find(rs, arg):
+#    if not arg or arg.lower() in ("main", "default"):
+#        return rs[0]
+#    for res in rs:
+#        if res.key == arg or (res.name and res.name.casefold() == arg.casefold()):
+#            return res
+#    return None
+#
+#
+#def cmd_show(arg):
+#    me = self_ip()
+#    rs = resolvers()
+#    res = find(rs, arg)
+#    if res is None:
+#        names, _ = load_names()
+#        if any(n.casefold() == arg.casefold() for n in names.values()) or arg in names:
+#            print("template %s has no customers, so it has no resolver on this relay "
+#                  "yet - it gets one when somebody is put on it." % arg)
+#            return 0
+#        print("no template %r here. There are: %s"
+#              % (arg, ", ".join(r.name or r.key for r in rs)), file=sys.stderr)
+#        return 1
+#    custom = {r.domain for r in read_rules(os.path.join(DNSMASQ_D, CUSTOM_CONF))}
+#    groups = collections.defaultdict(dict)
+#    for r in res.rules:
+#        kind = meaning(r, me)[0]
+#        groups[kind].setdefault(r.domain, r)
+#    print("%s - resolver on :%s" % (res.label(), res.port or "?"))
+#    titles = (("relay", "redirected to this relay"),
+#              ("direct", "bypassed - resolved elsewhere, the customer goes direct"),
+#              ("pinned", "pinned to a fixed address"),
+#              ("blocked", "answered with nothing"),
+#              ("local", "answered locally"))
+#    for kind, title in titles:
+#        rows = groups.get(kind)
+#        if not rows:
+#            continue
+#        print()
+#        print("%s (%d):" % (title, len(rows)))
+#        for d in sorted(rows):
+#            r = rows[d]
+#            tag = "  [custom]" if d in custom else ""
+#            if kind in ("direct", "pinned"):
+#                print("  %-44s %s%s" % (d, r.target, tag))
+#            else:
+#                print("  %s%s" % (d, tag))
+#    print()
+#    print("Anything not listed has no rule: it resolves normally and goes direct.")
+#    return 0
+#
+#
+#def clean(raw):
+#    d = raw.strip().lower()
+#    d = re.sub(r"^[a-z]+://", "", d).split("/")[0].split(":")[0].strip(".")
+#    try:
+#        d = d.encode("idna").decode("ascii")
+#    except UnicodeError:
+#        return None
+#    return d if DOMAIN.match(d) else None
+#
+#
+#def cmd_check(domains):
+#    me = self_ip()
+#    rs = resolvers()
+#    trouble = 0
+#    for raw in domains:
+#        name = clean(raw)
+#        if not name:
+#            print("not a domain: %s" % raw)
+#            trouble = 1
+#            continue
+#        print(name)
+#        for res in rs:
+#            rule = res.decide(name)
+#            kind, shown = meaning(rule, me)
+#            live = ask(name, res.port) if res.port else None
+#            if live is None:
+#                seen, agree = "no answer", False
+#            elif not live:
+#                seen, agree = "no address", kind not in ("relay", "pinned")
+#            else:
+#                seen = "answered " + " ".join(live[:2])
+#                if kind == "relay":
+#                    agree = me in live
+#                elif kind == "pinned":
+#                    agree = rule.target in live
+#                else:
+#                    agree = me not in live
+#            # The rule and the file it came from share one column, so a long
+#            # file name cannot push the answer out of line.
+#            why = "%s  (%s)" % (shown, rule.source) if rule else shown
+#            print("  :%-5s %-7s %-68s %-30s %s"
+#                  % (res.port or "?", kind, why, seen, res.label()))
+#            if not agree:
+#                trouble = 1
+#                if live is None:
+#                    print("  ! the resolver did not answer - is %s running?" % res.unit)
+#                else:
+#                    print("  ! its rules say %s, but that is not what it answered - "
+#                          "it may be running on old config: systemctl restart %s"
+#                          % (kind, res.unit))
+#    return trouble
+#
+#
+#def main(argv):
+#    try:
+#        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+#    except Exception:
+#        pass
+#    # `smartdns-rules show | head` closes the pipe early; that is the reader
+#    # being done, not an error worth a traceback.
+#    if hasattr(signal, "SIGPIPE"):
+#        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+#    usage = __doc__.split("\n\n")[1]
+#    if not argv:
+#        return cmd_summary()
+#    cmd, rest = argv[0], argv[1:]
+#    if cmd in ("-h", "--help", "help"):
+#        print(usage)
+#        return 0
+#    if cmd == "show":
+#        return cmd_show(" ".join(rest) if rest else None)
+#    if cmd == "check" and rest:
+#        return cmd_check(rest)
+#    print(usage, file=sys.stderr)
+#    return 2
+#
+#
+#if __name__ == "__main__":
+#    sys.exit(main(sys.argv[1:]))
+#__END_SMARTDNS_RULES__
 
 #__BEGIN_EPIC_PIN__
 ##!/usr/bin/env python3

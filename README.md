@@ -240,6 +240,20 @@ smartdns bypass api.example.com  # never route this one, even though its
 smartdns test example.com        # what this relay answers for it
 ```
 
+**`smartdns-rules`** — what each template does with a domain, asked of the
+resolvers themselves. Every template with customers gets its own resolver on
+the relay; the default template is the resolver on port 53.
+
+```sh
+smartdns-rules                   # every template: its port, its customers, and
+                                 # how many names it redirects, bypasses and pins
+smartdns-rules show test         # the full lists for one template
+smartdns-rules check gemini.google.com
+                                 # each template's rule for it and what its
+                                 # resolver really answers - flagged if the two
+                                 # disagree
+```
+
 **`smartdns-acl`** — who may use the relay, and what they have used. The panel
 drives this rather than touching nftables itself, so there is one place where
 the rules about what is legal live.
@@ -274,9 +288,28 @@ speeds there rather than here.
 
 ### On either
 
+**`smartdns-logs`** — what this machine has been doing, every part of it at
+once. It tells a relay from an exit by itself.
+
+```sh
+sudo smartdns-logs               # each part: running or not, and its last 100 lines
+sudo smartdns-logs -e            # only warnings and errors
+sudo smartdns-logs -f            # follow live; -e -f for problems only
+sudo smartdns-logs -n 500        # more lines per part
+sudo smartdns-logs --report      # all of it in one file to send, secrets masked
+```
+
+The panels log one line per request and one per operator action; the relay
+logs each domain that changes route in each template, and each customer that
+moves between templates. Warnings and errors carry a syslog level, which is
+what `-e` reads. Passwords, sessions and tokens are never written. Plain output
+is for your own screen - the admin panel's start-up line includes its address.
+`--report` masks every secret in the machine's config wherever it turns up,
+that address included; it still holds customers' addresses and usernames, so
+send it only to someone you trust.
+
 ```sh
 smartdns-cert panel.example.com  # get or renew a certificate for that name
-smartdns-logs                    # what this machine has been doing; -f to follow
 sudo bash doctor-dns.sh --version
 sudo bash doctor-dns.sh --uninstall
 ```

@@ -11,6 +11,7 @@ a customer sent their receipt, and the page stopped loading.
 These drive the real server class, with a real TLS handshake, against
 visitors that misbehave the ways real networks do.
 """
+import http.client
 import importlib.machinery
 import importlib.util
 import os
@@ -153,6 +154,46 @@ check("the handshake happens per connection",
       "def finish_request" in src and "wrap_socket(request" in src)
 
 httpd.shutdown()
+
+print("the admin panel and the relays' API, built the same way now")
+# Both wrapped their listening socket, as the customer panel did. On the API
+# that was the worst place for it: one silent connection to the exit's port
+# and no relay could sync - nobody new let in, nobody out of time cut off.
+for label, fname in (("admin panel", "smartdns-admin"), ("relay API", "smartdns-panel")):
+    spec = importlib.util.spec_from_loader(
+        label, importlib.machinery.SourceFileLoader(
+            label, os.path.join(HERE, "..", "templates", fname)))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m.HANDSHAKE_TIMEOUT, m.IO_TIMEOUT = 2, 3
+    if fname == "smartdns-admin":
+        m.CFG = {"ADMIN_PATH": "secret"}
+        srv = m.make_admin_server(ctx, 0)
+    else:
+        srv = m.make_api_server(ctx, 0)
+    p = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    held = [socket.create_connection(("127.0.0.1", p)) for _ in range(5)]
+    time.sleep(0.3)
+    t = time.time()
+    try:
+        c = http.client.HTTPSConnection("127.0.0.1", p, context=client, timeout=4)
+        c.request("GET", "/")
+        status = c.getresponse().status
+        c.close()
+    except Exception as e:
+        status = "no answer (%s)" % e
+    took = time.time() - t
+    check("%s: answers past five stalled handshakes" % label,
+          isinstance(status, int), str(status))
+    check("%s: promptly" % label, took < 1.5, "%.2fs" % took)
+    for s in held:
+        s.close()
+    srv.shutdown()
+    msrc = open(os.path.join(HERE, "..", "templates", fname), encoding="utf-8").read()
+    check("%s: its listening socket is not wrapped" % label,
+          "httpd.socket = ctx.wrap_socket" not in msrc)
+
 shutil.rmtree(tmp, ignore_errors=True)
 print()
 if fails:

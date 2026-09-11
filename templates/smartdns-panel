@@ -37,6 +37,7 @@ import ssl
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -513,8 +514,7 @@ def load_catalogue():
         with io_open(SERVICES_FILE) as fh:
             return json.load(fh).get("services", [])
     except Exception as e:
-        print("no service catalogue at %s: %s" % (SERVICES_FILE, e),
-              file=sys.stderr, flush=True)
+        log(ERROR, "no service catalogue at %s: %s" % (SERVICES_FILE, e))
         return []
 
 
@@ -887,6 +887,13 @@ class Store:
         return [r["domain"] for r in self.q(
             "SELECT domain FROM custom_domains ORDER BY domain")]
 
+    def template_names(self):
+        """Every template's name by id, and which is the default - so the
+        relay's own tools can say "test" where its resolvers only know "2"."""
+        rows = self.q("SELECT id, name, is_default FROM templates")
+        return {"default": next((r["id"] for r in rows if r["is_default"]), None),
+                "names": {str(r["id"]): r["name"] for r in rows}}
+
     def routes_custom(self, template_id):
         """Whether this template routes the operator's own domains.
 
@@ -1172,6 +1179,99 @@ def enforce_quotas(store):
                           (bit, u["id"]))
 
 
+# ------------------------------------------------------------------ logging
+# journald reads a leading <N> on a line as its syslog level. Warnings and
+# errors carry one, so `journalctl -p warning` - which is what
+# `smartdns-logs -e` runs - shows exactly the problems. Ordinary lines stay
+# unmarked and land at info, as they always did. Before this everything
+# landed at info, stderr included, and a failure looked like a heartbeat.
+INFO, WARN, ERROR = 6, 4, 3
+# The visitor went away, or never finished saying hello. Not a fault here.
+GONE = (ConnectionError, TimeoutError, ssl.SSLError)
+
+
+def log(level, msg):
+    tag = "<%d>" % level if level < INFO else ""
+    for line in str(msg).splitlines() or [""]:
+        print(tag + line, flush=True)
+
+
+def log_exception(what):
+    """An error with its traceback, every line at error level. journald makes
+    each line its own entry, and at info all but the first would be lost
+    among the ordinary ones."""
+    log(ERROR, "%s\n%s" % (what, traceback.format_exc().rstrip()))
+
+
+def log_access(h, prefix, code, path, who=""):
+    """One line for one request: what was asked, the answer, how long it took
+    and who asked. Server errors at error level; everything else is info."""
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = 0
+    ms = (time.monotonic() - getattr(h, "_t0", time.monotonic())) * 1000
+    # 501 is a scanner's GET to a POST-only port: the visitor's mistake.
+    log(ERROR if code >= 500 and code != 501 else INFO, "%s %s %s %d %dms from %s%s" % (
+        prefix, getattr(h, "command", None) or "-", path, code, ms,
+        h.client_address[0], " " + who if who else ""))
+
+
+# How long a visitor may take over the TLS handshake, and then how long any one
+# read or write may stall. Per operation, so a receipt crawling up from a
+# relay that keeps moving is never cut off, while a quiet connection is let go.
+HANDSHAKE_TIMEOUT = 10
+IO_TIMEOUT = 30
+
+
+class TLSServer(http.server.ThreadingHTTPServer):
+    """TLS per connection, under a deadline - never on the listening socket.
+
+    Wrapping the listening socket runs every visitor's handshake inside
+    accept(), on the one thread that accepts for all of them and with no
+    timeout, so a single connection that opens and then says nothing freezes
+    the server for everybody until it goes away. The customer panel froze
+    exactly that way in production, and this server was built the same way -
+    here it would have been worse: this port is public, the relay check comes
+    after the handshake, and while it hung no relay could sync, so nobody new
+    was let in and nobody whose time ran out was cut off. Here accept() only
+    accepts; a stalled visitor stalls only its own thread.
+
+    ctx=None serves plain http. That is for tests - serve_api never does.
+    """
+    daemon_threads = True
+
+    def __init__(self, addr, handler, ctx):
+        self.ctx = ctx
+        super().__init__(addr, handler)
+
+    def finish_request(self, request, client_address):
+        if self.ctx is None:
+            return super().finish_request(request, client_address)
+        request.settimeout(HANDSHAKE_TIMEOUT)
+        try:
+            tls = self.ctx.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError):
+            return      # a scanner, or plain http to an https port
+        try:
+            tls.settimeout(IO_TIMEOUT)
+            self.RequestHandlerClass(tls, client_address, self)
+        except (ssl.SSLError, OSError):
+            pass
+        finally:
+            try:
+                tls.close()
+            except OSError:
+                pass
+
+    def handle_error(self, request, client_address):
+        # Whatever a handler did not catch, with its traceback, at error
+        # level. http.server's default prints it at info, where nobody looks.
+        if isinstance(sys.exc_info()[1], GONE):
+            return
+        log_exception("request from %s failed" % client_address[0])
+
+
 # --------------------------------------------------------------- sync API
 class API(http.server.BaseHTTPRequestHandler):
     server_version = "smartdns"
@@ -1180,8 +1280,28 @@ class API(http.server.BaseHTTPRequestHandler):
     relays = ()
     tg = None
 
-    def log_message(self, *a):
-        pass
+    def log_message(self, fmt, *args):
+        # http.server's own notes - a malformed request, a timeout. The access
+        # line is log_request below.
+        log(INFO, "api %s from %s" % (fmt % args, self.client_address[0]))
+
+    def parse_request(self):
+        self._t0 = time.monotonic()
+        return super().parse_request()
+
+    def log_request(self, code="-", size="-"):
+        """One line per request, except the heartbeat: every relay syncs every
+        thirty seconds, and a line for each would bury everything else. A sync
+        is logged when it fails or crawls."""
+        path = urllib.parse.urlparse(getattr(self, "path", "") or "").path[:120]
+        took = time.monotonic() - getattr(self, "_t0", time.monotonic())
+        try:
+            fine = int(code) == 200
+        except (TypeError, ValueError):
+            fine = False
+        if path == "/sync" and fine and took < 2:
+            return
+        log_access(self, "api", code, path, getattr(self, "_who", ""))
 
     def reply(self, code, obj):
         body = json.dumps(obj).encode()
@@ -1202,7 +1322,14 @@ class API(http.server.BaseHTTPRequestHandler):
         want = "Bearer " + self.secret
         # Constant time, so the comparison cannot be used to guess the secret
         # one character at a time.
-        return hmac.compare_digest(given, want)
+        if hmac.compare_digest(given, want):
+            return True
+        # One of our own relays with the wrong secret is a broken pairing,
+        # not a scanner, and nothing works on that relay until it is fixed.
+        # Strangers get only their request line.
+        log(WARN, "api: %s is a paired relay but sent the wrong secret - its "
+            "SYNC_SECRET does not match this panel's" % self.client_address[0])
+        return False
 
     def do_POST(self):
         if not self.authorised():
@@ -1232,7 +1359,7 @@ class API(http.server.BaseHTTPRequestHandler):
             try:
                 enforce_quotas(self.store)
             except Exception as e:
-                print("quota pass failed: %r" % e, file=sys.stderr, flush=True)
+                log_exception("quota pass failed: %r" % e)
             by_ip, profiles = self.store.profiles(CATALOGUE, DEFAULT_TEMPLATE[0])
             # The label goes into the nftables element as a comment, so that
             # `smartdns-acl list` on the relay is readable without the
@@ -1249,6 +1376,7 @@ class API(http.server.BaseHTTPRequestHandler):
                 "SELECT domain FROM custom_domains ORDER BY domain")]
             return self.reply(200, {"allowed": allowed, "profiles": profiles,
                                     "extra_domains": extra,
+                                    "templates": self.store.template_names(),
                                     })
 
         # ---- user panel, served by the relay on the customer's behalf ----
@@ -1272,6 +1400,9 @@ class API(http.server.BaseHTTPRequestHandler):
         row = self.store.one(
             "SELECT u.* FROM panel_sessions s JOIN users u ON u.id = s.user_id"
             " WHERE s.token = ? AND s.expires_at > ?", (token or "", now()))
+        if row:
+            # Named on the request line: which customer, never the session.
+            self._who = "user #%d" % row["id"]
         return row
 
     def do_user_signup(self, body):
@@ -1321,6 +1452,7 @@ class API(http.server.BaseHTTPRequestHandler):
         ip = body.get("ip", "")
         ok, wait = THROTTLE.check("login:%s" % ip, limit=8, window=900)
         if not ok:
+            log(WARN, "api login throttled for %s: too many failed attempts" % ip)
             return {"ok": False, "message":
                     "تلاش زیاد بوده. %d دقیقه دیگر امتحان کنید."
                     % max(1, wait // 60)}
@@ -1331,8 +1463,13 @@ class API(http.server.BaseHTTPRequestHandler):
         # messages tell anybody who asks which names have accounts.
         if not user or not check_password(user, body.get("password") or ""):
             THROTTLE.hit("login:%s" % ip)
+            # The name tried and where from - enough to answer "I can't get
+            # in". Never the password.
+            log(INFO, "api login failed for %r from %s" % (username, ip))
             return {"ok": False, "message": "نام کاربری یا رمز درست نیست"}
         THROTTLE.clear("login:%s" % ip)
+        self._who = "user #%d" % user["id"]
+        log(INFO, "api login: user #%d (%s) from %s" % (user["id"], username, ip))
         return {"ok": True, "session": self.store.open_session(user["id"])}
 
     def do_user_password(self, body):
@@ -1488,11 +1625,13 @@ def serve_api(cfg, store):
     API.secret = cfg["SYNC_SECRET"]
     # Comma separated, so one exit can serve several relays.
     API.relays = tuple(x.strip() for x in cfg["RELAY_IP"].split(",") if x.strip())
-    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", API_PORT), API)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(CERT, KEY)
-    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-    httpd.serve_forever()
+    make_api_server(ctx).serve_forever()
+
+
+def make_api_server(ctx, port=None):
+    return TLSServer(("0.0.0.0", API_PORT if port is None else port), API, ctx)
 
 
 def watch_self(store):
@@ -1508,7 +1647,7 @@ def watch_self(store):
             store.record_metrics("exit", health.sample())
             store.prune_metrics()
         except Exception as e:
-            print("self health failed: %r" % e, file=sys.stderr, flush=True)
+            log(WARN, "self health failed: %r" % e)
         time.sleep(30)
 
 

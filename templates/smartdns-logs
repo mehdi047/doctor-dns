@@ -2,17 +2,30 @@
 # smartdns-logs - what this machine has been doing, all in one place.
 #
 # usage: smartdns-logs          recent logs of every part, and whether each runs
+#        smartdns-logs -e       only warnings and errors
 #        smartdns-logs -f       follow them live (ctrl-c to stop)
 #        smartdns-logs -n 500   more lines per part (default 100)
+#        smartdns-logs --report all of it in one file to send, secrets masked
 set -uo pipefail
+
+# Where this machine's config lives. A variable only so a test can point it
+# somewhere else; nothing else sets it.
+ETC="${SMARTDNS_ETC:-/etc/smart-dns}"
 
 n=100
 follow=no
+report=""
+errors=""
+# journald's own level filter. The programs mark their warnings and errors
+# with a syslog level, so this is exactly the problems and nothing else.
+prio=()
 while [ $# -gt 0 ]; do
     case "$1" in
+        -e|--errors) errors=yes; prio=(-p warning) ;;
         -f|--follow) follow=yes ;;
+        --report) report=yes ;;
         -n) shift; n="${1:-}" ;;
-        -h|--help) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1  (try -h)" >&2; exit 1 ;;
     esac
     shift
@@ -23,7 +36,7 @@ case "$n" in ''|*[!0-9]*) echo "-n wants a number of lines" >&2; exit 1 ;; esac
 # Which side this is decides which parts it has. The timers are listed for
 # their status - a oneshot service reads "inactive" between runs, which looks
 # like a fault and is not - and the services for their logs.
-if [ -f /etc/smart-dns/sync.env ]; then
+if [ -f "$ETC/sync.env" ]; then
     role=relay
     status="smartdns-sync dnsmasq nginx coturn epic-pin.timer smartdns-acl-save.timer"
     logs="smartdns-sync dnsmasq nginx coturn epic-pin smartdns-acl-save"
@@ -32,7 +45,7 @@ if [ -f /etc/smart-dns/sync.env ]; then
         status="$status smartdns-dns@$(basename "$f" .conf)"
         logs="$logs smartdns-dns@$(basename "$f" .conf)"
     done
-elif [ -f /etc/smart-dns/panel.env ]; then
+elif [ -f "$ETC/panel.env" ]; then
     role=exit
     status="smartdns-panel smartdns-admin nginx smartdns-cert.timer"
     logs="smartdns-panel smartdns-admin nginx smartdns-cert"
@@ -41,10 +54,76 @@ else
     exit 1
 fi
 
+# Every secret in this machine's config, replaced wherever it turns up in a
+# report. None should ever reach a log, but a report is made to be handed to
+# somebody else. Paths are left alone: they are where things are, not keys.
+MASK=$(cat <<'PY'
+import glob, re, sys
+found = set()
+for path in glob.glob(sys.argv[1] + "/*.env"):
+    try:
+        with open(path) as fh:
+            for line in fh:
+                key, _, value = line.strip().partition("=")
+                value = value.strip().strip("\"'")
+                if (re.search(r"SECRET|PATH|HASH|SALT|TOKEN|PASS", key)
+                        and len(value) >= 6 and not value.startswith("/")):
+                    found.add(value.encode())
+    except OSError:
+        pass
+data = sys.stdin.buffer.read()
+for value in sorted(found, key=len, reverse=True):
+    data = data.replace(value, b"<secret>")
+sys.stdout.buffer.write(data)
+PY
+)
+
+# One file with everything worth sending when something is wrong - the state of
+# each part, its warnings and errors, its recent logs - with the secrets masked.
+# It still holds customers' addresses and usernames: those are what the logs
+# are about, and the reader is told so.
+if [ -n "$report" ]; then
+    out="${SMARTDNS_REPORT_DIR:-/tmp}/doctor-dns-report-$role-$(date -u +%Y%m%d-%H%M%S).txt"
+    umask 077
+    {
+        echo "doctor dns report - $role - $(date -u '+%F %T') UTC"
+        echo "version  $(cat /var/lib/smart-dns/version 2>/dev/null || echo '?')"
+        echo "system   $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-?}"), kernel $(uname -r)"
+        echo "up       $(uptime -p 2>/dev/null || echo '?')"
+        # A clock that has drifted breaks TLS between the two machines and
+        # moves every expiry date, so it earns a line in any report.
+        echo "clock    $(timedatectl show -p NTPSynchronized --value 2>/dev/null \
+                         | sed 's/^yes$/synchronised/; s/^no$/NOT synchronised/')"
+        echo
+        echo "== disk and memory"
+        df -h / 2>/dev/null | tail -1
+        free -m 2>/dev/null | sed -n '1,2p'
+        if [ "$role" = relay ]; then
+            echo
+            echo "== routing"
+            smartdns-rules 2>&1
+            echo
+            echo "== access control"
+            smartdns-acl enforce status 2>&1 | head -3
+        fi
+        echo
+        echo "################ warnings and errors ################"
+        bash "$0" -e -n 300
+        echo
+        echo "################ recent logs ################"
+        bash "$0" -n 150
+    } 2>&1 | python3 -c "$MASK" "$ETC" > "$out"
+    echo "report written: $out ($(du -k "$out" | cut -f1) KB)"
+    echo "Secrets and the admin panel's address are masked. It does hold your"
+    echo "customers' IP addresses and usernames, from the logs - send it only"
+    echo "to someone you trust."
+    exit 0
+fi
+
 if [ "$follow" = yes ]; then
     args=()
     for u in $logs; do args+=(-u "$u"); done
-    exec journalctl "${args[@]}" -f -n 20 --no-pager -o short-iso
+    exec journalctl "${args[@]}" ${prio[@]+"${prio[@]}"} -f -n 20 --no-pager -o short-iso
 fi
 
 printf 'doctor dns %s - %s\n' \
@@ -63,10 +142,16 @@ fi
 for u in $logs; do
     echo
     echo "== $u"
-    journalctl -u "$u" -n "$n" --no-pager -o short-iso 2>/dev/null
+    journalctl -u "$u" ${prio[@]+"${prio[@]}"} -n "$n" --no-pager -o short-iso 2>/dev/null
 done
 if [ -s /var/log/nginx/error.log ]; then
     echo
     echo "== nginx errors"
-    tail -n "$n" /var/log/nginx/error.log
+    if [ -n "$errors" ]; then
+        # "access forbidden by rule" is the exit turning away everyone but its
+        # relay - the gate doing its job, at nginx's error level. Not a problem.
+        grep -v 'access forbidden by rule' /var/log/nginx/error.log | tail -n "$n"
+    else
+        tail -n "$n" /var/log/nginx/error.log
+    fi
 fi

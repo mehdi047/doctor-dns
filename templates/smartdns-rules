@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""smartdns-rules - what each template's resolver does with a domain.
+
+usage: smartdns-rules                  every resolver on this relay, and what it routes
+       smartdns-rules show [TEMPLATE]  what one template redirects, bypasses and pins
+       smartdns-rules check DOMAIN...  what every template does with these names
+
+Every template that has customers gets its own dnsmasq on this relay; the
+default template is the resolver on port 53. `check` answers from both sides:
+the rule that decides the name, read from that resolver's own files, and the
+answer the resolver actually gives when asked. A resolver still running on old
+config shows up as the two disagreeing.
+
+Nothing here reads a customer's traffic. It says where a name would go, not
+who asked for it.
+"""
+import collections
+import json
+import os
+import random
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+
+SYNC_ENV = "/etc/smart-dns/sync.env"
+DNSMASQ_D = "/etc/dnsmasq.d"
+BASE_DIR = "/etc/smartdns-base"
+PROFILE_DIR = "/etc/smartdns-profiles"
+TEMPLATE_NAMES = "/var/lib/smart-dns/templates.json"
+CUSTOM_CONF = "50-smartdns-custom.conf"
+ACL = "/usr/local/bin/smartdns-acl"
+NFT = "/usr/sbin/nft"
+NAT_TABLE = "smartdns_nat"
+MAIN_PORT = 53
+HOST = "127.0.0.1"
+TIMEOUT = 3.0
+
+# address=/a.com/b.com/1.2.3.4, server=/a.com/1.1.1.1, local=/a.com/. A server=
+# line with no slashes is an upstream, not a rule about any name.
+RULE_LINE = re.compile(r"^(address|server|local)=/(.+)/([^/]*)$")
+DOMAIN = re.compile(r"^[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?)*$")
+
+Rule = collections.namedtuple("Rule", "kind domain target source")
+
+
+def run(*args):
+    try:
+        return subprocess.run(list(args), capture_output=True, text=True,
+                              timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def self_ip():
+    try:
+        with open(SYNC_ENV) as fh:
+            for line in fh:
+                k, _, v = line.strip().partition("=")
+                if k.strip() == "SELF_IP":
+                    return v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+# ------------------------------------------------------------------ reading
+def conf_dir_files(d):
+    """The files dnsmasq reads from a --conf-dir: all of them, less the ones
+    it skips itself and the package manager's leftovers."""
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        if n.startswith(".") or n.endswith("~") or (n.startswith("#") and n.endswith("#")):
+            continue
+        if n.endswith((".dpkg-dist", ".dpkg-old", ".dpkg-new")):
+            continue
+        p = os.path.join(d, n)
+        if os.path.isfile(p):
+            out.append(p)
+    return out
+
+
+def read_rules(path):
+    rules = []
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return rules
+    with fh:
+        for line in fh:
+            m = RULE_LINE.match(line.strip())
+            if not m:
+                continue
+            kind, domains, target = m.groups()
+            for d in domains.split("/"):
+                d = d.strip().lower().rstrip(".")
+                if d:
+                    rules.append(Rule(kind, d, target.strip(), os.path.basename(path)))
+    return rules
+
+
+def conf_port(path):
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if line.startswith("port="):
+                    return int(line.split("=", 1)[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def load_names():
+    """Template names by id, and the default's id, as the panel last sent them."""
+    try:
+        with open(TEMPLATE_NAMES, encoding="utf-8") as fh:
+            info = json.load(fh)
+        names = {str(k): str(v) for k, v in (info.get("names") or {}).items()}
+        return names, str(info.get("default") or "")
+    except (OSError, ValueError, AttributeError):
+        return {}, ""
+
+
+class Resolver:
+    def __init__(self, key, port, files, name=""):
+        self.key, self.port, self.files, self.name = key, port, files, name
+        self.rules = [r for f in files for r in read_rules(f)]
+
+    @property
+    def unit(self):
+        return "dnsmasq" if self.key == "main" else "smartdns-dns@%s" % self.key
+
+    def label(self):
+        if self.key == "main":
+            return "%s (default)" % self.name if self.name else "default template"
+        return self.name or "template %s" % self.key
+
+    def decide(self, name):
+        """The rule dnsmasq applies to `name`: the longest domain that covers
+        it, and at a tie address= over server= - which is how this dnsmasq
+        behaves, measured, and why a template cannot un-route a name that
+        another file it reads routes."""
+        best = key = None
+        for r in self.rules:
+            if r.domain == "#":
+                length = 0
+            elif name == r.domain or name.endswith("." + r.domain):
+                length = len(r.domain)
+            else:
+                continue
+            k = (length, 1 if r.kind == "address" else 0)
+            if key is None or k > key:
+                best, key = r, k
+        return best
+
+
+def resolvers():
+    names, default = load_names()
+    out = [Resolver("main", MAIN_PORT, conf_dir_files(DNSMASQ_D),
+                    names.get(default, ""))]
+    try:
+        confs = [f for f in os.listdir(PROFILE_DIR) if f.endswith(".conf")]
+    except OSError:
+        confs = []
+    for f in sorted(confs, key=lambda f: (len(f), f)):
+        path = os.path.join(PROFILE_DIR, f)
+        key = f[:-len(".conf")]
+        out.append(Resolver(key, conf_port(path), conf_dir_files(BASE_DIR) + [path],
+                            names.get(key, "")))
+    return out
+
+
+def meaning(rule, me):
+    """(where it goes, how to say it) for the rule deciding a name."""
+    if rule is None:
+        return "direct", "no rule"
+    shown = "%s=/%s/%s" % (rule.kind, rule.domain, rule.target)
+    if rule.kind == "address":
+        if rule.target == me:
+            return "relay", shown
+        if rule.target in ("", "#", "0.0.0.0", "::"):
+            return "blocked", shown
+        return "pinned", shown
+    if rule.kind == "server":
+        return "direct", shown
+    return "local", shown
+
+
+# ------------------------------------------------------------------ asking
+def skip_name(buf, off):
+    while True:
+        n = buf[off]
+        if n == 0:
+            return off + 1
+        if n & 0xC0 == 0xC0:
+            return off + 2
+        off += 1 + n
+
+
+def ask(name, port, host=None, timeout=None):
+    """The A records a resolver gives for `name`: a list, empty when it
+    answered with none, or None when it did not answer at all."""
+    qid = random.randrange(65536)
+    packet = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    for label in name.encode("idna").split(b"."):
+        if label:
+            packet += bytes([len(label)]) + label
+    packet += b"\x00" + struct.pack(">HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout or TIMEOUT)
+    try:
+        s.sendto(packet, (host or HOST, port))
+        while True:
+            data, _ = s.recvfrom(4096)
+            if len(data) >= 12 and struct.unpack(">H", data[:2])[0] == qid:
+                break
+    except OSError:
+        return None
+    finally:
+        s.close()
+    try:
+        qd, an = struct.unpack(">HH", data[4:8])
+        off = 12
+        for _ in range(qd):
+            off = skip_name(data, off) + 4
+        ips = []
+        for _ in range(an):
+            off = skip_name(data, off)
+            typ, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+            off += 10
+            if typ == 1 and rdlen == 4:
+                ips.append(socket.inet_ntoa(data[off:off + 4]))
+            off += rdlen
+        return ips
+    except (IndexError, struct.error):
+        return []
+
+
+# --------------------------------------------------------------- customers
+def assignment():
+    """Registered addresses per resolver port, read off the redirect rules.
+
+    Not off the sets alone: a set no rule points at is a leftover, and the
+    addresses in it are really answered by the default resolver on 53.
+    """
+    r = run(NFT, "list", "chain", "ip", NAT_TABLE, "pre")
+    ports = {}
+    if r is not None and r.returncode == 0:
+        for m in re.finditer(r"ip saddr @(\S+) (?:udp|tcp) dport 53 redirect to :(\d+)",
+                             r.stdout):
+            ports[m.group(1)] = int(m.group(2))
+    by_port = {}
+    for setname, port in ports.items():
+        members = set()
+        r = run(NFT, "-j", "list", "set", "ip", NAT_TABLE, setname)
+        if r is not None and r.returncode == 0:
+            try:
+                for item in json.loads(r.stdout).get("nftables", []):
+                    for e in (item.get("set") or {}).get("elem") or []:
+                        if isinstance(e, dict):
+                            e = (e.get("elem") or {}).get("val", e)
+                        if isinstance(e, str):
+                            members.add(e)
+            except (ValueError, AttributeError):
+                pass
+        by_port.setdefault(port, set()).update(members)
+    return by_port
+
+
+def registered():
+    r = run(ACL, "list", "--json")
+    if r is None or r.returncode != 0:
+        return None
+    try:
+        return {row["ip"] for row in json.loads(r.stdout)}
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def state(unit):
+    r = run("systemctl", "is-active", unit)
+    return (r.stdout.strip() or "unknown") if r is not None else "unknown"
+
+
+# ---------------------------------------------------------------- commands
+def counts(res, me):
+    """Distinct names per kind. Not lines: every bypass is written twice, once
+    per public resolver, and would otherwise count double."""
+    seen = collections.defaultdict(set)
+    for r in res.rules:
+        seen[meaning(r, me)[0]].add(r.domain)
+    return collections.Counter({k: len(v) for k, v in seen.items()})
+
+
+def cmd_summary():
+    me = self_ip()
+    rs = resolvers()
+    regs = registered()
+    ports = assignment()
+    on_profile = set().union(*ports.values()) if ports else set()
+    print("doctor dns routing - this relay answers as %s" % (me or "?"))
+    print()
+    print("  %5s  %9s  %8s  %6s  %6s  %-9s %s"
+          % ("PORT", "CUSTOMERS", "REDIRECT", "BYPASS", "PINNED", "STATE", "TEMPLATE"))
+    for res in rs:
+        if res.key == "main":
+            n = len(regs - on_profile) if regs is not None else "?"
+        else:
+            n = len(ports.get(res.port, ())) if regs is not None or ports else 0
+        c = counts(res, me)
+        print("  %5s  %9s  %8d  %6d  %6d  %-9s %s"
+              % (res.port or "?", n, c["relay"], c["direct"], c["pinned"],
+                 state(res.unit), res.label()))
+    print()
+    print("A template with no customers has no resolver here, so is not listed.")
+    if regs is None:
+        print("(customers are counted from the firewall - run as root to see them)")
+    print("try: smartdns-rules check <domain>    smartdns-rules show <template>")
+    return 0
+
+
+def find(rs, arg):
+    if not arg or arg.lower() in ("main", "default"):
+        return rs[0]
+    for res in rs:
+        if res.key == arg or (res.name and res.name.casefold() == arg.casefold()):
+            return res
+    return None
+
+
+def cmd_show(arg):
+    me = self_ip()
+    rs = resolvers()
+    res = find(rs, arg)
+    if res is None:
+        names, _ = load_names()
+        if any(n.casefold() == arg.casefold() for n in names.values()) or arg in names:
+            print("template %s has no customers, so it has no resolver on this relay "
+                  "yet - it gets one when somebody is put on it." % arg)
+            return 0
+        print("no template %r here. There are: %s"
+              % (arg, ", ".join(r.name or r.key for r in rs)), file=sys.stderr)
+        return 1
+    custom = {r.domain for r in read_rules(os.path.join(DNSMASQ_D, CUSTOM_CONF))}
+    groups = collections.defaultdict(dict)
+    for r in res.rules:
+        kind = meaning(r, me)[0]
+        groups[kind].setdefault(r.domain, r)
+    print("%s - resolver on :%s" % (res.label(), res.port or "?"))
+    titles = (("relay", "redirected to this relay"),
+              ("direct", "bypassed - resolved elsewhere, the customer goes direct"),
+              ("pinned", "pinned to a fixed address"),
+              ("blocked", "answered with nothing"),
+              ("local", "answered locally"))
+    for kind, title in titles:
+        rows = groups.get(kind)
+        if not rows:
+            continue
+        print()
+        print("%s (%d):" % (title, len(rows)))
+        for d in sorted(rows):
+            r = rows[d]
+            tag = "  [custom]" if d in custom else ""
+            if kind in ("direct", "pinned"):
+                print("  %-44s %s%s" % (d, r.target, tag))
+            else:
+                print("  %s%s" % (d, tag))
+    print()
+    print("Anything not listed has no rule: it resolves normally and goes direct.")
+    return 0
+
+
+def clean(raw):
+    d = raw.strip().lower()
+    d = re.sub(r"^[a-z]+://", "", d).split("/")[0].split(":")[0].strip(".")
+    try:
+        d = d.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    return d if DOMAIN.match(d) else None
+
+
+def cmd_check(domains):
+    me = self_ip()
+    rs = resolvers()
+    trouble = 0
+    for raw in domains:
+        name = clean(raw)
+        if not name:
+            print("not a domain: %s" % raw)
+            trouble = 1
+            continue
+        print(name)
+        for res in rs:
+            rule = res.decide(name)
+            kind, shown = meaning(rule, me)
+            live = ask(name, res.port) if res.port else None
+            if live is None:
+                seen, agree = "no answer", False
+            elif not live:
+                seen, agree = "no address", kind not in ("relay", "pinned")
+            else:
+                seen = "answered " + " ".join(live[:2])
+                if kind == "relay":
+                    agree = me in live
+                elif kind == "pinned":
+                    agree = rule.target in live
+                else:
+                    agree = me not in live
+            # The rule and the file it came from share one column, so a long
+            # file name cannot push the answer out of line.
+            why = "%s  (%s)" % (shown, rule.source) if rule else shown
+            print("  :%-5s %-7s %-68s %-30s %s"
+                  % (res.port or "?", kind, why, seen, res.label()))
+            if not agree:
+                trouble = 1
+                if live is None:
+                    print("  ! the resolver did not answer - is %s running?" % res.unit)
+                else:
+                    print("  ! its rules say %s, but that is not what it answered - "
+                          "it may be running on old config: systemctl restart %s"
+                          % (kind, res.unit))
+    return trouble
+
+
+def main(argv):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    # `smartdns-rules show | head` closes the pipe early; that is the reader
+    # being done, not an error worth a traceback.
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    usage = __doc__.split("\n\n")[1]
+    if not argv:
+        return cmd_summary()
+    cmd, rest = argv[0], argv[1:]
+    if cmd in ("-h", "--help", "help"):
+        print(usage)
+        return 0
+    if cmd == "show":
+        return cmd_show(" ".join(rest) if rest else None)
+    if cmd == "check" and rest:
+        return cmd_check(rest)
+    print(usage, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

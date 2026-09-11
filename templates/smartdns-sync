@@ -34,11 +34,13 @@ import http.cookies
 import http.server
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 
 CONFIG = "/etc/smart-dns/sync.env"
@@ -72,6 +74,44 @@ def load_config():
 
 
 CFG = None
+
+
+# ------------------------------------------------------------------ logging
+# journald reads a leading <N> on a line as its syslog level. Warnings and
+# errors carry one, so `journalctl -p warning` - which is what
+# `smartdns-logs -e` runs - shows exactly the problems. Ordinary lines stay
+# unmarked and land at info, as they always did. Before this everything
+# landed at info, stderr included, and a failure looked like a heartbeat.
+INFO, WARN, ERROR = 6, 4, 3
+# The visitor went away, or never finished saying hello. Not a fault here.
+GONE = (ConnectionError, TimeoutError, ssl.SSLError)
+
+
+def log(level, msg):
+    tag = "<%d>" % level if level < INFO else ""
+    for line in str(msg).splitlines() or [""]:
+        print(tag + line, flush=True)
+
+
+def log_exception(what):
+    """An error with its traceback, every line at error level. journald makes
+    each line its own entry, and at info all but the first would be lost
+    among the ordinary ones."""
+    log(ERROR, "%s\n%s" % (what, traceback.format_exc().rstrip()))
+
+
+def log_access(h, prefix, code, path, who=""):
+    """One line for one request: what was asked, the answer, how long it took
+    and who asked. Server errors at error level; everything else is info."""
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = 0
+    ms = (time.monotonic() - getattr(h, "_t0", time.monotonic())) * 1000
+    # 501 is a scanner's GET to a POST-only port: the visitor's mistake.
+    log(ERROR if code >= 500 and code != 501 else INFO, "%s %s %s %d %dms from %s%s" % (
+        prefix, getattr(h, "command", None) or "-", path, code, ms,
+        h.client_address[0], " " + who if who else ""))
 
 
 def post(path, payload):
@@ -226,9 +266,37 @@ HIJACK_CONF = "/etc/dnsmasq.d/smart-dns.conf"
 # the ones decided per template - a profile that does not route something must
 # not find a rule for it at all.
 BASE_DIR = "/etc/smartdns-base"
+# The main resolver's config directory. A name rather than a literal so a test
+# can lay a relay out somewhere else.
+DNSMASQ_D = "/etc/dnsmasq.d"
 
 
 EPIC_PINS = "/etc/dnsmasq.d/epic-pins.conf"
+
+# The templates' names, as the panel knows them. Only smartdns-rules reads this
+# - the resolvers go by number - but "test" means something to an operator
+# where "profile 2" does not.
+TEMPLATE_NAMES = "/var/lib/smart-dns/templates.json"
+
+
+def save_template_names(info):
+    """Keep the names the panel sent. Returns whether the file changed."""
+    if not isinstance(info, dict) or not isinstance(info.get("names"), dict):
+        return False      # an older panel, which does not send them
+    text = json.dumps({"default": info.get("default"), "names": info["names"]},
+                      ensure_ascii=False, sort_keys=True) + "\n"
+    try:
+        with open(TEMPLATE_NAMES, encoding="utf-8") as fh:
+            if fh.read() == text:
+                return False
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(TEMPLATE_NAMES), exist_ok=True)
+    tmp = TEMPLATE_NAMES + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, TEMPLATE_NAMES)
+    return True
 
 
 def epic_pin_lines():
@@ -259,7 +327,7 @@ def sync_base_dir():
     by not linking the file.
     """
     os.makedirs(BASE_DIR, exist_ok=True)
-    want = {f for f in os.listdir("/etc/dnsmasq.d")
+    want = {f for f in os.listdir(DNSMASQ_D)
             if f.endswith(".conf")
             and f not in (os.path.basename(CUSTOM_CONF),
                           os.path.basename(EPIC_PINS),
@@ -268,12 +336,87 @@ def sync_base_dir():
     have = set(os.listdir(BASE_DIR))
     changed = False
     for f in want - have:
-        os.symlink(os.path.join("/etc/dnsmasq.d", f), os.path.join(BASE_DIR, f))
+        os.symlink(os.path.join(DNSMASQ_D, f), os.path.join(BASE_DIR, f))
         changed = True
     for f in have - want:
         os.unlink(os.path.join(BASE_DIR, f))
         changed = True
     return changed
+
+
+RULE_LINE = re.compile(r"^(address|server|local)=/(.+)/([^/]*)$")
+
+
+def base_settings():
+    """The main resolver's settings, less its rules, for the profiles to share.
+
+    They sit in the same file as the hijack list - the upstream servers,
+    no-resolv, the cache, the addresses to listen on - and that is a file the
+    profiles must not read. Leaving it out took the settings with it: a
+    template's resolver fell back to /etc/resolv.conf for its upstreams and to
+    dnsmasq's default cache of 150 names, over the slowest link there is. So
+    the settings are copied across and only the rules stay behind.
+    """
+    try:
+        with open(HIJACK_CONF) as fh:
+            lines = [l.strip() for l in fh]
+    except OSError:
+        return []
+    return [l for l in lines
+            if l and not l.startswith("#") and not RULE_LINE.match(l)]
+
+
+def rule_sets(text, me):
+    """What one resolver's config routes, bypasses and pins, as sets."""
+    out = {"routes": set(), "bypasses": set(), "pins": set()}
+    for line in (text or "").splitlines():
+        m = RULE_LINE.match(line.strip())
+        if not m:
+            continue
+        kind, domains, target = m.groups()
+        for d in filter(None, domains.split("/")):
+            if kind != "address":
+                out["bypasses"].add(d)
+            elif target == me:
+                out["routes"].add(d)
+            else:
+                # With its address, so a pin moving somewhere new shows up as
+                # the change it is rather than as nothing.
+                out["pins"].add("%s=%s" % (d, target))
+    return out
+
+
+def signed(names, sign, limit=15):
+    out = [sign + n for n in names[:limit]]
+    if len(names) > limit:
+        out.append("(%s%d more)" % (sign, len(names) - limit))
+    return out
+
+
+def describe_change(old_text, new_text, me):
+    """What changed between two versions of a resolver's rules, in one line:
+    each name that started or stopped being routed, bypassed or pinned.
+
+    This is the record of why a name went where it went. A count said that
+    something changed; it could not say that gemini.google.com stopped going
+    through the relay at 14:02, which is the question an operator is asking.
+    """
+    new = rule_sets(new_text, me)
+    if old_text is None:
+        return "routes %d, bypasses %d, pins %d" % (
+            len(new["routes"]), len(new["bypasses"]), len(new["pins"]))
+    old = rule_sets(old_text, me)
+    parts = []
+    for key in ("routes", "bypasses", "pins"):
+        plus, minus = sorted(new[key] - old[key]), sorted(old[key] - new[key])
+        if plus or minus:
+            parts.append("%s %s" % (key, " ".join(signed(plus, "+") + signed(minus, "-"))))
+    return "; ".join(parts) or "settings only"
+
+
+def template_label(key, names):
+    name = (names or {}).get(str(key))
+    return "template %s (%s)" % (key, name) if name else "template %s" % key
 
 
 def apply_custom_domains(domains):
@@ -308,15 +451,20 @@ def apply_custom_domains(domains):
         else:
             with open(CUSTOM_CONF, "w") as fh:
                 fh.write(current)
-        print("custom domains rejected by dnsmasq - reverted",
-              file=sys.stderr, flush=True)
+        log(ERROR, "custom domains rejected by dnsmasq - reverted")
         return False
     sh("systemctl", "restart", "dnsmasq")
-    print("custom domains: %d applied" % len(set(domains)), flush=True)
+    old, new = rule_sets(current, self_ip)["routes"], set(domains)
+    print("custom domains: %s (now %d)"
+          % (" ".join(signed(sorted(new - old), "+") + signed(sorted(old - new), "-"))
+             or "rewritten", len(new)), flush=True)
     return True
 
 
-def apply_profiles(profiles, assignment, restart=False):
+KNOWN_NAMES = {}
+
+
+def apply_profiles(profiles, assignment, restart=False, names=None):
     """Give each template its own resolver, and point each address at one.
 
     dnsmasq cannot answer differently per client, so the split is done with one
@@ -328,6 +476,10 @@ def apply_profiles(profiles, assignment, restart=False):
     the main resolver on port 53 already does, and every address not named in a
     redirect falls through to it.
     """
+    # A name outlives its template in the log: one deleted in the panel is no
+    # longer in what the panel sends, but its retirement should still say which.
+    KNOWN_NAMES.update(names or {})
+    names = KNOWN_NAMES
     os.makedirs(PROFILE_DIR, exist_ok=True)
     if sync_base_dir():
         restart = True
@@ -337,12 +489,14 @@ def apply_profiles(profiles, assignment, restart=False):
 
     # Read once: every profile that wants them gets the same lines.
     epic_pins = epic_pin_lines()
+    settings = base_settings()
 
     wanted_units = set()
     for key, spec in sorted(profiles.items()):
         port = ports[key]
         body = ["# generated by smartdns-sync - do not edit",
                 "port=%d" % port]
+        body += settings
         # The operator's own domains, listed only for templates that route
         # them. They cannot be un-routed by rule the way a service can: both
         # rules would name the same host and dnsmasq prefers the address= one.
@@ -370,10 +524,11 @@ def apply_profiles(profiles, assignment, restart=False):
             body += epic_pins
         conf = os.path.join(PROFILE_DIR, "%s.conf" % key)
         text = "\n".join(body) + "\n"
-        changed = True
+        old = None
         if os.path.exists(conf):
             with open(conf) as fh:
-                changed = fh.read() != text
+                old = fh.read()
+        changed = old != text
         if changed:
             with open(conf, "w") as fh:
                 fh.write(text)
@@ -386,8 +541,11 @@ def apply_profiles(profiles, assignment, restart=False):
         # and silently miss everybody on a template.
         if changed or not active or restart:
             sh("systemctl", "restart", unit)
-            print("profile %s on port %d (%d bypassed)"
-                  % (key, port, len(spec.get("bypass", []))), flush=True)
+            why = (describe_change(old, text, me) if changed
+                   else "was not running" if not active
+                   else "shared config changed")
+            print("%s on port %d restarted - %s"
+                  % (template_label(key, names), port, why), flush=True)
 
     # Stop resolvers for profiles nobody is on any more, and delete their
     # config, so a template an admin removed does not linger as a process.
@@ -402,14 +560,21 @@ def apply_profiles(profiles, assignment, restart=False):
                 os.remove(os.path.join(PROFILE_DIR, "%s.conf" % key))
             except OSError:
                 pass
-            print("profile %s retired" % key, flush=True)
+            print("%s retired - nobody is on it" % template_label(key, names),
+                  flush=True)
 
-    apply_redirects(ports, assignment)
+    apply_redirects(ports, assignment, names)
 
 
-def apply_redirects(ports, assignment):
+# Who was on which template at the last sync, so a move is logged once rather
+# than every thirty seconds. None until the first pass has looked.
+LAST_ASSIGNMENT = None
+
+
+def apply_redirects(ports, assignment, names=None):
     """Point each address at its profile's resolver, with one nftables set per
     profile and a redirect rule per set."""
+    global LAST_ASSIGNMENT
     if nft("list", "table", "ip", NAT_TABLE).returncode != 0:
         nft("add", "table", "ip", NAT_TABLE)
     nft("add", "chain", "ip", NAT_TABLE, "pre",
@@ -431,6 +596,28 @@ def apply_redirects(ports, assignment):
                 "ip saddr @%s udp dport 53 redirect to :%d" % (setname, port))
             nft("add", "rule", "ip", NAT_TABLE, "pre",
                 "ip saddr @%s tcp dport 53 redirect to :%d" % (setname, port))
+
+    # Sets no rule points at any more - a template that lost its last customer.
+    # Harmless left behind, but misleading: they go on listing addresses that
+    # the default resolver is really answering.
+    # The whole table, not `list sets ip <table>`: nft takes only a family
+    # there, refuses the table name, and the cleanup silently did nothing.
+    listed = nft("list", "table", "ip", NAT_TABLE)
+    for setname in re.findall(r"set (prof_\S+) \{", listed.stdout or ""):
+        if setname[len("prof_"):] not in ports:
+            nft("delete", "set", "ip", NAT_TABLE, setname)
+
+    now = {ip: prof for ip, prof in assignment.items() if prof in ports}
+    if LAST_ASSIGNMENT is not None:
+        for ip in sorted(set(now) | set(LAST_ASSIGNMENT)):
+            was, got = LAST_ASSIGNMENT.get(ip), now.get(ip)
+            if was == got:
+                continue
+            if got:
+                print("%s now on %s" % (ip, template_label(got, names)), flush=True)
+            else:
+                print("%s left %s" % (ip, template_label(was, names)), flush=True)
+    LAST_ASSIGNMENT = now
 
 
 def acl(*args):
@@ -473,15 +660,14 @@ def apply_speeds(allowed):
         # than every half minute, and carry on - unshaped is the old
         # behaviour, not a broken one.
         if SHAPED is None:
-            print("%s is missing - speed limits will not be applied" % SHAPE,
-                  file=sys.stderr, flush=True)
+            log(WARN, "%s is missing - speed limits will not be applied" % SHAPE)
         SHAPED = wanted
         return
     r = subprocess.run([SHAPE, "apply"], input=json.dumps(wanted),
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         # Leave SHAPED alone so the next pass tries again.
-        print("shaping failed: %s" % r.stderr.strip(), file=sys.stderr, flush=True)
+        log(ERROR, "shaping failed: %s" % r.stderr.strip())
         return
     if r.stdout.strip():
         print(r.stdout.strip(), flush=True)
@@ -534,6 +720,10 @@ def sync_once():
     except Exception as e:
         host = {"error": str(e)}
     answer = post("/sync", {"counters": counters, "host": host})
+    try:
+        save_template_names(answer.get("templates"))
+    except Exception as e:
+        log(WARN, "template names not saved: %s" % e)
 
     names = {a["ip"]: a.get("name", "") for a in answer.get("allowed", [])}
     want = set(names)
@@ -546,23 +736,24 @@ def sync_once():
         changed = apply_custom_domains(answer.get("extra_domains") or [])
         assignment = {a["ip"]: a.get("profile", "")
                       for a in answer.get("allowed", []) if a.get("profile")}
-        apply_profiles(answer.get("profiles") or {}, assignment, restart=changed)
+        apply_profiles(answer.get("profiles") or {}, assignment, restart=changed,
+                       names=(answer.get("templates") or {}).get("names"))
     except Exception as e:
-        print("profiles failed: %s" % e, file=sys.stderr, flush=True)
+        log_exception("profiles failed: %s" % e)
 
     try:
         apply_speeds(answer.get("allowed") or [])
     except Exception as e:
-        print("speeds failed: %s" % e, file=sys.stderr, flush=True)
+        log_exception("speeds failed: %s" % e)
 
     for ip in sorted(want - have):
         r = acl("add", ip, names[ip]) if names[ip] else acl("add", ip)
-        print("added %s%s" % (ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()),
-              flush=True)
+        log(INFO if r.returncode == 0 else ERROR, "added %s%s" % (
+            ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()))
     for ip in sorted(have - want):
         r = acl("del", ip)
-        print("removed %s%s" % (ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()),
-              flush=True)
+        log(INFO if r.returncode == 0 else ERROR, "removed %s%s" % (
+            ip, "" if r.returncode == 0 else " FAILED: " + r.stderr.strip()))
 
     # After the set is filled, not before: enforcing while the kernel list is
     # still empty is refused, and would leave the relay open for another cycle.
@@ -585,7 +776,9 @@ def sync_loop():
             # already in the kernel keeps working throughout - a sync outage
             # must never cut off paying users.
             if fails <= 3 or fails % 20 == 0:
-                print("sync failed (%d): %s" % (fails, e), file=sys.stderr, flush=True)
+                # A warning while it could be a blip on the link; an error
+                # once it has gone on long enough to be an outage.
+                log(WARN if fails < 3 else ERROR, "sync failed (%d): %s" % (fails, e))
         time.sleep(INTERVAL)
 
 
@@ -835,8 +1028,20 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
     server_version = "smartdns"
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, *a):
-        pass
+    def log_message(self, fmt, *args):
+        # http.server's own notes - a malformed request, a timeout. The access
+        # line is log_request below.
+        log(INFO, "panel %s from %s" % (fmt % args, self.client_address[0]))
+
+    def parse_request(self):
+        self._t0 = time.monotonic()
+        return super().parse_request()
+
+    def log_request(self, code="-", size="-"):
+        # The path only. The query carries nothing but the message shown after
+        # a form, and the cookie - the session - is never written anywhere.
+        log_access(self, "panel", code,
+                   urllib.parse.urlparse(getattr(self, "path", "") or "").path[:120])
 
     def client_ip(self):
         # The socket, never a header. Trusting X-Forwarded-For here would let
@@ -988,7 +1193,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
             try:
                 res = post(endpoint, payload)
             except Exception as e:
-                print("%s failed: %s" % (endpoint, e), file=sys.stderr, flush=True)
+                log(ERROR, "panel: %s failed: %s" % (endpoint, e))
                 return self.redirect(path, "الان نشد، چند دقیقه دیگر", bad=True)
             if not res.get("ok"):
                 return self.redirect(path, res.get("message", "خطا"), bad=True)
@@ -1012,7 +1217,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                     "new": form.get("new", ""),
                 })
             except Exception as e:
-                print("password change failed: %s" % e, file=sys.stderr, flush=True)
+                log(ERROR, "panel: password change failed: %s" % e)
                 return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
             return self.redirect("/", res.get("message", ""),
                                  bad=not res.get("ok"))
@@ -1034,7 +1239,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
                     "data": base64.b64encode(blob).decode("ascii"),
                 })
             except Exception as e:
-                print("receipt failed: %s" % e, file=sys.stderr, flush=True)
+                log(ERROR, "panel: receipt failed: %s" % e)
                 return self.redirect("/", "الان نشد، چند دقیقه دیگر", bad=True)
             return self.redirect("/", res.get("message", ""),
                                  bad=not res.get("ok"))
@@ -1044,7 +1249,8 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         try:
             res = post("/user-claim", {"session": self.session(),
                                        "ip": self.client_ip()})
-        except Exception:
+        except Exception as e:
+            log(ERROR, "panel: user-claim failed: %s" % e)
             res = {"ok": False, "message": "الان نشد"}
         return self.redirect("/", res.get("message", ""), bad=not res.get("ok"))
 
@@ -1055,7 +1261,7 @@ class UserPanel(http.server.BaseHTTPRequestHandler):
         try:
             info = post("/user-info", {"session": token, "ip": self.client_ip()})
         except Exception as e:
-            print("user-info failed: %s" % e, file=sys.stderr, flush=True)
+            log(ERROR, "panel: user-info failed: %s" % e)
             return self.send_html("<div class='icon'>⚠️</div><h1>الان نشد</h1>"
                                   "<p class='sub'>چند دقیقه دیگر دوباره.</p>", 502)
         if not info.get("ok"):
@@ -1204,6 +1410,8 @@ class PanelServer(http.server.ThreadingHTTPServer):
         super().__init__(addr, handler)
 
     def finish_request(self, request, client_address):
+        if self.ctx is None:      # plain http, for tests only
+            return super().finish_request(request, client_address)
         request.settimeout(HANDSHAKE_TIMEOUT)
         try:
             tls = self.ctx.wrap_socket(request, server_side=True)
@@ -1221,6 +1429,13 @@ class PanelServer(http.server.ThreadingHTTPServer):
                 tls.close()
             except OSError:
                 pass
+
+    def handle_error(self, request, client_address):
+        # Whatever a handler did not catch, with its traceback, at error
+        # level. http.server's default prints it at info, where nobody looks.
+        if isinstance(sys.exc_info()[1], GONE):
+            return
+        log_exception("request from %s failed" % client_address[0])
 
 
 def make_panel_server(ctx, port=None):

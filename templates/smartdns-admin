@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
@@ -67,12 +68,10 @@ def systemctl(*args):
         r = subprocess.run(["systemctl"] + list(args), capture_output=True,
                            text=True, timeout=30)
         if r.returncode != 0:
-            print("systemctl %s: %s" % (" ".join(args), r.stderr.strip()),
-                  file=sys.stderr, flush=True)
+            log(WARN, "systemctl %s: %s" % (" ".join(args), r.stderr.strip()))
         return r.returncode == 0
     except Exception as e:
-        print("systemctl %s failed: %r" % (" ".join(args), e),
-              file=sys.stderr, flush=True)
+        log(WARN, "systemctl %s failed: %r" % (" ".join(args), e))
         return False
 
 
@@ -442,6 +441,117 @@ def bar(used, total):
 # Failed attempts stay in memory. Losing that count on restart only makes
 # guessing slightly easier for someone who cannot cause restarts anyway.
 ATTEMPTS = {}          # address -> [count, first_failure_time]
+# ------------------------------------------------------------------ logging
+# journald reads a leading <N> on a line as its syslog level. Warnings and
+# errors carry one, so `journalctl -p warning` - which is what
+# `smartdns-logs -e` runs - shows exactly the problems. Ordinary lines stay
+# unmarked and land at info, as they always did. Before this everything
+# landed at info, stderr included, and a failure looked like a heartbeat.
+INFO, WARN, ERROR = 6, 4, 3
+# The visitor went away, or never finished saying hello. Not a fault here.
+GONE = (ConnectionError, TimeoutError, ssl.SSLError)
+
+
+def log(level, msg):
+    tag = "<%d>" % level if level < INFO else ""
+    for line in str(msg).splitlines() or [""]:
+        print(tag + line, flush=True)
+
+
+def log_exception(what):
+    """An error with its traceback, every line at error level. journald makes
+    each line its own entry, and at info all but the first would be lost
+    among the ordinary ones."""
+    log(ERROR, "%s\n%s" % (what, traceback.format_exc().rstrip()))
+
+
+def log_access(h, prefix, code, path, who=""):
+    """One line for one request: what was asked, the answer, how long it took
+    and who asked. Server errors at error level; everything else is info."""
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = 0
+    ms = (time.monotonic() - getattr(h, "_t0", time.monotonic())) * 1000
+    # 501 is a scanner's GET to a POST-only port: the visitor's mistake.
+    log(ERROR if code >= 500 and code != 501 else INFO, "%s %s %s %d %dms from %s%s" % (
+        prefix, getattr(h, "command", None) or "-", path, code, ms,
+        h.client_address[0], " " + who if who else ""))
+
+
+# Form fields never written to the journal, whatever the action.
+SECRET_FIELDS = re.compile(r"pass|token|secret|session|salt|hash", re.I)
+
+
+def describe(params):
+    """An action's form, fit for the journal: no passwords or tokens, and a
+    long list - a template's domains - as a count rather than every name."""
+    out = []
+    for k in sorted(params):
+        vals = [v for v in params[k] if v != ""]
+        if not vals:
+            continue
+        if SECRET_FIELDS.search(k):
+            out.append("%s=***" % k)
+        elif len(vals) > 4:
+            out.append("%s=[%d]" % (k, len(vals)))
+        else:
+            out.append("%s=%s" % (k, ",".join(v[:40] for v in vals)))
+    return " " + " ".join(out) if out else ""
+
+
+# How long a visitor may take over the TLS handshake, and then how long any one
+# read or write may stall. Per operation, so an upload that keeps moving is
+# never cut off, while a connection that has gone quiet is let go.
+HANDSHAKE_TIMEOUT = 10
+IO_TIMEOUT = 30
+
+
+class TLSServer(http.server.ThreadingHTTPServer):
+    """TLS per connection, under a deadline - never on the listening socket.
+
+    Wrapping the listening socket runs every visitor's handshake inside
+    accept(), on the one thread that accepts for all of them and with no
+    timeout, so a single connection that opens and then says nothing freezes
+    the server for everybody until it goes away. The customer panel froze
+    exactly that way in production, and this server was built the same way.
+    Here accept() only accepts; a stalled visitor stalls only its own thread.
+
+    ctx=None serves plain http. That is for tests - main() refuses to.
+    """
+    daemon_threads = True
+
+    def __init__(self, addr, handler, ctx):
+        self.ctx = ctx
+        super().__init__(addr, handler)
+
+    def finish_request(self, request, client_address):
+        if self.ctx is None:
+            return super().finish_request(request, client_address)
+        request.settimeout(HANDSHAKE_TIMEOUT)
+        try:
+            tls = self.ctx.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError):
+            return      # a scanner, a dropped phone, plain http to an https port
+        try:
+            tls.settimeout(IO_TIMEOUT)
+            self.RequestHandlerClass(tls, client_address, self)
+        except (ssl.SSLError, OSError):
+            pass
+        finally:
+            try:
+                tls.close()
+            except OSError:
+                pass
+
+    def handle_error(self, request, client_address):
+        # Whatever a handler did not catch, with its traceback, at error
+        # level. http.server's default prints it at info, where nobody looks.
+        if isinstance(sys.exc_info()[1], GONE):
+            return
+        log_exception("request from %s failed" % client_address[0])
+
+
 STORE = None
 CFG = {}
 
@@ -450,8 +560,29 @@ class Admin(http.server.BaseHTTPRequestHandler):
     server_version = "smartdns"
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, *a):
-        pass
+    def log_message(self, fmt, *args):
+        # http.server's own notes - a malformed request, a timeout. They can
+        # quote the raw request line, so the secret path is masked here too.
+        msg = fmt % args
+        if CFG.get("ADMIN_PATH"):
+            msg = msg.replace(CFG["ADMIN_PATH"], "<admin>")
+        log(INFO, "admin %s from %s" % (msg, self.client_address[0]))
+
+    def parse_request(self):
+        self._t0 = time.monotonic()
+        return super().parse_request()
+
+    def log_request(self, code="-", size="-"):
+        log_access(self, "admin", code, self.shown_path())
+
+    def shown_path(self):
+        """The path for the journal, with the secret part shown as <admin>
+        and the query - only ever the message after an action - left off."""
+        path = urllib.parse.urlparse(getattr(self, "path", "") or "").path
+        secret = CFG.get("ADMIN_PATH") or ""
+        if secret and (path == "/" + secret or path.startswith("/" + secret + "/")):
+            path = "/<admin>" + path[len(secret) + 1:]
+        return path[:120]
 
     # -- plumbing ---------------------------------------------------------
     def send(self, body, code=200, headers=None):
@@ -490,6 +621,12 @@ class Admin(http.server.BaseHTTPRequestHandler):
             fields = []
             for item in query.split("&"):
                 key, _, value = item.partition("=")
+                # A message starting with ! is a refusal - a bad number, a
+                # name already taken. The request line cannot say which; this
+                # can.
+                if key == "m" and value.startswith("!"):
+                    log(WARN, "admin %s refused: %s"
+                        % (getattr(self, "_action", "-"), value[1:]))
                 fields.append("%s=%s" % (key, urllib.parse.quote(value, safe="")))
             query = "?" + "&".join(fields)
         h = {"Location": "/%s/%s%s" % (CFG["ADMIN_PATH"], base, query)}
@@ -518,7 +655,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
             with open(path, "rb") as fh:
                 blob = fh.read()
         except Exception as e:
-            print("backup failed: %r" % e, file=sys.stderr, flush=True)
+            log_exception("backup failed: %r" % e)
             return self.redirect("settings?m=!پشتیبان‌گیری نشد: %s" % e)
         finally:
             try:
@@ -716,7 +853,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
                     pass
             systemctl("start", "smartdns-panel")
         except Exception as e:
-            print("restore failed: %r" % e, file=sys.stderr, flush=True)
+            log_exception("restore failed: %r" % e)
             systemctl("start", "smartdns-panel")
             return self.redirect("settings?m=!بازگردانی نشد: %s" % e)
         PENDING.clear()
@@ -798,13 +935,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
         """
         if self.session_ok():
             return self.redirect("")
-        path = urllib.parse.urlparse(self.path).path
-        # Logged so that "it 404s sometimes" is answerable next time. Only
-        # paths that missed the prefix, so the secret never reaches the
-        # journal.
-        if not path.startswith("/" + CFG["ADMIN_PATH"]):
-            print("404 %s from %s" % (path[:80], self.client_address[0]),
-                  file=sys.stderr, flush=True)
+        # Its request line names the path and who asked, the secret part
+        # masked, so "it 404s sometimes" stays answerable.
         return self.send("<h1>404</h1>", 404)
 
     def do_GET(self):
@@ -826,7 +958,7 @@ class Admin(http.server.BaseHTTPRequestHandler):
         try:
             return self.view(rest)
         except Exception as e:
-            print("admin GET %s failed: %r" % (rest, e), file=sys.stderr, flush=True)
+            log_exception("admin GET %s failed" % rest)
             return self.send(page("خطا", "<div class='card'>%s</div>"
                                   % html.escape(str(e)), CFG), 500)
 
@@ -837,6 +969,8 @@ class Admin(http.server.BaseHTTPRequestHandler):
         params = self.body_params()
         if not self.session_ok():
             if self.locked_out():
+                log(WARN, "admin login refused from %s: too many failed attempts"
+                    % self.client_address[0])
                 return self.send(login_page(
                     CFG, "تلاش‌های ناموفق زیاد. چند دقیقه صبر کنید."))
             given = self.one(params, "password")
@@ -855,15 +989,24 @@ class Admin(http.server.BaseHTTPRequestHandler):
                 STORE.run("DELETE FROM admin_sessions WHERE expires_at <= ?",
                           (now(),))
                 ATTEMPTS.pop(self.client_address[0], None)
+                log(INFO, "admin login from %s" % self.client_address[0])
                 return self.redirect("", {
                     "Set-Cookie": "sdns=%s; Path=/; HttpOnly; Secure; SameSite=Strict"
                                   % token})
             self.note_failure()
+            if given:
+                log(WARN, "admin login failed from %s (%d in a row)"
+                    % (self.client_address[0],
+                       ATTEMPTS.get(self.client_address[0], (0, 0))[0]))
             return self.send(login_page(CFG, "رمز اشتباه است."))
+        # What was done, before doing it - so an action that then fails is
+        # still on the record, next to the error it caused.
+        self._action = rest
+        log(INFO, "admin action %s%s" % (rest, describe(params)))
         try:
             return self.action(rest, params)
         except Exception as e:
-            print("admin POST %s failed: %r" % (rest, e), file=sys.stderr, flush=True)
+            log_exception("admin POST %s failed" % rest)
             return self.send(page("خطا", "<div class='card'>%s</div>"
                                   % html.escape(str(e)), CFG), 500)
 
@@ -1605,6 +1748,10 @@ def set_config_key(key, value):
     os.replace(tmp, CONFIG)
 
 
+def make_admin_server(ctx, port):
+    return TLSServer(("0.0.0.0", port), Admin, ctx)
+
+
 def main():
     global STORE, CFG, CATALOGUE
     CFG = load_config()
@@ -1612,13 +1759,12 @@ def main():
     STORE = Store(DB)
 
     port = int(CFG["ADMIN_PORT"])
-    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), Admin)
     cert = CFG.get("ADMIN_CERT")
     key = CFG.get("ADMIN_KEY")
     if cert and key and os.path.exists(cert):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        httpd = make_admin_server(ctx, port)
         scheme = "https"
     else:
         # Refuse rather than silently serve a login form in the clear: the
