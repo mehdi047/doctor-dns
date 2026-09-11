@@ -278,12 +278,6 @@ payloadها زیر `exit 0` می‌نشینند و هر خطشان با `#` شر
 
 - [آرمین ترنج](https://github.com/arminandtoo) — `@arminandtoo`
 
-## لایسنس
-
-MIT. فایل [LICENSE](LICENSE) را ببینید.
-
-فهرست دامنه‌ها از منابع عمومی و از تست عملی جمع شده؛ کامل نیست و با تغییر سرویس‌ها جابه‌جا می‌شود.
-
 ---
 
 <div align="center">
@@ -309,3 +303,9 @@ MIT. فایل [LICENSE](LICENSE) را ببینید.
 | **Tether — TRON (TRC20)** | `TPiyEnb41qTZz8eM6eqnRwXbPXBZCNS1pm` |
 
 </div>
+
+## لایسنس
+
+MIT. فایل [LICENSE](LICENSE) را ببینید.
+
+فهرست دامنه‌ها از منابع عمومی و از تست عملی جمع شده؛ کامل نیست و با تغییر سرویس‌ها جابه‌جا می‌شود.

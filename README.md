@@ -379,13 +379,6 @@ reach the service from.
 
 - [Armin Toranj](https://github.com/arminandtoo) — `@arminandtoo`
 
-## Licence
-
-MIT. See [LICENSE](LICENSE).
-
-The domain list is assembled from public sources and from testing; it is not
-exhaustive and will drift as services change.
-
 ---
 
 <div align="center">
@@ -412,3 +405,10 @@ of chasing bugs. If it has been useful to you, buy me a coffee ☕
 | **Tether — TRON (TRC20)** | `TPiyEnb41qTZz8eM6eqnRwXbPXBZCNS1pm` |
 
 </div>
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
+
+The domain list is assembled from public sources and from testing; it is not
+exhaustive and will drift as services change.
