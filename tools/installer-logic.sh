@@ -1347,6 +1347,14 @@ if [ "$ROLE" = relay ]; then
           "$(printf '%s\n' "$unrouted" | grep -c "^${RELAY_IP}$" || true)" "0"
     check "a site loads through the full chain" \
           "$(curl -sS -o /dev/null -m 25 --resolve "github.com:443:${RELAY_IP}" -w '%{http_code}' https://github.com/ 2>/dev/null || echo 000)" "200"
+    # The API the relay syncs with, reached the way smartdns-sync reaches it -
+    # by address, with a name in the handshake - but with a GET, which the API
+    # refuses as 501 without looking at any secret, so this proves the path
+    # and leaves no "wrong secret" warning in the exit's log. A relay whose
+    # sync could not get through used to pass every check here and then fail
+    # in the customer's panel instead.
+    check "the exit's sync API answers this relay" \
+          "$(curl -sk -o /dev/null -m 20 --resolve "${PANEL_DOMAIN:-sync.example.com}:8443:${EXIT_IP}" -w '%{http_code}' "https://${PANEL_DOMAIN:-sync.example.com}:8443/" 2>/dev/null || true)" "501"
 fi
 
 printf '\n'

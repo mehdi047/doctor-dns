@@ -114,6 +114,39 @@ def log_access(h, prefix, code, path, who=""):
         h.client_address[0], " " + who if who else ""))
 
 
+def sync_sni():
+    """The name to put in the TLS handshake with the exit, which has none.
+
+    The relay dials the exit by address, and Python sends no name in TLS for
+    an address. Filtering between Iran and some exits resets exactly those
+    handshakes: measured from a live relay to a Hetzner exit, a handshake with
+    no name was reset every time, and one carrying any name at all - the
+    relay's own domain, sync.example.com, smartdns.invalid - got through every
+    time. From outside Iran both worked. Sync and the customer panel both went
+    down with "connection reset by peer" while the proxy on 443, which always
+    carries the customer's name, was fine.
+
+    The name decides nothing here: the exit's certificate is checked against
+    its fingerprint, not against a name. So it is the operator's own domain
+    when there is one, a harmless placeholder when there is not, and SYNC_SNI
+    in sync.env if a network ever needs something else.
+    """
+    return (CFG.get("SYNC_SNI") or CFG.get("PANEL_DOMAIN")
+            or "sync.example.com")
+
+
+class NamedHTTPS(http.client.HTTPSConnection):
+    """HTTPS to an address, with a name in the handshake anyway."""
+
+    def __init__(self, host, port, sni, **kw):
+        super().__init__(host, port, **kw)
+        self.sni = sni
+
+    def connect(self):
+        http.client.HTTPConnection.connect(self)       # the TCP part only
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.sni)
+
+
 def post(path, payload):
     """POST JSON to the exit's API, pinned to its certificate.
 
@@ -126,9 +159,7 @@ def post(path, payload):
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    conn = http.client.HTTPSConnection(
-        CFG["PANEL_HOST"], 8443, timeout=25, context=ctx
-    )
+    conn = NamedHTTPS(CFG["PANEL_HOST"], 8443, sync_sni(), timeout=25, context=ctx)
     try:
         conn.connect()
         seen = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
