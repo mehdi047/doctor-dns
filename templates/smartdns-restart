@@ -1,0 +1,95 @@
+#!/bin/bash
+# smartdns-restart - restart every part of doctor dns on this machine at once.
+#
+# usage: smartdns-restart      restart them all, then say which came back up
+#        smartdns-restart -h   this help
+set -uo pipefail
+
+# Where this machine's config lives, and its templates' resolvers. Variables
+# only so a test can point them somewhere else; nothing else sets them.
+ETC="${SMARTDNS_ETC:-/etc/smart-dns}"
+PROFILES="${SMARTDNS_PROFILES:-/etc/smartdns-profiles}"
+
+case "${1:-}" in
+    "") ;;
+    -h|--help) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $1  (try -h)" >&2; exit 1 ;;
+esac
+[ "$(id -u)" = 0 ] || { echo "run as root:  sudo smartdns-restart" >&2; exit 1; }
+
+# Services only. The timers are clocks with nothing to unstick, and nftables is
+# left alone on purpose: restarting it reloads the rules from disk, which throws
+# away the allowlist and the usage counted since the last save.
+if [ -f "$ETC/sync.env" ]; then
+    role=relay
+    resolvers=""
+    for f in "$PROFILES"/*.conf; do
+        [ -e "$f" ] || continue
+        resolvers="$resolvers smartdns-dns@$(basename "$f" .conf)"
+    done
+    units="smartdns-sync$resolvers dnsmasq coturn nginx"
+elif [ -f "$ETC/panel.env" ]; then
+    role=exit
+    units="smartdns-panel smartdns-admin nginx"
+else
+    echo "doctor dns is not installed on this machine" >&2
+    exit 1
+fi
+
+installed() { [ "$(systemctl show -p LoadState --value "$1" 2>/dev/null)" = loaded ]; }
+
+# A service that failed too often in a row is refused a restart until its
+# failures are forgotten - and that is exactly when somebody reaches for this.
+restart() {
+    systemctl reset-failed "$@" 2>/dev/null
+    systemctl restart "$@" 2>&1 | sed 's/^/    /'
+}
+
+echo "restarting doctor dns - $role"
+[ "$role" = relay ] && echo "customers' open connections drop for a moment and come straight back"
+echo
+
+skipped=""
+if [ "$role" = relay ]; then
+    # In one call, so systemd restarts each resolver once: they are PartOf the
+    # sync agent and would otherwise go down again with it.
+    restart smartdns-sync $resolvers
+    # A config that does not load would keep dnsmasq down after the restart,
+    # where right now it is at least running on the old one.
+    if out="$(dnsmasq --test -C /etc/dnsmasq.conf 2>&1)"; then
+        restart dnsmasq
+    else
+        echo "  dnsmasq's config does not load, so it was left running as it was:"
+        printf '%s\n' "$out" | sed 's/^/    /'
+        skipped="$skipped dnsmasq"
+    fi
+    restart coturn
+else
+    restart smartdns-panel
+    installed smartdns-admin && restart smartdns-admin
+fi
+# The same for nginx, which carries every customer's traffic.
+if out="$(nginx -t 2>&1)"; then
+    restart nginx
+else
+    echo "  nginx's config does not load, so it was left running as it was:"
+    printf '%s\n' "$out" | sed 's/^/    /'
+    skipped="$skipped nginx"
+fi
+
+sleep 2
+fail=0
+for u in $units; do
+    installed "$u" || continue
+    state="$(systemctl is-active "$u" 2>/dev/null)"
+    case " $skipped " in *" $u "*) state="$state (not restarted)"; fail=1 ;; esac
+    [ "${state%% *}" = active ] || fail=1
+    printf '  %-26s %s\n' "$u" "$state"
+done
+echo
+if [ "$fail" = 0 ]; then
+    echo "all of it is back up"
+else
+    echo "not everything came back - see why with:  sudo smartdns-logs -e"
+    exit 1
+fi

@@ -951,6 +951,9 @@ note_file /usr/local/bin/smartdns-cert
 payload SMARTDNS_LOGS > /usr/local/bin/smartdns-logs
 chmod +x /usr/local/bin/smartdns-logs
 note_file /usr/local/bin/smartdns-logs
+payload SMARTDNS_RESTART > /usr/local/bin/smartdns-restart
+chmod +x /usr/local/bin/smartdns-restart
+note_file /usr/local/bin/smartdns-restart
 install_payload CERT_SERVICE /etc/systemd/system/smartdns-cert.service || true
 install_payload CERT_TIMER   /etc/systemd/system/smartdns-cert.timer   || true
 systemctl daemon-reload

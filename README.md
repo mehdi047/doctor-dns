@@ -340,6 +340,19 @@ is for your own screen - the admin panel's start-up line includes its address.
 that address included; it still holds customers' addresses and usernames, so
 send it only to someone you trust.
 
+**`smartdns-restart`** — restart every part of this machine at once, then
+show which came back up. It tells a relay from an exit by itself.
+
+```sh
+sudo smartdns-restart
+```
+
+On a relay, customers' open connections drop for a moment and come straight
+back. If nginx's or dnsmasq's config does not load, that part is left running
+as it was rather than restarted into a failure, and the command says why.
+nftables is never restarted: that would throw away the allowlist and the usage
+counted since the last save.
+
 ```sh
 smartdns-cert panel.example.com  # get or renew a certificate for that name
 sudo bash doctor-dns.sh --version
