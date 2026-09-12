@@ -149,6 +149,29 @@ Two machines with Debian or Ubuntu and a public address each:
 No pip, no npm, no containers. Python's standard library, nginx, dnsmasq,
 nftables and coturn, all from the distribution.
 
+### Which servers to buy (what we found)
+
+Honestly, whether the service is fast or slow depends less on this script than
+on how easily your Iran server and your exit can talk to each other. Iran's
+filtering doesn't treat every foreign server the same: some it leaves alone,
+some it slows down, and some it effectively shuts off. Here is what we saw, so
+you don't spend money on a server that won't work.
+
+| Exit | What we saw |
+|---|---|
+| AWS Lightsail, Germany | worked great |
+| Hetzner (Germany, Finland) | great and fast, about 2 MB/s |
+| Linode Frankfurt, OVH France, a Turkish host | worked well |
+| DigitalOcean | didn't work, in any of the 8 regions we tried - it connects, then nothing gets through after a few KB |
+| OVH (some newer addresses) | same problem as DigitalOcean |
+| Vultr Miami | works, but very slow - about 100 KB/s |
+
+Two things to keep in mind:
+
+- A provider's speed-test file downloading fast from Iran doesn't mean the
+  server you buy from them will be fast. We saw exactly that with OVH and Vultr.
+- An exit can work well with one Iran server and badly with another.
+
 ### Ports
 
 Everything below is taken by the service. Open them in the firewall, and do
