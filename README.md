@@ -149,28 +149,36 @@ Two machines with Debian or Ubuntu and a public address each:
 No pip, no npm, no containers. Python's standard library, nginx, dnsmasq,
 nftables and coturn, all from the distribution.
 
-### Which servers to buy (what we found)
+### Choosing servers - what we have measured
 
-Honestly, whether the service is fast or slow depends less on this script than
-on how easily your Iran server and your exit can talk to each other. Iran's
-filtering doesn't treat every foreign server the same: some it leaves alone,
-some it slows down, and some it effectively shuts off. Here is what we saw, so
-you don't spend money on a server that won't work.
+How fast the service is, and whether it works at all, depends less on this
+script than on the path between the Iran server and the exit. Iran's filtering
+does not treat every foreign server alike: some it leaves alone, some it slows
+down, and some it effectively shuts off. The results below come from our own
+tests, so that your money does not go on a server that will not work.
 
-| Exit | What we saw |
+| Exit | Result |
 |---|---|
-| AWS Lightsail, Germany | worked great |
-| Hetzner (Germany, Finland) | great and fast, about 2 MB/s |
-| Linode Frankfurt, OVH France, a Turkish host | worked well |
-| DigitalOcean | didn't work, in any of the 8 regions we tried - it connects, then nothing gets through after a few KB |
-| OVH (some newer addresses) | same problem as DigitalOcean |
-| Vultr Miami | works, but very slow - about 100 KB/s |
+| AWS Lightsail, Germany | worked without problems |
+| Hetzner (Germany, Finland) | worked without problems, and fast - about 2 MB/s |
+| Linode Frankfurt, OVH France, a host in Turkey | worked well |
+| DigitalOcean | did not work in any of the 8 regions tested; the connection opens, but after a few KB nothing more gets through |
+| OVH (some newer addresses) | the same problem as DigitalOcean |
+| Vultr Miami | works, but very slowly - about 100 KB/s |
 
-Two things to keep in mind:
+A few notes:
 
-- A provider's speed-test file downloading fast from Iran doesn't mean the
-  server you buy from them will be fast. We saw exactly that with OVH and Vultr.
-- An exit can work well with one Iran server and badly with another.
+- A provider's test file downloading fast from inside Iran does not mean the
+  server you buy from that provider will be fast; we saw exactly this with OVH
+  and Vultr.
+- An exit may work well with one Iran server and not with another.
+- The service did not behave the same on every internet connection: with the
+  same setup it worked well on mobile internet but was very slow on home
+  internet. Test it on the connections your customers actually use.
+
+**Our advice:** if you are buying servers for this script, rent both the Iran
+server and the exit by the hour first. Set the service up, try it on different
+connections, and only renew the servers for longer once you are satisfied.
 
 ### Ports
 
